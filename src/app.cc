@@ -16,6 +16,8 @@
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "UnreachableCode"
 using namespace std;
+//添加全局变量控制每次是否保存帧，默认保存
+bool g_save_each_frame = false;
 
 
 App::App() {
@@ -66,6 +68,7 @@ App::App() {
   double t0, t1, t2, t3, tn;
 
   size_t frame_idx = 0;
+  //程序无限循环，直到没有输入
   while (true) {
     t0 = cv::getTickCount();
 
@@ -90,9 +93,11 @@ App::App() {
     }
     t2 = cv::getTickCount();
 
-
-    imwrite("../results/image_concat_umat_" + to_string(frame_idx) + ".png",
-            image_concat_umat_);
+    // 保存帧
+    if (g_save_each_frame) {
+      imwrite("../results/image_concat_umat_" + to_string(frame_idx) + ".png",
+             image_concat_umat_);
+    }
 
     frame_idx++;
     tn = cv::getTickCount();
