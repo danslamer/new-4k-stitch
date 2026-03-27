@@ -1,0 +1,6 @@
+/datasets/*
+/.clion.source.upload.marker
+.idea
+cmake-build*
+/results/*
+/build/*
