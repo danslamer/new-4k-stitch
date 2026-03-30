@@ -23,6 +23,7 @@ class ImageStitcher {
 
     void WarpImages(
         const int& img_idx,
+        const size_t& frame_idx,
         const int& fusion_pixel,
         const vector<cv::UMat>& image_vector,
         vector<mutex>& image_mutex_vector,

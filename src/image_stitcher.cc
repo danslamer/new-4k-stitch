@@ -3,9 +3,11 @@
 //
 
 #include "image_stitcher.h"
+#include "logger.h"
 
 #include <thread>
 #include <mutex>
+#include <sstream>
 
 void ImageStitcher::SetParams(
     const int& blend_width,
@@ -79,6 +81,7 @@ void ImageStitcher::CreateWeightMap(const int& height, const int& width) {
 
 void ImageStitcher::WarpImages(
     const int& img_idx,
+    const size_t& frame_idx,
     const int& fusion_pixel,
     const vector<cv::UMat>& image_vector,
     vector<mutex>& image_mutex_vector,
@@ -149,9 +152,11 @@ void ImageStitcher::WarpImages(
                                  roi_vect_[img_idx].height)));
 
   tn = cv::getTickCount();
-  cout << "[image_stitcher] "
-       << (t1 - t0) / cv::getTickFrequency() << ";"
-       << (t2 - t1) / cv::getTickFrequency() << ";"
-       << (t3 - t2) / cv::getTickFrequency() << ";"
-       << 1 / (tn - t0) * cv::getTickFrequency() << endl;
+  std::ostringstream timing_stream;
+  timing_stream << "[image_stitcher] "
+                << (t1 - t0) / cv::getTickFrequency() << ";"
+                << (t2 - t1) / cv::getTickFrequency() << ";"
+                << (t3 - t2) / cv::getTickFrequency() << ";"
+                << 1 / (tn - t0) * cv::getTickFrequency();
+  Logger::GetInstance().LogFrame(frame_idx, timing_stream.str());
 }

@@ -4,9 +4,11 @@
 //
 
 #include "stitching_param_generater.h"
+#include "logger.h"
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 
@@ -15,8 +17,8 @@ using namespace cv;
 using namespace cv::detail;
 
 #define ENABLE_LOG 0
-#define LOG(msg) std::cout << msg
-#define LOGLN(msg) std::cout << msg << std::endl
+#define LOG(msg) do { std::ostringstream log_stream; log_stream << msg; Logger::GetInstance().Log(log_stream.str()); } while (false)
+#define LOGLN(msg) LOG(msg)
 
 
 StitchingParamGenerator::StitchingParamGenerator(
@@ -92,7 +94,7 @@ void StitchingParamGenerator::InitCameraParam() {
   else
     estimator = makePtr<HomographyBasedEstimator>();
   if (!(*estimator)(features, pairwise_matches, camera_params_vector_)) {
-    cout << "Homography estimation failed.\n";
+    Logger::GetInstance().LogError("Homography estimation failed.");
     assert(false);
   }
   for (auto& i : camera_params_vector_) {
@@ -110,9 +112,8 @@ void StitchingParamGenerator::InitCameraParam() {
         makePtr<detail::BundleAdjusterAffinePartial>();
   else if (ba_cost_func == "no") adjuster = makePtr<NoBundleAdjuster>();
   else {
-    cout << "Unknown bundle adjustment cost function: '"
-         << ba_cost_func
-         << "'.\n";
+    Logger::GetInstance().LogError(
+        "Unknown bundle adjustment cost function: '" + ba_cost_func + "'.");
     assert(false);
   }
   adjuster->setConfThresh(conf_thresh);
@@ -124,7 +125,7 @@ void StitchingParamGenerator::InitCameraParam() {
   if (ba_refine_mask[4] == 'x') refine_mask(1, 2) = 1;
   adjuster->setRefinementMask(refine_mask);
   if (!(*adjuster)(features, pairwise_matches, camera_params_vector_)) {
-    cout << "Camera parameters adjusting failed.\n";
+    Logger::GetInstance().LogError("Camera parameters adjusting failed.");
     assert(false);
   }
 
@@ -212,7 +213,8 @@ void StitchingParamGenerator::InitWarper() {
       warper_creator = makePtr<cv::TransverseMercatorWarper>();
   }
   if (!warper_creator) {
-    cout << "Can't create the following warper '" << warp_type << "'\n";
+    Logger::GetInstance().LogError(
+        "Can't create the following warper '" + warp_type + "'");
     assert(false);
   }
   rotation_warper_ =
@@ -266,7 +268,7 @@ void StitchingParamGenerator::InitWarper() {
     Mat K;
     camera_params_vector_[i].K().convertTo(K, CV_32F);
     Rect roi = rotation_warper_->warpRoi(sz, K, camera_params_vector_[i].R);
-    cout << "roi" << roi << endl;
+    LOG("roi" << roi);
     roi_tl_bias.x = min(roi.tl().x, roi_tl_bias.x);
     roi_tl_bias.y = min(roi.tl().y, roi_tl_bias.y);
     projected_image_roi_vect[i] = roi;
@@ -332,8 +334,10 @@ void StitchingParamGenerator::InitUndistortMap() {
 
         cv::FileStorage::READ);
     if (!fs_read.isOpened()) {
-      fprintf(stderr, "%s:%d:loadParams falied. 'camera.yml' does not exist\n",
-              __FILE__, __LINE__);
+      std::ostringstream error_stream;
+      error_stream << __FILE__ << ":" << __LINE__
+                   << ":loadParams falied. 'camera.yml' does not exist";
+      Logger::GetInstance().LogError(error_stream.str());
       return;
     }
     cv::Mat R, K;

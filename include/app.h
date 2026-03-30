@@ -9,6 +9,7 @@
 
 #include "sensor_data_interface.h"
 #include "image_stitcher.h"
+#include "logger.h"
 
 using namespace std;
 

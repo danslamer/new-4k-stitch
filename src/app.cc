@@ -12,6 +12,7 @@
 
 #include "image_stitcher.h"
 #include "stitching_param_generater.h"
+#include "logger.h"
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "UnreachableCode"
@@ -21,6 +22,9 @@ bool g_save_each_frame = false;
 
 
 App::App() {
+  Logger::GetInstance().Initialize();
+  Logger::GetInstance().Log("[App] Application starting...");
+  
   sensorDataInterface_.InitVideoCapture(num_img_);
 
   vector<cv::UMat> first_image_vector = vector<cv::UMat>(num_img_);
@@ -81,6 +85,7 @@ App::App() {
           &ImageStitcher::WarpImages,
           &image_stitcher_,
           img_idx,
+          frame_idx,
           20,
           image_vector,
           ref(image_mutex_vector),
@@ -95,18 +100,19 @@ App::App() {
 
     // 保存帧
     if (g_save_each_frame) {
-      imwrite("../results/image_concat_umat_" + to_string(frame_idx) + ".png",
-             image_concat_umat_);
+      std::string filename = "image_concat_umat_" + to_string(frame_idx) + ".png";
+      Logger::GetInstance().SaveImage(image_concat_umat_, filename, frame_idx);
     }
 
-    frame_idx++;
     tn = cv::getTickCount();
 
-    cout << "[app] "
-         << (t1 - t0) / cv::getTickFrequency() << ";"
-         << (t2 - t1) / cv::getTickFrequency() << endl;
-    cout << 1 / ((t2 - t0) / cv::getTickFrequency()) << " FPS; "
-         << 1 / ((tn - t0) / cv::getTickFrequency()) << " Real FPS." << endl;
+    std::string timing_msg = "[app] " + to_string((t1 - t0) / cv::getTickFrequency()) + ";" + 
+                             to_string((t2 - t1) / cv::getTickFrequency());
+    std::string fps_msg = to_string(1 / ((t2 - t0) / cv::getTickFrequency())) + " FPS; " + 
+                          to_string(1 / ((tn - t0) / cv::getTickFrequency())) + " Real FPS.";
+    Logger::GetInstance().LogFrame(frame_idx, timing_msg);
+    Logger::GetInstance().LogFrame(frame_idx, fps_msg);
+    frame_idx++;
 
   }
   record_videos_thread.join();

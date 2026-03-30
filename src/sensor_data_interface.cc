@@ -4,6 +4,7 @@
 //
 
 #include "sensor_data_interface.h"
+#include "logger.h"
 
 #include <string>
 #include <thread>
@@ -48,8 +49,9 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
     std::string file_name = video_dir + video_file_name[i];
 
     cv::VideoCapture capture(file_name);
-    if (!capture.isOpened())
-      std::cout << "fail to open!" << std::endl;
+    if (!capture.isOpened()) {
+      Logger::GetInstance().LogError("fail to open! " + file_name);
+    }
     video_capture_vector_.push_back(capture);
 
     cv::UMat frame;
