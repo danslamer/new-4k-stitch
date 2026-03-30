@@ -31,6 +31,7 @@ class SensorDataInterface {
  private:
     const size_t max_queue_length_;
     size_t num_img_;
+    size_t frame_idx; // 帧索引
     std::vector<std::queue<cv::UMat>> image_queue_vector_;
     std::vector<std::mutex> image_queue_mutex_vector_;
     std::vector<cv::VideoCapture> video_capture_vector_;

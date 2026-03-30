@@ -19,3 +19,6 @@ add_executable(${PROJECT_NAME}
         src/logger.cc include/logger.h)
 
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS} -lpthread -lm)
+
+add_executable(video_decode_test src/video_decode_test.cc src/sensor_data_interface.cc src/logger.cc)
+target_link_libraries(video_decode_test ${OpenCV_LIBS} -lpthread -lm)

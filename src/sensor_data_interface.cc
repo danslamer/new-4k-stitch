@@ -12,6 +12,7 @@
 SensorDataInterface::SensorDataInterface()
     : max_queue_length_(2) {
   num_img_ = 0;
+  frame_idx = 0;
 }
 
 //读取图片数据
