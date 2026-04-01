@@ -72,6 +72,49 @@ const AVCodec* FindPreferredDecoder(AVCodecID codec_id) {
   return avcodec_find_decoder(codec_id);
 }
 
+struct DecoderPerfStats {
+  size_t packets_read = 0;
+  size_t packets_sent = 0;
+  size_t frames_decoded = 0;
+  size_t hardware_frames = 0;
+  size_t software_frames = 0;
+  size_t queue_pushes = 0;
+  size_t queue_drops = 0;
+  double read_seconds = 0.0;
+  double send_seconds = 0.0;
+  double receive_seconds = 0.0;
+  double convert_seconds = 0.0;
+  double upload_seconds = 0.0;
+  std::chrono::steady_clock::time_point report_time =
+      std::chrono::steady_clock::now();
+};
+
+std::string FormatDecoderPerfLog(size_t decoder_index,
+                                 const std::string& decoder_name,
+                                 const std::string& frame_format_name,
+                                 const DecoderPerfStats& stats,
+                                 double elapsed_seconds) {
+  std::ostringstream stream;
+  stream << "[decoder_perf " << decoder_index << "]"
+         << " decoder=" << decoder_name
+         << " frame_fmt=" << frame_format_name
+         << " packets=" << stats.packets_read
+         << " frames=" << stats.frames_decoded
+         << " fps=" << (elapsed_seconds > 0.0
+                            ? static_cast<double>(stats.frames_decoded) / elapsed_seconds
+                            : 0.0)
+         << " hw_frames=" << stats.hardware_frames
+         << " sw_frames=" << stats.software_frames
+         << " read_ms=" << stats.read_seconds * 1000.0
+         << " send_ms=" << stats.send_seconds * 1000.0
+         << " receive_ms=" << stats.receive_seconds * 1000.0
+         << " convert_ms=" << stats.convert_seconds * 1000.0
+         << " upload_ms=" << stats.upload_seconds * 1000.0
+         << " queue_pushes=" << stats.queue_pushes
+         << " queue_drops=" << stats.queue_drops;
+  return stream.str();
+}
+
 }  // namespace
 
 SensorDataInterface::SensorDataInterface()
@@ -128,6 +171,8 @@ void SensorDataInterface::StartDecodeThreads() {
   for (size_t i = 0; i < num_img_; ++i) {
     decode_threads_.emplace_back([this, i]() {
       const std::string& file_name = video_file_paths_[i];
+      DecoderPerfStats perf_stats;
+      std::string last_frame_format_name = "unknown";
 
       AVFormatContext* format_context = nullptr;
       AVCodecContext* codec_context = nullptr;
@@ -161,7 +206,10 @@ void SensorDataInterface::StartDecodeThreads() {
 
       auto receive_and_queue_frames = [&]() -> bool {
         while (!stop_requested_) {
+          const double receive_t0 = cv::getTickCount();
           int receive_ret = avcodec_receive_frame(codec_context, decoded_frame);
+          perf_stats.receive_seconds +=
+              (cv::getTickCount() - receive_t0) / cv::getTickFrequency();
           if (receive_ret == AVERROR(EAGAIN)) {
             return true;
           }
@@ -176,8 +224,15 @@ void SensorDataInterface::StartDecodeThreads() {
           }
 
           AVFrame* frame_to_convert = decoded_frame;
+          const AVPixelFormat decoded_pixel_format =
+              static_cast<AVPixelFormat>(decoded_frame->format);
+          const char* decoded_format_name = av_get_pix_fmt_name(decoded_pixel_format);
+          last_frame_format_name =
+              decoded_format_name != nullptr ? decoded_format_name : "unknown";
+          perf_stats.frames_decoded++;
           if (IsHardwarePixelFormat(
-                  static_cast<AVPixelFormat>(decoded_frame->format))) {
+                  decoded_pixel_format)) {
+            perf_stats.hardware_frames++;
             if (av_hwframe_transfer_data(software_frame, decoded_frame, 0) < 0) {
               Logger::GetInstance().LogError(
                   "[decoder " + std::to_string(i) +
@@ -186,8 +241,11 @@ void SensorDataInterface::StartDecodeThreads() {
               continue;
             }
             frame_to_convert = software_frame;
+          } else {
+            perf_stats.software_frames++;
           }
 
+          const double convert_t0 = cv::getTickCount();
           sws_context = sws_getCachedContext(
               sws_context,
               frame_to_convert->width,
@@ -225,16 +283,23 @@ void SensorDataInterface::StartDecodeThreads() {
                     frame_to_convert->height,
                     destination_data,
                     destination_linesize);
+          perf_stats.convert_seconds +=
+              (cv::getTickCount() - convert_t0) / cv::getTickFrequency();
 
+          const double upload_t0 = cv::getTickCount();
           cv::UMat umat_frame;
           bgr_frame.copyTo(umat_frame);
+          perf_stats.upload_seconds +=
+              (cv::getTickCount() - upload_t0) / cv::getTickFrequency();
 
           {
             std::lock_guard<std::mutex> queue_lock(image_queue_mutex_vector_[i]);
             if (image_queue_vector_[i].size() >= max_queue_length_) {
               image_queue_vector_[i].pop();
+              perf_stats.queue_drops++;
             }
             image_queue_vector_[i].push(umat_frame);
+            perf_stats.queue_pushes++;
           }
 
           {
@@ -253,6 +318,21 @@ void SensorDataInterface::StartDecodeThreads() {
               decoded_frames_since_report_[i] = 0;
               decode_report_time_vector_[i] = now;
             }
+          }
+
+          const auto now = std::chrono::steady_clock::now();
+          const std::chrono::duration<double> perf_elapsed =
+              now - perf_stats.report_time;
+          if (perf_elapsed.count() >= 1.0) {
+            Logger::GetInstance().Log(
+                FormatDecoderPerfLog(i,
+                                     codec_context->codec != nullptr
+                                         ? codec_context->codec->name
+                                         : "unknown",
+                                     last_frame_format_name,
+                                     perf_stats,
+                                     perf_elapsed.count()));
+            perf_stats = DecoderPerfStats{};
           }
 
           av_frame_unref(software_frame);
@@ -355,17 +435,29 @@ void SensorDataInterface::StartDecodeThreads() {
       }
 
 #ifdef ENABLE_RK_HARDWARE_DECODING
-      Logger::GetInstance().Log(
-          "[decoder " + std::to_string(i) + "] hardware decoding enabled with " +
-          std::string(codec->name));
+      Logger::GetInstance().Log("[decoder " + std::to_string(i) +
+                                "] hardware decode requested, actual decoder=" +
+                                std::string(codec->name) +
+                                " size=" + std::to_string(codec_context->width) +
+                                "x" + std::to_string(codec_context->height));
+      if (std::string(codec->name).find("rkmpp") == std::string::npos) {
+        Logger::GetInstance().LogError(
+            "[decoder " + std::to_string(i) +
+            "] hardware decode was requested but FFmpeg selected a non-rkmpp decoder.");
+      }
 #else
       Logger::GetInstance().Log(
           "[decoder " + std::to_string(i) + "] FFmpeg software decoding enabled with " +
-          std::string(codec->name));
+          std::string(codec->name) +
+          " size=" + std::to_string(codec_context->width) +
+          "x" + std::to_string(codec_context->height));
 #endif
 
       while (!stop_requested_) {
+        const double read_t0 = cv::getTickCount();
         const int read_ret = av_read_frame(format_context, packet);
+        perf_stats.read_seconds +=
+            (cv::getTickCount() - read_t0) / cv::getTickFrequency();
         if (read_ret == AVERROR_EOF) {
           avcodec_send_packet(codec_context, nullptr);
           if (!receive_and_queue_frames()) {
@@ -392,7 +484,11 @@ void SensorDataInterface::StartDecodeThreads() {
         }
 
         if (packet->stream_index == video_stream_index) {
+          perf_stats.packets_read++;
+          const double send_t0 = cv::getTickCount();
           const int send_ret = avcodec_send_packet(codec_context, packet);
+          perf_stats.send_seconds +=
+              (cv::getTickCount() - send_t0) / cv::getTickFrequency();
           if (send_ret < 0) {
             Logger::GetInstance().LogError(
                 "[decoder " + std::to_string(i) + "] send packet failed: " +
@@ -400,6 +496,7 @@ void SensorDataInterface::StartDecodeThreads() {
             av_packet_unref(packet);
             break;
           }
+          perf_stats.packets_sent++;
 
           if (!receive_and_queue_frames()) {
             av_packet_unref(packet);

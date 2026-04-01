@@ -56,6 +56,8 @@ cd /userdata/Projects/yzy/video-stitching/
 
 ## ffmpeg
 ~/dev/ffmpeg
+~/dev/ffmpeg60
+
 测试解码器
 解码但不复制回。没有 AFBC（ARM 帧缓冲区压缩）。
 ./ffmpeg -stream_loop -1 -hwaccel rkmpp -hwaccel_output_format drm_prime -i /userdata/Projects/yzy/new-4k-stitch/datasets/4k-test/40.mp4 -an -sn -vframes 5000 -f null -
@@ -68,6 +70,10 @@ cd /userdata/Projects/yzy/video-stitching/
 
 解码但不复制回。如果 RGA3 可用，使用 AFBC。
 ./ffmpeg -stream_loop -1 -hwaccel rkmpp -hwaccel_output_format drm_prime -afbc rga -i /path/to/any-h264-video.mp4 -an -sn -vframes 5000 -f null -
+
+确认能连接到60版本的ffmpeg,,你要看到的是 libavcodec.so.60，而不是 so.59
+ldd ./image-stitching | grep avcodec
+
 
 ## 新仓库地址
 cd /userdata/Projects/yzy/new-4k-stitch
