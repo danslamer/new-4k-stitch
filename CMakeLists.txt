@@ -6,32 +6,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(ENABLE_RK_HARDWARE_DECODING "Enable FFmpeg Rockchip hardware decoding" ON)
 
-# -----------------------------
-# 设置自定义 FFmpeg 6 路径
-# -----------------------------
-# 假设你安装 FFmpeg 6 到 ~/dev/ffmpeg60
 set(FFMPEG_ROOT "$ENV{HOME}/dev/ffmpeg60")
-
-# 设置 pkg-config 搜索路径和运行时库路径
 set(ENV{PKG_CONFIG_PATH} "${FFMPEG_ROOT}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 set(ENV{LD_LIBRARY_PATH} "${FFMPEG_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
 
-# -----------------------------
-# 查找依赖库
-# -----------------------------
 find_package(OpenCV 4 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 
-# 使用 pkg-config 查找 FFmpeg 6
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
 pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
 pkg_check_modules(SWSCALE REQUIRED IMPORTED_TARGET libswscale)
 
-# -----------------------------
-# 编译源文件
-# -----------------------------
+find_path(RGA_INCLUDE_DIR
+    NAMES im2d.h
+    PATH_SUFFIXES include rga
+)
+find_library(RGA_LIBRARY
+    NAMES rga
+)
+
 add_executable(${PROJECT_NAME}
     src/app.cc
     include/app.h
@@ -45,7 +40,6 @@ add_executable(${PROJECT_NAME}
     include/logger.h
 )
 
-# 包含头文件
 target_include_directories(${PROJECT_NAME} PRIVATE
     include
     ${OpenCV_INCLUDE_DIRS}
@@ -55,7 +49,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${SWSCALE_INCLUDE_DIRS}
 )
 
-# 链接库
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${OpenCV_LIBS}
     Threads::Threads
@@ -65,7 +58,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::SWSCALE
 )
 
-# 开启硬解码宏
 if(ENABLE_RK_HARDWARE_DECODING)
+    if(NOT RGA_INCLUDE_DIR OR NOT RGA_LIBRARY)
+        message(FATAL_ERROR "ENABLE_RK_HARDWARE_DECODING requires librga (im2d.h and librga).")
+    endif()
+    target_include_directories(${PROJECT_NAME} PRIVATE ${RGA_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${RGA_LIBRARY})
     target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_RK_HARDWARE_DECODING=1)
 endif()

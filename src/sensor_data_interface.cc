@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <sstream>
 #include <thread>
 
@@ -21,6 +22,16 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#ifdef ENABLE_RK_HARDWARE_DECODING
+#if __has_include(<im2d.h>)
+#include <im2d.h>
+#elif __has_include(<rga/im2d.h>)
+#include <rga/im2d.h>
+#else
+#error "librga header im2d.h not found"
+#endif
+#endif
+
 namespace {
 
 std::string AvErrorToString(int errnum) {
@@ -28,6 +39,77 @@ std::string AvErrorToString(int errnum) {
   av_strerror(errnum, errbuf, sizeof(errbuf));
   return std::string(errbuf);
 }
+
+#ifdef ENABLE_RK_HARDWARE_DECODING
+std::string ImStatusToString(IM_STATUS status) {
+  const char* status_name = imStrError(status);
+  return status_name != nullptr ? std::string(status_name)
+                                : std::string("unknown rga status");
+}
+
+bool ConvertFrameToBgrWithRga(const AVFrame* frame,
+                              cv::Mat& bgr_frame,
+                              std::string& error_message) {
+  if (frame == nullptr) {
+    error_message = "input frame is null";
+    return false;
+  }
+  if (frame->format != AV_PIX_FMT_NV12) {
+    error_message = "RGA color conversion only supports NV12 frames";
+    return false;
+  }
+  if (frame->data[0] == nullptr || frame->data[1] == nullptr) {
+    error_message = "NV12 frame planes are null";
+    return false;
+  }
+
+  const int src_width_stride = frame->linesize[0];
+  const int src_height_stride = frame->height;
+  const size_t src_bytes =
+      static_cast<size_t>(src_width_stride) * static_cast<size_t>(src_height_stride) * 3 / 2;
+  std::vector<uint8_t> nv12_buffer(src_bytes);
+
+  for (int row = 0; row < frame->height; ++row) {
+    std::memcpy(nv12_buffer.data() + row * src_width_stride,
+                frame->data[0] + row * frame->linesize[0],
+                static_cast<size_t>(frame->width));
+  }
+
+  uint8_t* uv_destination =
+      nv12_buffer.data() + static_cast<size_t>(src_width_stride) * frame->height;
+  for (int row = 0; row < frame->height / 2; ++row) {
+    std::memcpy(uv_destination + row * src_width_stride,
+                frame->data[1] + row * frame->linesize[1],
+                static_cast<size_t>(frame->width));
+  }
+
+  bgr_frame.create(frame->height, frame->width, CV_8UC3);
+
+  rga_buffer_t src_buffer = wrapbuffer_virtualaddr(nv12_buffer.data(),
+                                                   frame->width,
+                                                   frame->height,
+                                                   RK_FORMAT_YCbCr_420_SP,
+                                                   src_width_stride,
+                                                   src_height_stride);
+  rga_buffer_t dst_buffer = wrapbuffer_virtualaddr(bgr_frame.data,
+                                                   frame->width,
+                                                   frame->height,
+                                                   RK_FORMAT_BGR_888,
+                                                   static_cast<int>(bgr_frame.step[0] / 3),
+                                                   frame->height);
+
+  const IM_STATUS status = imcvtcolor(src_buffer,
+                                      dst_buffer,
+                                      RK_FORMAT_YCbCr_420_SP,
+                                      RK_FORMAT_BGR_888);
+  if (status != IM_STATUS_SUCCESS) {
+    error_message = "imcvtcolor failed: " + ImStatusToString(status);
+    return false;
+  }
+
+  return true;
+}
+#endif
 
 bool IsHardwarePixelFormat(AVPixelFormat pixel_format) {
   const AVPixFmtDescriptor* descriptor = av_pix_fmt_desc_get(pixel_format);
@@ -246,6 +328,18 @@ void SensorDataInterface::StartDecodeThreads() {
           }
 
           const double convert_t0 = cv::getTickCount();
+          cv::Mat bgr_frame;
+#ifdef ENABLE_RK_HARDWARE_DECODING
+          std::string rga_error;
+          if (!ConvertFrameToBgrWithRga(frame_to_convert, bgr_frame, rga_error)) {
+            Logger::GetInstance().LogError(
+                "[decoder " + std::to_string(i) +
+                "] RGA color conversion failed: " + rga_error);
+            av_frame_unref(software_frame);
+            av_frame_unref(decoded_frame);
+            return false;
+          }
+#else
           sws_context = sws_getCachedContext(
               sws_context,
               frame_to_convert->width,
@@ -268,9 +362,9 @@ void SensorDataInterface::StartDecodeThreads() {
             return false;
           }
 
-          cv::Mat bgr_frame(frame_to_convert->height,
-                            frame_to_convert->width,
-                            CV_8UC3);
+          bgr_frame.create(frame_to_convert->height,
+                           frame_to_convert->width,
+                           CV_8UC3);
           uint8_t* destination_data[4] = {
               bgr_frame.data, nullptr, nullptr, nullptr};
           int destination_linesize[4] = {
@@ -283,6 +377,7 @@ void SensorDataInterface::StartDecodeThreads() {
                     frame_to_convert->height,
                     destination_data,
                     destination_linesize);
+#endif
           perf_stats.convert_seconds +=
               (cv::getTickCount() - convert_t0) / cv::getTickFrequency();
 
@@ -439,7 +534,8 @@ void SensorDataInterface::StartDecodeThreads() {
                                 "] hardware decode requested, actual decoder=" +
                                 std::string(codec->name) +
                                 " size=" + std::to_string(codec_context->width) +
-                                "x" + std::to_string(codec_context->height));
+                                "x" + std::to_string(codec_context->height) +
+                                " color_convert=RGA");
       if (std::string(codec->name).find("rkmpp") == std::string::npos) {
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
