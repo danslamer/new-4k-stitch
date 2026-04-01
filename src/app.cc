@@ -6,6 +6,7 @@
 
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,9 +67,6 @@ App::App() {
   vector<cv::UMat> image_vector(num_img_);
   vector<mutex> image_mutex_vector(num_img_);
   vector<cv::UMat> images_warped_vector(num_img_);
-  thread record_videos_thread(
-      &SensorDataInterface::RecordVideos,
-      &sensorDataInterface_);
   double t0, t1, t2, t3, tn;
 
   size_t frame_idx = 0;
@@ -110,13 +108,18 @@ App::App() {
                              to_string((t2 - t1) / cv::getTickFrequency());
     std::string fps_msg = to_string(1 / ((t2 - t0) / cv::getTickFrequency())) + " FPS; " + 
                           to_string(1 / ((tn - t0) / cv::getTickFrequency())) + " Real FPS.";
+    vector<double> decode_fps_vector = sensorDataInterface_.GetDecodeFpsSnapshot();
+    std::ostringstream decode_fps_stream;
+    decode_fps_stream << "[decode_fps]";
+    for (size_t i = 0; i < decode_fps_vector.size(); ++i) {
+      decode_fps_stream << " ch" << i << "=" << decode_fps_vector[i];
+    }
     Logger::GetInstance().LogFrame(frame_idx, timing_msg);
     Logger::GetInstance().LogFrame(frame_idx, fps_msg);
+    Logger::GetInstance().LogFrame(frame_idx, decode_fps_stream.str());
     frame_idx++;
 
   }
-  record_videos_thread.join();
-
 }
 
 

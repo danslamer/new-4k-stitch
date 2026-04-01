@@ -54,6 +54,21 @@ opencv>=4.5
 cd /userdata/Projects/yzy/gpu-based-image-stitching-dataset-new/gpu-based-image-stitching/
 cd /userdata/Projects/yzy/video-stitching/
 
+## ffmpeg
+~/dev/ffmpeg
+测试解码器
+解码但不复制回。没有 AFBC（ARM 帧缓冲区压缩）。
+./ffmpeg -stream_loop -1 -hwaccel rkmpp -hwaccel_output_format drm_prime -i /userdata/Projects/yzy/new-4k-stitch/datasets/4k-test/40.mp4 -an -sn -vframes 5000 -f null -
+
+解码并复制回。没有 AFBC。（AFBC 不能与复制回或 hwdownload 滤镜一起使用）
+./ffmpeg -stream_loop -1 -hwaccel rkmpp -i /userdata/Projects/yzy/new-4k-stitch/datasets/4k-test/40.mp4 -an -sn -vframes 5000 -f null -
+
+解码但不复制回。有 AFBC。
+./ffmpeg -stream_loop -1 -hwaccel rkmpp -hwaccel_output_format drm_prime -afbc 1 -i /path/to/any-h264-video.mp4 -an -sn -vframes 5000 -f null -
+
+解码但不复制回。如果 RGA3 可用，使用 AFBC。
+./ffmpeg -stream_loop -1 -hwaccel rkmpp -hwaccel_output_format drm_prime -afbc rga -i /path/to/any-h264-video.mp4 -an -sn -vframes 5000 -f null -
+
 ## 新仓库地址
 cd /userdata/Projects/yzy/new-4k-stitch
 
@@ -562,3 +577,54 @@ bash
 ssh root@192.168.0.10
 Putty：
 主机名填写 192.168.0.10，端口 22，连接类型 SSH，然后点击“Open”。
+
+
+https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation
+
+# Native compilation on ARM/ARM64 host
+
+# Build MPP
+mkdir -p ~/dev && cd ~/dev
+git clone -b jellyfin-mpp --depth=1 https://gitee.com/nyanmisaka/mpp.git rkmpp
+pushd rkmpp
+mkdir rkmpp_build
+pushd rkmpp_build
+cmake \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_TEST=OFF \
+    ..
+make -j $(nproc)
+make install
+
+
+# Build RGA
+mkdir -p ~/dev && cd ~/dev
+git clone -b jellyfin-rga --depth=1 https://gitee.com/nyanmisaka/rga.git rkrga
+meson setup rkrga rkrga_build \
+    --prefix=/usr \
+    --libdir=lib \
+    --buildtype=release \
+    --default-library=shared \
+    -Dcpp_args=-fpermissive \
+    -Dlibdrm=false \
+    -Dlibrga_demo=false
+meson configure rkrga_build
+ninja -C rkrga_build install
+
+
+# Build the minimal FFmpeg (You can customize the configure and install prefix)
+mkdir -p ~/dev && cd ~/dev
+git clone --depth=1 https://github.com/nyanmisaka/ffmpeg-rockchip.git ffmpeg
+cd ffmpeg
+./configure --prefix=/usr --enable-gpl --enable-version3 --enable-libdrm --enable-rkmpp --enable-rkrga
+make -j $(nproc)
+
+# Try the compiled FFmpeg without installation
+./ffmpeg -decoders | grep rkmpp
+./ffmpeg -encoders | grep rkmpp
+./ffmpeg -filters | grep rkrga
+
+# Install FFmpeg to the prefix path
+make install
