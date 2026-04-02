@@ -92,11 +92,14 @@ RGA 直接在硬件 buffer 上做格式转换 / resize / copy
 低风险路线
 保留 rkmpp + RGA，去掉 UMat，改成全链路 cv::Mat
 这是最容易落地、最快验证收益的方案。
-``收益很低``
+``负收益``
 
 最高性能路线
 重构拼接链，让它直接消费 RK 硬件 buffer / DMA-BUF / DRM buffer。
 这才是真正“硬解后直接传 GPU”，但改动会非常大，基本不是当前 image_stitcher 这套 OpenCV 代码的小修。
+
+✅ 对接 FFmpeg rkmpp（DMA零拷贝）
+✅ 或直接改成 RGA全硬件拼接版本（性能再翻倍）
 
 现在的数据流是：
 rkmpp 解码->RGA 转 BGR->直接以 cv::Mat 入队->App 取 Mat->ImageStitcher 全程用 Mat 做 remap/blend/copy
