@@ -8,7 +8,7 @@
 #include "opencv2/opencv.hpp"
 
 #include "sensor_data_interface.h"
-#include "image_stitcher.h"
+#include "image_stitcher_nv12.h"
 #include "logger.h"
 
 using namespace std;
@@ -22,11 +22,9 @@ class App {
  private:
     std::size_t num_img_;
     SensorDataInterface sensorDataInterface_;
-    ImageStitcher image_stitcher_;
-    vector<cv::Mat> image_vector_;
-    cv::UMat image_concat_umat_;
+    ImageStitcherNV12 image_stitcher_;
+    NV12Frame image_concat_nv12_;
     int total_cols_;
-
 };
 
 #endif //IMAGE_STITCHING_APP_H

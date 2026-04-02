@@ -8,6 +8,10 @@
 struct NV12Frame {
     cv::UMat y;   // H x W, CV_8UC1
     cv::UMat uv;  // H/2 x W/2, CV_8UC2
+
+    bool empty() const {
+        return y.empty() || uv.empty();
+    }
 };
 
 class ImageStitcherNV12 {

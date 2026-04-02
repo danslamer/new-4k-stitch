@@ -15,6 +15,8 @@
 
 #include <opencv2/opencv.hpp>
 
+#include "image_stitcher_nv12.h"
+
 class SensorDataInterface {
  public:
     SensorDataInterface();
@@ -23,8 +25,8 @@ class SensorDataInterface {
     void InitExampleImages();
     void InitVideoCapture(size_t& num_img);
 
-    void get_image_vector(std::vector<cv::UMat>& image_vector,
-                          std::vector<std::mutex>& image_mutex_vector);
+    void get_nv12_frame_vector(std::vector<NV12Frame>& image_vector,
+                               std::vector<std::mutex>& image_mutex_vector);
 
     void RecordVideos();
     std::vector<double> GetDecodeFpsSnapshot();
@@ -36,7 +38,7 @@ class SensorDataInterface {
     const size_t max_queue_length_;
     size_t num_img_;
     size_t frame_idx;
-    std::vector<std::queue<cv::UMat>> image_queue_vector_;
+    std::vector<std::queue<NV12Frame>> image_queue_vector_;
     std::vector<std::mutex> image_queue_mutex_vector_;
     std::vector<cv::VideoCapture> video_capture_vector_;
     std::vector<std::string> video_file_paths_;

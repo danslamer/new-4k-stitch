@@ -12,6 +12,7 @@
 #include <cstring>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -19,18 +20,7 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
 }
-
-#ifdef ENABLE_RK_HARDWARE_DECODING
-#if __has_include(<im2d.h>)
-#include <im2d.h>
-#elif __has_include(<rga/im2d.h>)
-#include <rga/im2d.h>
-#else
-#error "librga header im2d.h not found"
-#endif
-#endif
 
 namespace {
 
@@ -39,77 +29,6 @@ std::string AvErrorToString(int errnum) {
   av_strerror(errnum, errbuf, sizeof(errbuf));
   return std::string(errbuf);
 }
-
-#ifdef ENABLE_RK_HARDWARE_DECODING
-std::string ImStatusToString(IM_STATUS status) {
-  const char* status_name = imStrError(status);
-  return status_name != nullptr ? std::string(status_name)
-                                : std::string("unknown rga status");
-}
-
-bool ConvertFrameToBgrWithRga(const AVFrame* frame,
-                              cv::Mat& bgr_frame,
-                              std::string& error_message) {
-  if (frame == nullptr) {
-    error_message = "input frame is null";
-    return false;
-  }
-  if (frame->format != AV_PIX_FMT_NV12) {
-    error_message = "RGA color conversion only supports NV12 frames";
-    return false;
-  }
-  if (frame->data[0] == nullptr || frame->data[1] == nullptr) {
-    error_message = "NV12 frame planes are null";
-    return false;
-  }
-
-  const int src_width_stride = frame->linesize[0];
-  const int src_height_stride = frame->height;
-  const size_t src_bytes =
-      static_cast<size_t>(src_width_stride) * static_cast<size_t>(src_height_stride) * 3 / 2;
-  std::vector<uint8_t> nv12_buffer(src_bytes);
-
-  for (int row = 0; row < frame->height; ++row) {
-    std::memcpy(nv12_buffer.data() + row * src_width_stride,
-                frame->data[0] + row * frame->linesize[0],
-                static_cast<size_t>(frame->width));
-  }
-
-  uint8_t* uv_destination =
-      nv12_buffer.data() + static_cast<size_t>(src_width_stride) * frame->height;
-  for (int row = 0; row < frame->height / 2; ++row) {
-    std::memcpy(uv_destination + row * src_width_stride,
-                frame->data[1] + row * frame->linesize[1],
-                static_cast<size_t>(frame->width));
-  }
-
-  bgr_frame.create(frame->height, frame->width, CV_8UC3);
-
-  rga_buffer_t src_buffer = wrapbuffer_virtualaddr(nv12_buffer.data(),
-                                                   frame->width,
-                                                   frame->height,
-                                                   RK_FORMAT_YCbCr_420_SP,
-                                                   src_width_stride,
-                                                   src_height_stride);
-  rga_buffer_t dst_buffer = wrapbuffer_virtualaddr(bgr_frame.data,
-                                                   frame->width,
-                                                   frame->height,
-                                                   RK_FORMAT_BGR_888,
-                                                   static_cast<int>(bgr_frame.step[0] / 3),
-                                                   frame->height);
-
-  const IM_STATUS status = imcvtcolor(src_buffer,
-                                      dst_buffer,
-                                      RK_FORMAT_YCbCr_420_SP,
-                                      RK_FORMAT_BGR_888);
-  if (status != IM_STATUS_SUCCESS) {
-    error_message = "imcvtcolor failed: " + ImStatusToString(status);
-    return false;
-  }
-
-  return true;
-}
-#endif
 
 bool IsHardwarePixelFormat(AVPixelFormat pixel_format) {
   const AVPixFmtDescriptor* descriptor = av_pix_fmt_desc_get(pixel_format);
@@ -160,16 +79,127 @@ struct DecoderPerfStats {
   size_t frames_decoded = 0;
   size_t hardware_frames = 0;
   size_t software_frames = 0;
+  size_t hw_transfers = 0;
   size_t queue_pushes = 0;
   size_t queue_drops = 0;
   double read_seconds = 0.0;
   double send_seconds = 0.0;
   double receive_seconds = 0.0;
-  double convert_seconds = 0.0;
-  double upload_seconds = 0.0;
+  double transfer_seconds = 0.0;
+  double nv12_extract_seconds = 0.0;
   std::chrono::steady_clock::time_point report_time =
       std::chrono::steady_clock::now();
 };
+
+bool CopyPlaneToMat(const AVFrame* frame,
+                    int plane_index,
+                    int rows,
+                    int cols,
+                    int cv_type,
+                    cv::Mat& destination,
+                    std::string& error_message) {
+  if (frame == nullptr) {
+    error_message = "input frame is null";
+    return false;
+  }
+  if (frame->data[plane_index] == nullptr) {
+    error_message = "plane " + std::to_string(plane_index) + " is null";
+    return false;
+  }
+
+  destination.create(rows, cols, cv_type);
+  const size_t row_bytes =
+      static_cast<size_t>(cols) * static_cast<size_t>(destination.elemSize());
+  for (int row = 0; row < rows; ++row) {
+    std::memcpy(destination.ptr(row),
+                frame->data[plane_index] + static_cast<size_t>(row) * frame->linesize[plane_index],
+                row_bytes);
+  }
+  return true;
+}
+
+bool ExtractNV12Planes(const AVFrame* frame,
+                       NV12Frame& nv12_frame,
+                       std::string& error_message) {
+  if (frame == nullptr) {
+    error_message = "input frame is null";
+    return false;
+  }
+  cv::Mat y_plane;
+  cv::Mat uv_plane;
+  const AVPixelFormat pixel_format =
+      static_cast<AVPixelFormat>(frame->format);
+
+  if (pixel_format == AV_PIX_FMT_NV12) {
+    if (!CopyPlaneToMat(frame,
+                        0,
+                        frame->height,
+                        frame->width,
+                        CV_8UC1,
+                        y_plane,
+                        error_message)) {
+      return false;
+    }
+    if (!CopyPlaneToMat(frame,
+                        1,
+                        frame->height / 2,
+                        frame->width / 2,
+                        CV_8UC2,
+                        uv_plane,
+                        error_message)) {
+      return false;
+    }
+
+    y_plane.copyTo(nv12_frame.y);
+    uv_plane.copyTo(nv12_frame.uv);
+    return true;
+  }
+
+  if (pixel_format == AV_PIX_FMT_YUV420P || pixel_format == AV_PIX_FMT_YUVJ420P) {
+    cv::Mat u_plane;
+    cv::Mat v_plane;
+
+    if (!CopyPlaneToMat(frame,
+                        0,
+                        frame->height,
+                        frame->width,
+                        CV_8UC1,
+                        y_plane,
+                        error_message)) {
+      return false;
+    }
+    if (!CopyPlaneToMat(frame,
+                        1,
+                        frame->height / 2,
+                        frame->width / 2,
+                        CV_8UC1,
+                        u_plane,
+                        error_message)) {
+      return false;
+    }
+    if (!CopyPlaneToMat(frame,
+                        2,
+                        frame->height / 2,
+                        frame->width / 2,
+                        CV_8UC1,
+                        v_plane,
+                        error_message)) {
+      return false;
+    }
+
+    cv::Mat uv_channels[] = {u_plane, v_plane};
+    cv::merge(uv_channels, 2, uv_plane);
+
+    y_plane.copyTo(nv12_frame.y);
+    uv_plane.copyTo(nv12_frame.uv);
+    return true;
+  }
+
+  const char* format_name = av_get_pix_fmt_name(pixel_format);
+  error_message = std::string("expected NV12/YUV420 frame, got ") +
+                  (format_name != nullptr ? format_name : "unknown");
+  return false;
+}
 
 std::string FormatDecoderPerfLog(size_t decoder_index,
                                  const std::string& decoder_name,
@@ -187,11 +217,12 @@ std::string FormatDecoderPerfLog(size_t decoder_index,
                             : 0.0)
          << " hw_frames=" << stats.hardware_frames
          << " sw_frames=" << stats.software_frames
+         << " hw_transfers=" << stats.hw_transfers
          << " read_ms=" << stats.read_seconds * 1000.0
          << " send_ms=" << stats.send_seconds * 1000.0
          << " receive_ms=" << stats.receive_seconds * 1000.0
-         << " convert_ms=" << stats.convert_seconds * 1000.0
-         << " upload_ms=" << stats.upload_seconds * 1000.0
+         << " transfer_ms=" << stats.transfer_seconds * 1000.0
+         << " nv12_extract_ms=" << stats.nv12_extract_seconds * 1000.0
          << " queue_pushes=" << stats.queue_pushes
          << " queue_drops=" << stats.queue_drops;
   return stream.str();
@@ -220,7 +251,7 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   num_img_ = video_file_name.size();
   num_img = num_img_;
 
-  image_queue_vector_ = std::vector<std::queue<cv::UMat>>(num_img_);
+  image_queue_vector_ = std::vector<std::queue<NV12Frame>>(num_img_);
   image_queue_mutex_vector_ = std::vector<std::mutex>(num_img_);
   video_capture_vector_.clear();
 
@@ -261,14 +292,9 @@ void SensorDataInterface::StartDecodeThreads() {
       AVPacket* packet = nullptr;
       AVFrame* decoded_frame = nullptr;
       AVFrame* software_frame = nullptr;
-      SwsContext* sws_context = nullptr;
       int video_stream_index = -1;
 
       auto cleanup = [&]() {
-        if (sws_context != nullptr) {
-          sws_freeContext(sws_context);
-          sws_context = nullptr;
-        }
         if (software_frame != nullptr) {
           av_frame_free(&software_frame);
         }
@@ -315,6 +341,7 @@ void SensorDataInterface::StartDecodeThreads() {
           if (IsHardwarePixelFormat(
                   decoded_pixel_format)) {
             perf_stats.hardware_frames++;
+            const double transfer_t0 = cv::getTickCount();
             if (av_hwframe_transfer_data(software_frame, decoded_frame, 0) < 0) {
               Logger::GetInstance().LogError(
                   "[decoder " + std::to_string(i) +
@@ -322,70 +349,27 @@ void SensorDataInterface::StartDecodeThreads() {
               av_frame_unref(decoded_frame);
               continue;
             }
+            perf_stats.transfer_seconds +=
+                (cv::getTickCount() - transfer_t0) / cv::getTickFrequency();
+            perf_stats.hw_transfers++;
             frame_to_convert = software_frame;
           } else {
             perf_stats.software_frames++;
           }
 
-          const double convert_t0 = cv::getTickCount();
-          cv::Mat bgr_frame;
-#ifdef ENABLE_RK_HARDWARE_DECODING
-          std::string rga_error;
-          if (!ConvertFrameToBgrWithRga(frame_to_convert, bgr_frame, rga_error)) {
+          const double extract_t0 = cv::getTickCount();
+          NV12Frame nv12_frame;
+          std::string extract_error;
+          if (!ExtractNV12Planes(frame_to_convert, nv12_frame, extract_error)) {
             Logger::GetInstance().LogError(
                 "[decoder " + std::to_string(i) +
-                "] RGA color conversion failed: " + rga_error);
+                "] NV12 extraction failed: " + extract_error);
             av_frame_unref(software_frame);
             av_frame_unref(decoded_frame);
             return false;
           }
-#else
-          sws_context = sws_getCachedContext(
-              sws_context,
-              frame_to_convert->width,
-              frame_to_convert->height,
-              static_cast<AVPixelFormat>(frame_to_convert->format),
-              frame_to_convert->width,
-              frame_to_convert->height,
-              AV_PIX_FMT_BGR24,
-              SWS_BILINEAR,
-              nullptr,
-              nullptr,
-              nullptr);
-
-          if (sws_context == nullptr) {
-            Logger::GetInstance().LogError(
-                "[decoder " + std::to_string(i) +
-                "] failed to create pixel conversion context.");
-            av_frame_unref(software_frame);
-            av_frame_unref(decoded_frame);
-            return false;
-          }
-
-          bgr_frame.create(frame_to_convert->height,
-                           frame_to_convert->width,
-                           CV_8UC3);
-          uint8_t* destination_data[4] = {
-              bgr_frame.data, nullptr, nullptr, nullptr};
-          int destination_linesize[4] = {
-              static_cast<int>(bgr_frame.step[0]), 0, 0, 0};
-
-          sws_scale(sws_context,
-                    frame_to_convert->data,
-                    frame_to_convert->linesize,
-                    0,
-                    frame_to_convert->height,
-                    destination_data,
-                    destination_linesize);
-#endif
-          perf_stats.convert_seconds +=
-              (cv::getTickCount() - convert_t0) / cv::getTickFrequency();
-
-          const double upload_t0 = cv::getTickCount();
-          cv::UMat umat_frame;
-          bgr_frame.copyTo(umat_frame);
-          perf_stats.upload_seconds +=
-              (cv::getTickCount() - upload_t0) / cv::getTickFrequency();
+          perf_stats.nv12_extract_seconds +=
+              (cv::getTickCount() - extract_t0) / cv::getTickFrequency();
 
           {
             std::lock_guard<std::mutex> queue_lock(image_queue_mutex_vector_[i]);
@@ -393,7 +377,7 @@ void SensorDataInterface::StartDecodeThreads() {
               image_queue_vector_[i].pop();
               perf_stats.queue_drops++;
             }
-            image_queue_vector_[i].push(umat_frame);
+            image_queue_vector_[i].push(std::move(nv12_frame));
             perf_stats.queue_pushes++;
           }
 
@@ -535,7 +519,7 @@ void SensorDataInterface::StartDecodeThreads() {
                                 std::string(codec->name) +
                                 " size=" + std::to_string(codec_context->width) +
                                 "x" + std::to_string(codec_context->height) +
-                                " color_convert=RGA");
+                                " pixel_path=NV12");
       if (std::string(codec->name).find("rkmpp") == std::string::npos) {
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
@@ -628,19 +612,19 @@ void SensorDataInterface::RecordVideos() {
   StartDecodeThreads();
 }
 
-void SensorDataInterface::get_image_vector(
-    std::vector<cv::UMat>& image_vector,
+void SensorDataInterface::get_nv12_frame_vector(
+    std::vector<NV12Frame>& image_vector,
     std::vector<std::mutex>& image_mutex_vector) {
   for (size_t i = 0; i < num_img_; ++i) {
     while (true) {
       bool has_frame = false;
       bool decoder_finished = false;
-      cv::UMat frame;
+      NV12Frame frame;
 
       {
         std::lock_guard<std::mutex> queue_lock(image_queue_mutex_vector_[i]);
         if (!image_queue_vector_[i].empty()) {
-          frame = image_queue_vector_[i].front();
+          frame = std::move(image_queue_vector_[i].front());
           image_queue_vector_[i].pop();
           has_frame = true;
         }
@@ -661,7 +645,7 @@ void SensorDataInterface::get_image_vector(
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
             "] decoder stopped and queue is empty, cannot provide input frame.");
-        image_vector[i] = cv::UMat();
+        image_vector[i] = NV12Frame{};
         break;
       }
 

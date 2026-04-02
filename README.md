@@ -108,6 +108,38 @@ VPU (rkmpp) → DMA buffer (NV12)
         ❌
 OpenCV UMat → BGR (OpenCL/CPU)
 
+rkmpp → DMA-BUF → RGA（warp+blend）→ DRM/显示
+
+主瓶颈不是拼接，而是取帧/解码。不开启保存 这份日志里，[app_timing] 的统计是：
+fetch_ms 平均约 121.5 ms
+stitch_ms 平均约 15.8 ms
+output_ms 基本是 0
+
+当前“rkmpp”并没有形成你想要的零拷贝链路。日志里反复出现：
+decoder=h264_rkmpp
+frame_fmt=nv12
+hw_frames=0
+sw_frames>0
+hw_transfers=0
+这说明 FFmpeg 虽然用了 h264_rkmpp 解码器，但你拿到的是软件侧 NV12 帧，不是 DRM_PRIME/DMA-BUF 硬件帧。也就是说现在实际跑的不是“rkmpp -> DMA-BUF -> GPU stitch”，而是“rkmpp decoder -> software NV12 -> OpenCV UMat”。
+
+NV12 提取路径本身非常重。src/sensor_data_interface.cc:94 到 src/sensor_data_interface.cc:194 里做了这些事：
+每行 memcpy 拷贝 Y
+每行 memcpy 拷贝 UV
+再 copyTo(UMat) 一次
+
+
+最高优先级：把解码输出改成真正的 DRM_PRIME/DMA-BUF。
+目标是让日志从 hw_frames=0 变成真正拿到硬件帧。
+需要在 FFmpeg 初始化里显式建立 RK 硬件设备上下文，并让解码输出走 AV_PIX_FMT_DRM_PRIME，而不是当前这种软件 nv12。
+只有这样，后面才有机会接 DMA-BUF -> RGA/DRM，否则 30+ FPS 基本没戏。
+去掉 src/sensor_data_interface.cc:94 这套 memcpy + copyTo(UMat) 双拷贝路径。
+如果暂时做不到 DMA-BUF 直通，至少要把软件侧 NV12 保留成连续缓冲，不要再 Mat -> UMat 复制一次。
+更进一步是让 stitch 直接消费导入的外部 GPU buffer，而不是 OpenCV 自己再分配一份 UMat。
+
+
+
+
 
 ## 新仓库地址
 cd /userdata/Projects/yzy/new-4k-stitch

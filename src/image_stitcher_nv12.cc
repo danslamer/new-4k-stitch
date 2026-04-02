@@ -1,5 +1,8 @@
 #include "image_stitcher_nv12.h"
+#include "logger.h"
+
 #include <iostream>
+#include <sstream>
 
 using namespace std;
 using namespace cv;
@@ -45,6 +48,12 @@ void ImageStitcherNV12::SetParams(
         min_h = min(min_h, roi_vect_[i].height);
 
     CreateWeightMap(min_h, blend_width);
+
+    std::ostringstream log_stream;
+    log_stream << "[ImageStitcherNV12] configured cameras=" << num_img_
+               << " blend_width=" << blend_width
+               << " min_roi_height=" << min_h;
+    Logger::GetInstance().Log(log_stream.str());
 }
 
 void ImageStitcherNV12::CreateWeightMap(const int& height, const int& width) {
@@ -63,12 +72,20 @@ void ImageStitcherNV12::CreateWeightMap(const int& height, const int& width) {
     weightMap_.push_back(r.getUMat(ACCESS_READ));
 
     // UV weight
-    UMat l_uv, r_uv;
-    resize(weightMap_[0], l_uv, Size(), 0.5, 0.5);
-    resize(weightMap_[1], r_uv, Size(), 0.5, 0.5);
+    Mat l_uv_single;
+    Mat r_uv_single;
+    resize(l, l_uv_single, Size(), 0.5, 0.5, INTER_LINEAR);
+    resize(r, r_uv_single, Size(), 0.5, 0.5, INTER_LINEAR);
 
-    weightMap_uv_.push_back(l_uv);
-    weightMap_uv_.push_back(r_uv);
+    Mat l_uv_channels[] = {l_uv_single, l_uv_single};
+    Mat r_uv_channels[] = {r_uv_single, r_uv_single};
+    Mat l_uv;
+    Mat r_uv;
+    merge(l_uv_channels, 2, l_uv);
+    merge(r_uv_channels, 2, r_uv);
+
+    weightMap_uv_.push_back(l_uv.getUMat(ACCESS_READ));
+    weightMap_uv_.push_back(r_uv.getUMat(ACCESS_READ));
 }
 
 void ImageStitcherNV12::WarpImages(
@@ -76,6 +93,9 @@ void ImageStitcherNV12::WarpImages(
     const NV12Frame& input,
     NV12Frame& output,
     vector<mutex>& image_mutex_vector) {
+    if (input.empty() || output.empty()) {
+        return;
+    }
 
     image_mutex_vector[img_idx].lock();
 
