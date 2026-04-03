@@ -65,7 +65,8 @@ App::App() {
     if (first_image_vector[i].empty()) {
       Logger::GetInstance().LogError(
           "[App] failed to fetch initial NV12 frame from channel " + to_string(i));
-      continue;
+      throw std::runtime_error(
+          "initial frame acquisition failed; DRM_PRIME frames could not be converted to startup NV12 previews");
     }
     first_mat_vector[i] = BuildPreviewBgrFromNV12Y(first_image_vector[i]);
   }
@@ -96,7 +97,7 @@ App::App() {
   image_concat_nv12_.uv = cv::UMat(output_height / 2, total_cols_ / 2, CV_8UC2);
 
   std::ostringstream init_stream;
-  init_stream << "[App] pipeline=FFmpeg(rkmpp)->NV12->NV12 Stitch(GPU)->output"
+  init_stream << "[App] pipeline=FFmpeg(rkmpp DRM_PRIME)->DMA-BUF->NV12 Stitch(GPU fallback)->output"
               << " stitched_size=" << stitched_width
               << "x" << stitched_height
               << " aligned_output_size=" << total_cols_ << "x" << output_height;

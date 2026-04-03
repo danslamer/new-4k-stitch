@@ -19,6 +19,8 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -79,6 +81,7 @@ struct DecoderPerfStats {
   size_t frames_decoded = 0;
   size_t hardware_frames = 0;
   size_t software_frames = 0;
+  size_t drm_prime_frames = 0;
   size_t hw_transfers = 0;
   size_t queue_pushes = 0;
   size_t queue_drops = 0;
@@ -91,11 +94,101 @@ struct DecoderPerfStats {
       std::chrono::steady_clock::now();
 };
 
+struct AVFrameDeleter {
+  void operator()(AVFrame* frame) const {
+    if (frame != nullptr) {
+      av_frame_free(&frame);
+    }
+  }
+};
+
+using AVFramePtr = std::shared_ptr<AVFrame>;
+
+AVFramePtr CloneFrameReference(const AVFrame* source_frame) {
+  if (source_frame == nullptr) {
+    return AVFramePtr();
+  }
+
+  AVFrame* frame_ref = av_frame_alloc();
+  if (frame_ref == nullptr) {
+    return AVFramePtr();
+  }
+
+  if (av_frame_ref(frame_ref, source_frame) < 0) {
+    av_frame_free(&frame_ref);
+    return AVFramePtr();
+  }
+
+  return AVFramePtr(frame_ref, AVFrameDeleter{});
+}
+
+void FillDrmPrimeMetadata(const AVFrame* frame, QueuedFrame& queued_frame) {
+  queued_frame.width = frame != nullptr ? frame->width : 0;
+  queued_frame.height = frame != nullptr ? frame->height : 0;
+  queued_frame.pixel_format =
+      frame != nullptr ? frame->format : static_cast<int>(AV_PIX_FMT_NONE);
+  queued_frame.dma_buf_fd = -1;
+  queued_frame.drm_layer_count = 0;
+
+  if (frame == nullptr || frame->format != AV_PIX_FMT_DRM_PRIME ||
+      frame->data[0] == nullptr) {
+    return;
+  }
+
+  const AVDRMFrameDescriptor* descriptor =
+      reinterpret_cast<const AVDRMFrameDescriptor*>(frame->data[0]);
+  if (descriptor == nullptr) {
+    return;
+  }
+
+  queued_frame.drm_layer_count = descriptor->nb_layers;
+  if (descriptor->nb_objects > 0) {
+    queued_frame.dma_buf_fd = descriptor->objects[0].fd;
+  }
+}
+
+AVPixelFormat SelectDecoderPixelFormat(AVCodecContext* codec_context,
+                                       const AVPixelFormat* pixel_formats) {
+  if (pixel_formats == nullptr) {
+    return AV_PIX_FMT_NONE;
+  }
+
+  std::ostringstream candidate_stream;
+  candidate_stream << "[decoder_get_format] codec="
+                   << (codec_context != nullptr && codec_context->codec != nullptr
+                           ? codec_context->codec->name
+                           : "unknown")
+                   << " candidates=";
+  bool first_candidate = true;
+  for (const AVPixelFormat* format = pixel_formats;
+       *format != AV_PIX_FMT_NONE;
+       ++format) {
+    const char* format_name = av_get_pix_fmt_name(*format);
+    if (!first_candidate) {
+      candidate_stream << ",";
+    }
+    candidate_stream << (format_name != nullptr ? format_name : "unknown");
+    first_candidate = false;
+  }
+  Logger::GetInstance().Log(candidate_stream.str());
+
+#ifdef ENABLE_RK_HARDWARE_DECODING
+  for (const AVPixelFormat* format = pixel_formats;
+       *format != AV_PIX_FMT_NONE;
+       ++format) {
+    if (*format == AV_PIX_FMT_DRM_PRIME) {
+      return *format;
+    }
+  }
+#endif
+
+  return pixel_formats[0];
+}
+
 bool CopyPlaneToMat(const AVFrame* frame,
                     int plane_index,
                     int rows,
                     int cols,
-                    int cv_type,
                     cv::Mat& destination,
                     std::string& error_message) {
   if (frame == nullptr) {
@@ -107,7 +200,6 @@ bool CopyPlaneToMat(const AVFrame* frame,
     return false;
   }
 
-  destination.create(rows, cols, cv_type);
   const size_t row_bytes =
       static_cast<size_t>(cols) * static_cast<size_t>(destination.elemSize());
   for (int row = 0; row < rows; ++row) {
@@ -131,27 +223,19 @@ bool ExtractNV12Planes(const AVFrame* frame,
       static_cast<AVPixelFormat>(frame->format);
 
   if (pixel_format == AV_PIX_FMT_NV12) {
-    if (!CopyPlaneToMat(frame,
-                        0,
-                        frame->height,
-                        frame->width,
-                        CV_8UC1,
-                        y_plane,
-                        error_message)) {
-      return false;
-    }
-    if (!CopyPlaneToMat(frame,
-                        1,
-                        frame->height / 2,
-                        frame->width / 2,
-                        CV_8UC2,
-                        uv_plane,
-                        error_message)) {
-      return false;
-    }
+    nv12_frame.y.create(frame->height, frame->width, CV_8UC1);
+    nv12_frame.uv.create(frame->height / 2, frame->width / 2, CV_8UC2);
+    y_plane = nv12_frame.y.getMat(cv::ACCESS_WRITE);
+    uv_plane = nv12_frame.uv.getMat(cv::ACCESS_WRITE);
 
-    y_plane.copyTo(nv12_frame.y);
-    uv_plane.copyTo(nv12_frame.uv);
+    if (!CopyPlaneToMat(frame, 0, frame->height, frame->width, y_plane,
+                        error_message)) {
+      return false;
+    }
+    if (!CopyPlaneToMat(frame, 1, frame->height / 2, frame->width / 2, uv_plane,
+                        error_message)) {
+      return false;
+    }
     return true;
   }
 
@@ -159,39 +243,29 @@ bool ExtractNV12Planes(const AVFrame* frame,
     cv::Mat u_plane;
     cv::Mat v_plane;
 
-    if (!CopyPlaneToMat(frame,
-                        0,
-                        frame->height,
-                        frame->width,
-                        CV_8UC1,
-                        y_plane,
+    nv12_frame.y.create(frame->height, frame->width, CV_8UC1);
+    nv12_frame.uv.create(frame->height / 2, frame->width / 2, CV_8UC2);
+    y_plane = nv12_frame.y.getMat(cv::ACCESS_WRITE);
+
+    u_plane.create(frame->height / 2, frame->width / 2, CV_8UC1);
+    v_plane.create(frame->height / 2, frame->width / 2, CV_8UC1);
+    uv_plane = nv12_frame.uv.getMat(cv::ACCESS_WRITE);
+
+    if (!CopyPlaneToMat(frame, 0, frame->height, frame->width, y_plane,
                         error_message)) {
       return false;
     }
-    if (!CopyPlaneToMat(frame,
-                        1,
-                        frame->height / 2,
-                        frame->width / 2,
-                        CV_8UC1,
-                        u_plane,
+    if (!CopyPlaneToMat(frame, 1, frame->height / 2, frame->width / 2, u_plane,
                         error_message)) {
       return false;
     }
-    if (!CopyPlaneToMat(frame,
-                        2,
-                        frame->height / 2,
-                        frame->width / 2,
-                        CV_8UC1,
-                        v_plane,
+    if (!CopyPlaneToMat(frame, 2, frame->height / 2, frame->width / 2, v_plane,
                         error_message)) {
       return false;
     }
 
     cv::Mat uv_channels[] = {u_plane, v_plane};
     cv::merge(uv_channels, 2, uv_plane);
-
-    y_plane.copyTo(nv12_frame.y);
-    uv_plane.copyTo(nv12_frame.uv);
     return true;
   }
 
@@ -199,6 +273,36 @@ bool ExtractNV12Planes(const AVFrame* frame,
   error_message = std::string("expected NV12/YUV420 frame, got ") +
                   (format_name != nullptr ? format_name : "unknown");
   return false;
+}
+
+bool DownloadDrmPrimeFrameToNV12(const AVFrame* hardware_frame,
+                                 NV12Frame& nv12_frame,
+                                 std::string& error_message) {
+  if (hardware_frame == nullptr) {
+    error_message = "hardware frame is null";
+    return false;
+  }
+
+  AVFrame* software_frame = av_frame_alloc();
+  if (software_frame == nullptr) {
+    error_message = "failed to allocate software frame";
+    return false;
+  }
+
+  const int transfer_ret = av_hwframe_transfer_data(software_frame,
+                                                    hardware_frame,
+                                                    0);
+  if (transfer_ret < 0) {
+    error_message = "av_hwframe_transfer_data failed: " +
+                    AvErrorToString(transfer_ret);
+    av_frame_free(&software_frame);
+    return false;
+  }
+
+  const bool extract_success =
+      ExtractNV12Planes(software_frame, nv12_frame, error_message);
+  av_frame_free(&software_frame);
+  return extract_success;
 }
 
 std::string FormatDecoderPerfLog(size_t decoder_index,
@@ -216,6 +320,7 @@ std::string FormatDecoderPerfLog(size_t decoder_index,
                             ? static_cast<double>(stats.frames_decoded) / elapsed_seconds
                             : 0.0)
          << " hw_frames=" << stats.hardware_frames
+         << " drm_prime_frames=" << stats.drm_prime_frames
          << " sw_frames=" << stats.software_frames
          << " hw_transfers=" << stats.hw_transfers
          << " read_ms=" << stats.read_seconds * 1000.0
@@ -251,7 +356,7 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   num_img_ = video_file_name.size();
   num_img = num_img_;
 
-  image_queue_vector_ = std::vector<std::queue<NV12Frame>>(num_img_);
+  image_queue_vector_ = std::vector<std::queue<QueuedFrame>>(num_img_);
   image_queue_mutex_vector_ = std::vector<std::mutex>(num_img_);
   video_capture_vector_.clear();
 
@@ -265,6 +370,7 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
           num_img_, std::chrono::steady_clock::now());
   decoder_ready_vector_ = std::vector<bool>(num_img_, false);
   decoder_finished_vector_ = std::vector<bool>(num_img_, false);
+  drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
 
   for (size_t i = 0; i < num_img_; ++i) {
     const std::string file_name = video_dir + video_file_name[i];
@@ -291,13 +397,9 @@ void SensorDataInterface::StartDecodeThreads() {
       AVCodecContext* codec_context = nullptr;
       AVPacket* packet = nullptr;
       AVFrame* decoded_frame = nullptr;
-      AVFrame* software_frame = nullptr;
       int video_stream_index = -1;
 
       auto cleanup = [&]() {
-        if (software_frame != nullptr) {
-          av_frame_free(&software_frame);
-        }
         if (decoded_frame != nullptr) {
           av_frame_free(&decoded_frame);
         }
@@ -331,45 +433,55 @@ void SensorDataInterface::StartDecodeThreads() {
             return false;
           }
 
-          AVFrame* frame_to_convert = decoded_frame;
           const AVPixelFormat decoded_pixel_format =
               static_cast<AVPixelFormat>(decoded_frame->format);
           const char* decoded_format_name = av_get_pix_fmt_name(decoded_pixel_format);
           last_frame_format_name =
               decoded_format_name != nullptr ? decoded_format_name : "unknown";
           perf_stats.frames_decoded++;
-          if (IsHardwarePixelFormat(
-                  decoded_pixel_format)) {
+          QueuedFrame queued_frame;
+          queued_frame.width = decoded_frame->width;
+          queued_frame.height = decoded_frame->height;
+          queued_frame.pixel_format = decoded_frame->format;
+
+          if (decoded_pixel_format == AV_PIX_FMT_DRM_PRIME) {
             perf_stats.hardware_frames++;
-            const double transfer_t0 = cv::getTickCount();
-            if (av_hwframe_transfer_data(software_frame, decoded_frame, 0) < 0) {
+            perf_stats.drm_prime_frames++;
+            queued_frame.storage = QueuedFrameStorage::kDrmPrime;
+            queued_frame.hardware_frame = CloneFrameReference(decoded_frame);
+            FillDrmPrimeMetadata(decoded_frame, queued_frame);
+            if (queued_frame.hardware_frame == nullptr) {
               Logger::GetInstance().LogError(
                   "[decoder " + std::to_string(i) +
-                  "] failed to transfer hardware frame to system memory.");
+                  "] failed to retain DRM_PRIME frame reference.");
               av_frame_unref(decoded_frame);
               continue;
             }
-            perf_stats.transfer_seconds +=
-                (cv::getTickCount() - transfer_t0) / cv::getTickFrequency();
-            perf_stats.hw_transfers++;
-            frame_to_convert = software_frame;
-          } else {
-            perf_stats.software_frames++;
-          }
-
-          const double extract_t0 = cv::getTickCount();
-          NV12Frame nv12_frame;
-          std::string extract_error;
-          if (!ExtractNV12Planes(frame_to_convert, nv12_frame, extract_error)) {
+          } else if (IsHardwarePixelFormat(decoded_pixel_format)) {
+            perf_stats.hardware_frames++;
             Logger::GetInstance().LogError(
                 "[decoder " + std::to_string(i) +
-                "] NV12 extraction failed: " + extract_error);
-            av_frame_unref(software_frame);
+                "] received unsupported hardware pixel format: " +
+                last_frame_format_name);
             av_frame_unref(decoded_frame);
-            return false;
+            continue;
+          } else {
+            perf_stats.software_frames++;
+            const double extract_t0 = cv::getTickCount();
+            std::string extract_error;
+            queued_frame.storage = QueuedFrameStorage::kSoftwareNV12;
+            if (!ExtractNV12Planes(decoded_frame,
+                                   queued_frame.software_nv12,
+                                   extract_error)) {
+              Logger::GetInstance().LogError(
+                  "[decoder " + std::to_string(i) +
+                  "] NV12 extraction failed: " + extract_error);
+              av_frame_unref(decoded_frame);
+              return false;
+            }
+            perf_stats.nv12_extract_seconds +=
+                (cv::getTickCount() - extract_t0) / cv::getTickFrequency();
           }
-          perf_stats.nv12_extract_seconds +=
-              (cv::getTickCount() - extract_t0) / cv::getTickFrequency();
 
           {
             std::lock_guard<std::mutex> queue_lock(image_queue_mutex_vector_[i]);
@@ -377,7 +489,7 @@ void SensorDataInterface::StartDecodeThreads() {
               image_queue_vector_[i].pop();
               perf_stats.queue_drops++;
             }
-            image_queue_vector_[i].push(std::move(nv12_frame));
+            image_queue_vector_[i].push(std::move(queued_frame));
             perf_stats.queue_pushes++;
           }
 
@@ -414,7 +526,6 @@ void SensorDataInterface::StartDecodeThreads() {
             perf_stats = DecoderPerfStats{};
           }
 
-          av_frame_unref(software_frame);
           av_frame_unref(decoded_frame);
         }
 
@@ -489,6 +600,14 @@ void SensorDataInterface::StartDecodeThreads() {
         return;
       }
 
+#ifdef ENABLE_RK_HARDWARE_DECODING
+      codec_context->get_format = SelectDecoderPixelFormat;
+
+      // Keep DRM_PRIME output linear for the current fallback path.
+      // AFBC/non-linear surfaces cannot be downloaded by av_hwframe_transfer_data.
+      av_opt_set(codec_context->priv_data, "afbc", "0", 0);
+#endif
+
       if (avcodec_open2(codec_context, codec, nullptr) < 0) {
         Logger::GetInstance().LogError("[decoder " + std::to_string(i) +
                                        "] failed to open decoder: " +
@@ -501,9 +620,8 @@ void SensorDataInterface::StartDecodeThreads() {
 
       packet = av_packet_alloc();
       decoded_frame = av_frame_alloc();
-      software_frame = av_frame_alloc();
 
-      if (packet == nullptr || decoded_frame == nullptr || software_frame == nullptr) {
+      if (packet == nullptr || decoded_frame == nullptr) {
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
             "] failed to allocate packet or frame buffers.");
@@ -519,7 +637,7 @@ void SensorDataInterface::StartDecodeThreads() {
                                 std::string(codec->name) +
                                 " size=" + std::to_string(codec_context->width) +
                                 "x" + std::to_string(codec_context->height) +
-                                " pixel_path=NV12");
+                                " requested_output=DRM_PRIME");
       if (std::string(codec->name).find("rkmpp") == std::string::npos) {
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
@@ -619,18 +737,46 @@ void SensorDataInterface::get_nv12_frame_vector(
     while (true) {
       bool has_frame = false;
       bool decoder_finished = false;
-      NV12Frame frame;
+      QueuedFrame queued_frame;
 
       {
         std::lock_guard<std::mutex> queue_lock(image_queue_mutex_vector_[i]);
         if (!image_queue_vector_[i].empty()) {
-          frame = std::move(image_queue_vector_[i].front());
+          queued_frame = std::move(image_queue_vector_[i].front());
           image_queue_vector_[i].pop();
           has_frame = true;
         }
       }
 
       if (has_frame) {
+        NV12Frame frame;
+        if (queued_frame.storage == QueuedFrameStorage::kSoftwareNV12) {
+          frame = std::move(queued_frame.software_nv12);
+        } else if (queued_frame.storage == QueuedFrameStorage::kDrmPrime) {
+          {
+            std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
+            if (!drm_prime_fallback_logged_vector_[i]) {
+              drm_prime_fallback_logged_vector_[i] = true;
+              std::ostringstream log_stream;
+              log_stream << "[decoder " << i
+                         << "] DRM_PRIME frame received (dma_buf_fd="
+                         << queued_frame.dma_buf_fd
+                         << ", layers=" << queued_frame.drm_layer_count
+                         << "), current stitch path still falls back to hwdownload->NV12.";
+              Logger::GetInstance().Log(log_stream.str());
+            }
+          }
+          std::string download_error;
+          if (!DownloadDrmPrimeFrameToNV12(queued_frame.hardware_frame.get(),
+                                           frame,
+                                           download_error)) {
+            Logger::GetInstance().LogError(
+                "[decoder " + std::to_string(i) +
+                "] DRM_PRIME fallback download failed: " + download_error);
+            frame = NV12Frame{};
+          }
+        }
+
         std::lock_guard<std::mutex> image_lock(image_mutex_vector[i]);
         image_vector[i] = frame;
         break;

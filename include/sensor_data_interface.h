@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -16,6 +17,37 @@
 #include <opencv2/opencv.hpp>
 
 #include "image_stitcher_nv12.h"
+
+extern "C" {
+struct AVFrame;
+}
+
+enum class QueuedFrameStorage {
+    kEmpty = 0,
+    kSoftwareNV12 = 1,
+    kDrmPrime = 2,
+};
+
+struct QueuedFrame {
+    QueuedFrameStorage storage = QueuedFrameStorage::kEmpty;
+    NV12Frame software_nv12;
+    std::shared_ptr<AVFrame> hardware_frame;
+    int width = 0;
+    int height = 0;
+    int pixel_format = -1;
+    int dma_buf_fd = -1;
+    int drm_layer_count = 0;
+
+    bool empty() const {
+        if (storage == QueuedFrameStorage::kSoftwareNV12) {
+            return software_nv12.empty();
+        }
+        if (storage == QueuedFrameStorage::kDrmPrime) {
+            return hardware_frame == nullptr;
+        }
+        return true;
+    }
+};
 
 class SensorDataInterface {
  public:
@@ -38,7 +70,7 @@ class SensorDataInterface {
     const size_t max_queue_length_;
     size_t num_img_;
     size_t frame_idx;
-    std::vector<std::queue<NV12Frame>> image_queue_vector_;
+    std::vector<std::queue<QueuedFrame>> image_queue_vector_;
     std::vector<std::mutex> image_queue_mutex_vector_;
     std::vector<cv::VideoCapture> video_capture_vector_;
     std::vector<std::string> video_file_paths_;
@@ -48,6 +80,7 @@ class SensorDataInterface {
     std::vector<std::chrono::steady_clock::time_point> decode_report_time_vector_;
     std::vector<bool> decoder_ready_vector_;
     std::vector<bool> decoder_finished_vector_;
+    std::vector<bool> drm_prime_fallback_logged_vector_;
     std::mutex decode_stats_mutex_;
     std::atomic<bool> stop_requested_;
     std::atomic<bool> decode_threads_started_;
