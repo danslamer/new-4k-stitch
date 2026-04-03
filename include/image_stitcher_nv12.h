@@ -32,9 +32,13 @@ public:
 
 private:
     void CreateWeightMap(const int& height, const int& width);
+    cv::Rect NormalizeCropRoi(const cv::Rect& roi,
+                              const NV12Frame& input) const;
+    int ComputeOutputOffset(int img_idx) const;
 
 private:
     int num_img_;
+    bool crop_only_ = false;
 
     std::vector<cv::UMat> final_xmap_vector_;
     std::vector<cv::UMat> final_ymap_vector_;

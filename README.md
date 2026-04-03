@@ -137,9 +137,18 @@ NV12 提取路径本身非常重。src/sensor_data_interface.cc:94 到 src/senso
 如果暂时做不到 DMA-BUF 直通，至少要把软件侧 NV12 保留成连续缓冲，不要再 Mat -> UMat 复制一次。
 更进一步是让 stitch 直接消费导入的外部 GPU buffer，而不是 OpenCV 自己再分配一份 UMat。
 
+你当前这套拼接效果依赖的是“像素级非线性 remap”，不是简单的 crop/scale/blend。RGA 很适合做 DMA-BUF 上的裁剪、缩放、拷贝和混合，但要做到和现在 OpenCV remap 一样的效果，必须再补一层专门的 mesh-warp/分块仿射 backend。
 
+你当前 /usr/include/rga/im2d_single.h 里的 imcopy() 只有整帧版本
+不支持 imcopy(src, dst, src_rect, dst_rect) 这种新式矩形重载
 
+imcrop() 负责裁剪
+imrotate() 负责 90/180/270 旋转
+最终带目标偏移的拷贝改走老版 RgaApi 的 c_RkRgaBlit()
 
+用的是 DMA-BUF fd -> fread()
+但 DMA-BUF fd 不是普通文件，不能按普通文件流那样读
+所以开关设成 true 后，实际上很容易导出失败，自然就不会有图
 
 ## 新仓库地址
 cd /userdata/Projects/yzy/new-4k-stitch

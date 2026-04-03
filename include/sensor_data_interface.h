@@ -16,7 +16,7 @@
 
 #include <opencv2/opencv.hpp>
 
-#include "image_stitcher_nv12.h"
+#include "nv12_frame.h"
 
 extern "C" {
 struct AVFrame;
@@ -30,18 +30,16 @@ enum class QueuedFrameStorage {
 
 struct QueuedFrame {
     QueuedFrameStorage storage = QueuedFrameStorage::kEmpty;
-    NV12Frame software_nv12;
     std::shared_ptr<AVFrame> hardware_frame;
     int width = 0;
     int height = 0;
+    int stride_w = 0;
+    int stride_h = 0;
     int pixel_format = -1;
     int dma_buf_fd = -1;
     int drm_layer_count = 0;
 
     bool empty() const {
-        if (storage == QueuedFrameStorage::kSoftwareNV12) {
-            return software_nv12.empty();
-        }
         if (storage == QueuedFrameStorage::kDrmPrime) {
             return hardware_frame == nullptr;
         }
@@ -57,8 +55,11 @@ class SensorDataInterface {
     void InitExampleImages();
     void InitVideoCapture(size_t& num_img);
 
-    void get_nv12_frame_vector(std::vector<NV12Frame>& image_vector,
-                               std::vector<std::mutex>& image_mutex_vector);
+    void get_frame_vector(std::vector<QueuedFrame>& frame_vector);
+    void get_image_vector(std::vector<NV12Frame>& image_vector);
+    bool ConvertQueuedFrameToDmabuf(const QueuedFrame& queued_frame,
+                                    NV12Frame& frame,
+                                    size_t channel_index);
 
     void RecordVideos();
     std::vector<double> GetDecodeFpsSnapshot();

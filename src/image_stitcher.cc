@@ -1,162 +1,277 @@
-//
-// Created by s1nh.org on 2020/12/1.
-//
-
 #include "image_stitcher.h"
-#include "logger.h"
 
-#include <thread>
-#include <mutex>
+#include <algorithm>
+#include <cstring>
 #include <sstream>
 
-void ImageStitcher::SetParams(
-    const int& blend_width,
-    vector<cv::UMat>& undist_xmap_vector,
-    vector<cv::UMat>& undist_ymap_vector,
-    vector<cv::UMat>& reproj_xmap_vector,
-    vector<cv::UMat>& reproj_ymap_vector,
-    vector<cv::Rect>& projected_image_roi_vect_refined) {
-  num_img_ = undist_xmap_vector.size();
-  warp_mutex_vector_ = vector<mutex>(num_img_);
+#include <rga/im2d.h>
+#include <rga/RgaApi.h>
+#include <rga/rga.h>
 
+#include "logger.h"
 
-  undist_xmap_vector_ = undist_xmap_vector;
-  undist_ymap_vector_ = undist_ymap_vector;
-  reproj_xmap_vector_ = reproj_xmap_vector;
-  reproj_ymap_vector_ = reproj_ymap_vector;
-  roi_vect_ = projected_image_roi_vect_refined;
+namespace {
+constexpr int kNv12Format = RK_FORMAT_YCbCr_420_SP;
 
-  // Combine two remap operator (For speed up a little bit)
-  final_xmap_vector_ = vector<cv::UMat>(undist_ymap_vector.size());
-  final_ymap_vector_ = vector<cv::UMat>(undist_ymap_vector.size());
-  tmp_umat_vect_ = vector<cv::UMat>(undist_ymap_vector.size());
-  for (size_t img_idx = 0; img_idx < num_img_; ++img_idx) {
-    remap(undist_xmap_vector_[img_idx],
-          final_xmap_vector_[img_idx],
-          reproj_xmap_vector_[img_idx],
-          reproj_ymap_vector_[img_idx],
-          cv::INTER_LINEAR);
-    remap(undist_ymap_vector_[img_idx],
-          final_ymap_vector_[img_idx],
-          reproj_xmap_vector_[img_idx],
-          reproj_ymap_vector_[img_idx],
-          cv::INTER_LINEAR);
-    cv::UMat _;
-    undist_xmap_vector[img_idx].copyTo(_);
-//    wrap_vec_.push_back(_);//TODO: Use zeros instead of this fake data.
-  }
-  int min_roi_height = roi_vect_[0].height;
-  for (size_t img_idx = 1; img_idx < num_img_; ++img_idx) {
-    min_roi_height = min(min_roi_height, roi_vect_[img_idx].height);
-  }
-  CreateWeightMap(min_roi_height, blend_width);
+int NormalizeEvenFloor(int value) {
+    return std::max(0, value & ~1);
 }
 
+int NormalizeEvenCeil(int value) {
+    return std::max(2, (value + 1) & ~1);
+}
 
-void ImageStitcher::CreateWeightMap(const int& height, const int& width) {
-  // TODO: Try CV_16F.
-  cv::Mat _l = cv::Mat(height, width, CV_8UC3);
-  cv::Mat _r = cv::Mat(height, width, CV_8UC3);
-  for (int i = 0; i < height; ++i) {
-    for (int j = 0; j < width; ++j) {
-      _l.at<cv::Vec3b>(i, j)[0] =
-      _l.at<cv::Vec3b>(i, j)[1] =
-      _l.at<cv::Vec3b>(i, j)[2] =
-          cv::saturate_cast<uchar>((float) j / (float) width * 255);
+bool IsRightAngleRotation(int rotation_deg) {
+    return rotation_deg == 0 || rotation_deg == 90 ||
+           rotation_deg == 180 || rotation_deg == 270;
+}
 
-
-      _r.at<cv::Vec3b>(i, j)[0] =
-      _r.at<cv::Vec3b>(i, j)[1] =
-      _r.at<cv::Vec3b>(i, j)[2] =
-          cv::saturate_cast<uchar>((float) (width - j) / (float) width * 255);
-
+int ToRgaRotation(int rotation_deg) {
+    switch (rotation_deg) {
+        case 90:
+            return IM_HAL_TRANSFORM_ROT_90;
+        case 180:
+            return IM_HAL_TRANSFORM_ROT_180;
+        case 270:
+            return IM_HAL_TRANSFORM_ROT_270;
+        case 0:
+        default:
+            return 0;
     }
-  }
-  weightMap_.emplace_back(_l.getUMat(cv::ACCESS_READ));
-  weightMap_.emplace_back(_r.getUMat(cv::ACCESS_READ));
-
-  cv::imwrite("../results/_weight_map_l.png", weightMap_[0]);
-  cv::imwrite("../results/_weight_map_r.png", weightMap_[1]);
 }
 
-void ImageStitcher::WarpImages(
-    const int& img_idx,
-    const size_t& frame_idx,
-    const int& fusion_pixel,
-    const vector<cv::UMat>& image_vector,
-    vector<mutex>& image_mutex_vector,
-    vector<cv::UMat>& images_warped_with_roi_vector,
-    cv::UMat& image_concat_umat) {
-  double t0, t1, t2, t3, t4, t5, t6, tn;
-  t0 = cv::getTickCount();
-  image_mutex_vector[img_idx].lock();
+bool BlitByRect(int src_fd,
+                int src_stride_w,
+                int src_stride_h,
+                int src_x,
+                int src_y,
+                int copy_w,
+                int copy_h,
+                int dst_fd,
+                int dst_stride_w,
+                int dst_stride_h,
+                int dst_x,
+                int dst_y) {
+    rga_info_t src_info;
+    std::memset(&src_info, 0, sizeof(src_info));
+    src_info.fd = src_fd;
+    src_info.mmuFlag = 1;
+    rga_set_rect(&src_info.rect,
+                 src_x, src_y,
+                 copy_w, copy_h,
+                 src_stride_w, src_stride_h,
+                 kNv12Format);
 
-//  remap(image_vector[img_idx],
-//        tmp_umat_vect_[img_idx],
-//        undist_xmap_vector_[img_idx],
-//        undist_ymap_vector_[img_idx],
-//        cv::INTER_LINEAR);
-  t1 = cv::getTickCount();
+    rga_info_t dst_info;
+    std::memset(&dst_info, 0, sizeof(dst_info));
+    dst_info.fd = dst_fd;
+    dst_info.mmuFlag = 1;
+    rga_set_rect(&dst_info.rect,
+                 dst_x, dst_y,
+                 copy_w, copy_h,
+                 dst_stride_w, dst_stride_h,
+                 kNv12Format);
 
-  // Must use UMat.
-//  remap(tmp_umat_vect_[img_idx],
-//        tmp_umat_vect_[img_idx],
-//        reproj_xmap_vector_[img_idx],
-//        reproj_ymap_vector_[img_idx],
-//        cv::INTER_LINEAR);
+    return c_RkRgaBlit(&src_info, &dst_info, nullptr) == 0;
+}
+}
 
-//  // Combine two remap operator (For speed up a little bit)
-  remap(image_vector[img_idx],
-        tmp_umat_vect_[img_idx],
-        final_xmap_vector_[img_idx],
-        final_ymap_vector_[img_idx],
-        cv::INTER_LINEAR);
-  image_mutex_vector[img_idx].unlock();
-  t2 = cv::getTickCount();
-  t3 = cv::getTickCount();
+ImageStitcher::ImageStitcher()
+    : num_img_(0), blend_width_(0), out_w_(0), out_h_(0) {}
 
+ImageStitcher::~ImageStitcher() {
+    ReleaseScratchBuffers();
+}
 
-  // Blend the edge of 2 images.
-//  warp_mutex_vector_[img_idx].lock();
-//  tmp_umat_vect_[img_idx].copyTo(wrap_vec_[img_idx]);
-//  warp_mutex_vector_[img_idx].unlock();
+void ImageStitcher::SetParams(int blend_width,
+                              int num_img,
+                              int out_w,
+                              int out_h) {
+    num_img_ = num_img;
+    blend_width_ = blend_width;
+    out_w_ = out_w;
+    out_h_ = out_h;
 
-  if (img_idx > 0) {
-    cv::UMat _r = tmp_umat_vect_[img_idx](cv::Rect(
-        roi_vect_[img_idx].x,
-        roi_vect_[img_idx].y,
-        weightMap_[0].cols,
-        weightMap_[0].rows));
+    warp_mutex_ = std::vector<std::mutex>(num_img_);
+    crop_buffers_.resize(num_img_);
+    rotate_buffers_.resize(num_img_);
+}
 
-    warp_mutex_vector_[img_idx - 1].lock();
-    cv::UMat _l = tmp_umat_vect_[img_idx - 1](cv::Rect(
-        roi_vect_[img_idx - 1].x + roi_vect_[img_idx - 1].width,
-        roi_vect_[img_idx - 1].y,
-        weightMap_[0].cols,
-        weightMap_[0].rows));
-    warp_mutex_vector_[img_idx - 1].unlock();
+void ImageStitcher::SetLayout(const std::vector<StitchTask>& tasks) {
+    tasks_ = tasks;
+}
 
-    cv::multiply(_r, weightMap_[0], _r, 1. / 255.);
-    cv::multiply(_l, weightMap_[1], _l, 1. / 255.);
-    cv::add(_r, _l, _r);
-  }
+void ImageStitcher::ClearOutput(const NV12Frame& output) const {
+    if (output.empty()) {
+        return;
+    }
 
-  // Apply ROI.
-  int cols = 0;
-  for (size_t i = 0; i < img_idx; i++) {
-    cols += roi_vect_[i].width;
-  }
+    rga_buffer_t dst = wrapbuffer_fd(output.fd, output.width, output.height, kNv12Format);
+    im_rect full_rect = {0, 0, output.width, output.height};
+    imfill(dst, full_rect, 0x00000000);
+}
 
-  tmp_umat_vect_[img_idx](roi_vect_[img_idx]).copyTo(
-      image_concat_umat(cv::Rect(cols, 0, roi_vect_[img_idx].width,
-                                 roi_vect_[img_idx].height)));
+bool ImageStitcher::EnsureScratchBuffer(std::vector<DrmBuffer>* buffers,
+                                        int img_idx,
+                                        int width,
+                                        int height) {
+    if (buffers == nullptr || img_idx < 0 || img_idx >= static_cast<int>(buffers->size())) {
+        return false;
+    }
 
-  tn = cv::getTickCount();
-  std::ostringstream timing_stream;
-  timing_stream << "[image_stitcher] "
-                << (t1 - t0) / cv::getTickFrequency() << ";"
-                << (t2 - t1) / cv::getTickFrequency() << ";"
-                << (t3 - t2) / cv::getTickFrequency() << ";"
-                << 1 / (tn - t0) * cv::getTickFrequency();
-  Logger::GetInstance().LogFrame(frame_idx, timing_stream.str());
+    DrmBuffer& buffer = (*buffers)[img_idx];
+    if (buffer.fd >= 0 && buffer.width == width && buffer.height == height) {
+        return true;
+    }
+
+    drm_free(buffer);
+    return drm_alloc_nv12(width, height, buffer) == 0;
+}
+
+void ImageStitcher::ReleaseScratchBuffers() {
+    for (DrmBuffer& buffer : crop_buffers_) {
+        drm_free(buffer);
+    }
+    for (DrmBuffer& buffer : rotate_buffers_) {
+        drm_free(buffer);
+    }
+}
+
+int ImageStitcher::RotatedWidth(const StitchTask& task) const {
+    return (task.rotation_deg == 90 || task.rotation_deg == 270) ? task.src_h : task.src_w;
+}
+
+int ImageStitcher::RotatedHeight(const StitchTask& task) const {
+    return (task.rotation_deg == 90 || task.rotation_deg == 270) ? task.src_w : task.src_h;
+}
+
+void ImageStitcher::WarpImages(int img_idx,
+                               size_t,
+                               const std::vector<NV12Frame>& inputs,
+                               NV12Frame& output) {
+    if (img_idx < 0 || img_idx >= static_cast<int>(inputs.size()) || output.empty()) {
+        return;
+    }
+    if (img_idx >= static_cast<int>(tasks_.size())) {
+        return;
+    }
+
+    const NV12Frame& in = inputs[img_idx];
+    const StitchTask& task = tasks_[img_idx];
+    if (in.empty() || !task.enabled) {
+        return;
+    }
+    if (!IsRightAngleRotation(task.rotation_deg)) {
+        std::ostringstream stream;
+        stream << "[ImageStitcher] cam" << img_idx
+               << " invalid rotation_deg=" << task.rotation_deg
+               << ", only 0/90/180/270 are supported.";
+        Logger::GetInstance().LogError(stream.str());
+        return;
+    }
+
+    const int src_x = NormalizeEvenFloor(std::min(task.src_x, in.width));
+    const int src_y = NormalizeEvenFloor(std::min(task.src_y, in.height));
+    const int src_w = NormalizeEvenFloor(
+        std::min(task.src_w > 0 ? task.src_w : in.width - src_x, in.width - src_x));
+    const int src_h = NormalizeEvenFloor(
+        std::min(task.src_h > 0 ? task.src_h : in.height - src_y, in.height - src_y));
+    if (src_w < 2 || src_h < 2) {
+        return;
+    }
+
+    rga_buffer_t src = wrapbuffer_fd(
+        in.fd,
+        in.width,
+        in.height,
+        in.stride_w > 0 ? in.stride_w : in.width,
+        in.stride_h > 0 ? in.stride_h : in.height,
+        kNv12Format);
+
+    rga_buffer_t dst = wrapbuffer_fd(
+        output.fd,
+        output.width,
+        output.height,
+        output.stride_w > 0 ? output.stride_w : output.width,
+        output.stride_h > 0 ? output.stride_h : output.height,
+        kNv12Format);
+
+    im_rect src_rect = {src_x, src_y, src_w, src_h};
+    StitchTask normalized_task = task;
+    normalized_task.src_x = src_x;
+    normalized_task.src_y = src_y;
+    normalized_task.src_w = src_w;
+    normalized_task.src_h = src_h;
+    const int rotated_w = NormalizeEvenCeil(RotatedWidth(normalized_task));
+    const int rotated_h = NormalizeEvenCeil(RotatedHeight(normalized_task));
+    const int dst_x = NormalizeEvenFloor(task.dst_x);
+    const int dst_y = NormalizeEvenFloor(task.dst_y);
+    if (dst_x + rotated_w > output.width || dst_y + rotated_h > output.height) {
+        std::ostringstream stream;
+        stream << "[ImageStitcher] cam" << img_idx
+               << " dst rect out of panorama bounds: "
+               << "dst=(" << dst_x << "," << dst_y << "," << rotated_w << "," << rotated_h << ")"
+               << " output=(" << output.width << "x" << output.height << ")";
+        Logger::GetInstance().LogError(stream.str());
+        return;
+    }
+
+    if (task.rotation_deg == 0) {
+        if (!BlitByRect(in.fd,
+                        in.stride_w > 0 ? in.stride_w : in.width,
+                        in.stride_h > 0 ? in.stride_h : in.height,
+                        src_x,
+                        src_y,
+                        rotated_w,
+                        rotated_h,
+                        output.fd,
+                        output.stride_w > 0 ? output.stride_w : output.width,
+                        output.stride_h > 0 ? output.stride_h : output.height,
+                        dst_x,
+                        dst_y)) {
+            Logger::GetInstance().LogError("[ImageStitcher] c_RkRgaBlit failed on direct copy path.");
+        }
+        return;
+    }
+
+    if (!EnsureScratchBuffer(&crop_buffers_, img_idx, src_w, src_h) ||
+        !EnsureScratchBuffer(&rotate_buffers_, img_idx, rotated_w, rotated_h)) {
+        Logger::GetInstance().LogError("[ImageStitcher] failed to allocate scratch DMA-BUF for rotation.");
+        return;
+    }
+
+    DrmBuffer& crop = crop_buffers_[img_idx];
+    DrmBuffer& rotated = rotate_buffers_[img_idx];
+    rga_buffer_t crop_buf = wrapbuffer_fd(
+        crop.fd,
+        crop.width,
+        crop.height,
+        static_cast<int>(crop.pitch),
+        crop.height,
+        kNv12Format);
+    rga_buffer_t rotated_buf = wrapbuffer_fd(
+        rotated.fd,
+        rotated.width,
+        rotated.height,
+        static_cast<int>(rotated.pitch),
+        rotated.height,
+        kNv12Format);
+
+    imcrop(src, crop_buf, src_rect);
+    imrotate(crop_buf, rotated_buf, ToRgaRotation(task.rotation_deg));
+
+    if (!BlitByRect(rotated.fd,
+                    static_cast<int>(rotated.pitch),
+                    rotated.height,
+                    0,
+                    0,
+                    rotated_w,
+                    rotated_h,
+                    output.fd,
+                    output.stride_w > 0 ? output.stride_w : output.width,
+                    output.stride_h > 0 ? output.stride_h : output.height,
+                    dst_x,
+                    dst_y)) {
+        Logger::GetInstance().LogError("[ImageStitcher] c_RkRgaBlit failed on rotated copy path.");
+    }
 }
