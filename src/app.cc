@@ -1,3 +1,11 @@
+/**
+ * @file app.cc
+ * @brief 视频拼接应用主文件
+ *
+ * 此文件实现了视频拼接应用的核心逻辑，包括初始化、ROI检测、拼接布局构建和运行循环。
+ * 使用ffmpeg库里的rkmpp解码器硬件解码和OpenCV进行实时视频拼接，RGA用于剪裁拼接处理。
+ */
+
 #include "app.h"
 
 #include <algorithm>
@@ -15,48 +23,102 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 }
 
+
+bool g_save_stitched_frames = false;
+size_t g_save_frame_interval = 30;
+
+
 namespace {
 
+/**
+ * @struct CameraTuning
+ * @brief 相机调参结构体
+ *
+ * 包含相机旋转、裁剪和偏移参数，用于调整拼接效果。
+ */
 struct CameraTuning {
-  int rotation_deg = 0;
-  int crop_left = 0;
-  int crop_right = 0;
-  int crop_top = 0;
-  int crop_bottom = 0;
-  int offset_x = 0;
-  int offset_y = 0;
-  bool enabled = true;
+  int rotation_deg = 0;  ///< 旋转角度（度）
+  int crop_left = 0;     ///< 左侧裁剪像素
+  int crop_right = 0;    ///< 右侧裁剪像素
+  int crop_top = 0;      ///< 顶部裁剪像素
+  int crop_bottom = 0;   ///< 底部裁剪像素
+  int offset_x = 0;      ///< X轴偏移
+  int offset_y = 0;      ///< Y轴偏移
+  bool enabled = true;   ///< 是否启用该相机
 };
 
+/**
+ * @struct OverlapEstimate
+ * @brief 重叠区域估计结构体
+ *
+ * 存储相邻相机间的重叠宽度、Y轴偏移和匹配分数。
+ */
 struct OverlapEstimate {
-  int overlap = 0;
-  int shift_y = 0;
-  double score = 0.0;
+  int overlap = 0;     ///< 重叠宽度（像素）
+  int shift_y = 0;     ///< Y轴偏移
+  double score = 0.0;  ///< 匹配分数
 };
 
+/**
+ * @struct CameraRoi
+ * @brief 相机感兴趣区域结构体
+ *
+ * 定义每个相机的ROI坐标和尺寸。
+ */
 struct CameraRoi {
-  int x = 0;
-  int y = 0;
-  int width = 0;
-  int height = 0;
+  int x = 0;      ///< ROI起始X坐标
+  int y = 0;      ///< ROI起始Y坐标
+  int width = 0;  ///< ROI宽度
+  int height = 0; ///< ROI高度
 };
 
+/**
+ * @brief 向下取整到偶数
+ * @param value 输入值
+ * @return 偶数结果
+ * 因为硬件加速库要求偶数尺寸，所以这里提供了一个工具函数来确保尺寸是偶数。
+ */
 int NormalizeEvenFloor(int value) {
   return std::max(0, value & ~1);
 }
 
+/**
+ * @brief 向上取整到偶数
+ * @param value 输入值
+ * @return 偶数结果
+ * 因为NV12帧结构要求偶数尺寸，所以这里提供了一个工具函数来确保尺寸是偶数。
+ */
 int NormalizeEvenCeil(int value) {
   return std::max(2, (value + 1) & ~1);
 }
 
+/**
+ * @brief 计算旋转后的宽度
+ * @param width 原始宽度
+ * @param height 原始高度
+ * @param rotation_deg 旋转角度
+ * @return 旋转后宽度
+ */
 int RotatedWidth(int width, int height, int rotation_deg) {
   return (rotation_deg == 90 || rotation_deg == 270) ? height : width;
 }
 
+/**
+ * @brief 计算旋转后的高度
+ * @param width 原始宽度
+ * @param height 原始高度
+ * @param rotation_deg 旋转角度
+ * @return 旋转后高度
+ */
 int RotatedHeight(int width, int height, int rotation_deg) {
   return (rotation_deg == 90 || rotation_deg == 270) ? width : height;
 }
 
+/**
+ * @brief 计算整数中位数
+ * @param values 值列表
+ * @return 中位数
+ */
 int MedianInt(std::vector<int> values) {
   if (values.empty()) {
     return 0;
@@ -65,6 +127,11 @@ int MedianInt(std::vector<int> values) {
   return values[values.size() / 2];
 }
 
+/**
+ * @brief 计算浮点数中位数
+ * @param values 值列表
+ * @return 中位数
+ */
 double MedianDouble(std::vector<double> values) {
   if (values.empty()) {
     return 0.0;
@@ -73,6 +140,11 @@ double MedianDouble(std::vector<double> values) {
   return values[values.size() / 2];
 }
 
+/**
+ * @brief 将硬件NV12帧导出为BGR格式
+ * @param frame NV12帧
+ * @return BGR图像
+ */
 cv::Mat ExportHardwareFrameToBgr(const NV12Frame& frame) {
   if (frame.empty() || !frame.owner) {
     return cv::Mat();
@@ -112,6 +184,12 @@ cv::Mat ExportHardwareFrameToBgr(const NV12Frame& frame) {
   return bgr;
 }
 
+/**
+ * @brief 将NV12 DRM缓冲区导出为BGR UMat
+ * @param buffer DRM缓冲区
+ * @return BGR UMat
+ * 用于初始化时使用opencv读取DRM_PRIME帧进行ROI检测和拼接布局构建。
+ */
 cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   if (buffer.fd < 0 || buffer.width <= 0 || buffer.height <= 0 || buffer.pitch == 0) {
     return cv::UMat();
@@ -150,6 +228,12 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   return bgr_host.getUMat(cv::ACCESS_READ);
 }
 
+/**
+ * @brief 构建默认相机调参
+ * @param num_cameras 相机数量
+ * @return 调参列表
+ * 暂未启用
+ */
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
   // Industrial deployment should replace these defaults with fixed installation
@@ -157,6 +241,13 @@ std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   return tuning;
 }
 
+/**
+ * @brief 估计两帧之间的重叠区域
+ * 使用ORB特征匹配和模板匹配相结合的方法
+ * @param left_bgr 左侧帧BGR图像
+ * @param right_bgr 右侧帧BGR图像
+ * @return 重叠估计结果
+ */
 OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& right_bgr) {
   auto estimate_by_template = [&]() {
   OverlapEstimate estimate;
@@ -319,6 +410,11 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   return estimate;
 }
 
+/**
+ * @brief 保存检测到的ROI调试图像
+ * @param bootstrap_bgr 引导帧BGR图像
+ * @param rois ROI列表
+ */
 void SaveDetectedRoiDebug(const std::vector<cv::Mat>& bootstrap_bgr,
                           const std::vector<CameraRoi>& rois) {
   for (size_t i = 0; i < bootstrap_bgr.size() && i < rois.size(); ++i) {
@@ -348,6 +444,11 @@ void SaveDetectedRoiDebug(const std::vector<cv::Mat>& bootstrap_bgr,
   }
 }
 
+/**
+ * @brief 估计所有相邻帧之间的重叠
+ * @param frames 引导帧列表
+ * @return 重叠估计列表
+ */
 std::vector<OverlapEstimate> EstimateOverlaps(const std::vector<cv::Mat>& frames) {
   std::vector<OverlapEstimate> overlaps;
   if (frames.size() < 2) {
@@ -361,6 +462,13 @@ std::vector<OverlapEstimate> EstimateOverlaps(const std::vector<cv::Mat>& frames
   return overlaps;
 }
 
+/**
+ * @brief 基于重叠估计和调参构建相机ROI
+ * @param frames 硬件帧列表
+ * @param overlaps 重叠估计列表
+ * @param tuning 相机调参列表
+ * @return 相机ROI列表
+ */
 std::vector<CameraRoi> BuildCameraRois(const std::vector<NV12Frame>& frames,
                                       const std::vector<OverlapEstimate>& overlaps,
                                       const std::vector<CameraTuning>& tuning) {
@@ -431,6 +539,14 @@ std::vector<CameraRoi> BuildCameraRois(const std::vector<NV12Frame>& frames,
   return rois;
 }
 
+/**
+ * @brief 构建拼接布局任务
+ * @param rois 相机ROI列表
+ * @param tuning 相机调参列表
+ * @param panorama_width 输出全景图宽度
+ * @param panorama_height 输出全景图高度
+ * @return 拼接任务列表
+ */
 std::vector<StitchTask> BuildStitchLayout(const std::vector<CameraRoi>& rois,
                                           const std::vector<CameraTuning>& tuning,
                                           int* panorama_width,
@@ -467,9 +583,10 @@ std::vector<StitchTask> BuildStitchLayout(const std::vector<CameraRoi>& rois,
 
 using namespace std;
 
-bool g_save_stitched_frames = false;
-size_t g_save_frame_interval = 30;
-
+/**
+ * @brief App构造函数，初始化拼接应用
+ * 执行引导阶段：捕获第一帧，检测ROI，构建拼接布局
+ */
 App::App() : num_img_(0), total_cols_(0), height_(0) {
   Logger::GetInstance().Initialize();
   Logger::GetInstance().Log("[App] Application starting...");
@@ -539,10 +656,17 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   image_concat_.stride_h = height_;
 }
 
+/**
+ * @brief App析构函数，释放DRM缓冲区
+ */
 App::~App() {
   drm_free(output_drm_buf_);
 }
 
+/**
+ * @brief 运行拼接主循环
+ * 无限循环：获取帧 -> 拼接 -> 保存结果 -> 记录性能
+ */
 [[noreturn]] void App::run_stitching() {
   size_t frame_idx = 0;
 
@@ -600,6 +724,10 @@ App::~App() {
   }
 }
 
+/**
+ * @brief 主函数，创建App实例并运行拼接
+ * @return 程序退出码（实际不会返回，因为run_stitching是noreturn）
+ */
 int main() {
   App app;
   app.run_stitching();

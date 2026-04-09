@@ -3,6 +3,33 @@
 // Updated to use FFmpeg decoding for multi-channel video input.
 //
 
+/**
+ * @file sensor_data_interface.cc
+ * @brief 传感器数据接口实现
+ * 负责多路视频流的获取、FFmpeg硬件解码和帧队列管理
+ * 支持RK硬件解码(rkmpp)和DRM_PRIME缓冲区输出
+
+AvErrorToString() - FFmpeg错误代码转换为可读字符串
+IsHardwarePixelFormat() - 判断像素格式是否为硬件加速格式
+FindPreferredDecoder() - 查找优先解码器（rkmpp或软件）
+DecoderPerfStats 结构体 - 解码器性能统计
+AVFrameDeleter 结构体 - 智能指针删除器用于自动释放AVFrame
+CloneFrameReference() - 克隆AVFrame引用
+FillDrmPrimeMetadata() - 填充DRM_PRIME帧元数据
+SelectDecoderPixelFormat() - 选择解码器输出像素格式
+FormatDecoderPerfLog() - 格式化解码器性能日志
+
+InitExampleImages() - 初始化示例图像（未使用）
+InitVideoCapture() - 初始化视频捕获和解码线程
+StartDecodeThreads() - 启动解码线程
+StopDecodeThreads() - 停止解码线程
+RecordVideos() - 记录视频
+get_frame_vector() - 从缓冲队列提取帧
+ConvertQueuedFrameToDmabuf() - 将QueuedFrame转换为DMA-BUF格式
+get_image_vector() - 获取所有通道的NV12帧
+GetDecodeFpsSnapshot() - 获取解码FPS快照
+ */
+
 #include "sensor_data_interface.h"
 
 #include "logger.h"
@@ -26,18 +53,34 @@ extern "C" {
 
 namespace {
 
+/**
+ * @brief 将FFmpeg错误代码转换为可读的错误字符串
+ * @param errnum FFmpeg错误代码
+ * @return 错误说明字符串
+ */
 std::string AvErrorToString(int errnum) {
   char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
   av_strerror(errnum, errbuf, sizeof(errbuf));
   return std::string(errbuf);
 }
 
+/**
+ * @brief 判断像素格式是否为硬件加速格式
+ * @param pixel_format AVPixelFormat格式
+ * @return 如果是硬件格式返回true，否则返回false
+ */
 bool IsHardwarePixelFormat(AVPixelFormat pixel_format) {
   const AVPixFmtDescriptor* descriptor = av_pix_fmt_desc_get(pixel_format);
   return descriptor != nullptr &&
          (descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0;
 }
 
+/**
+ * @brief 查找优先使用的解码器
+ * 若启用硬件解码，优先选择rkmpp解码器；否则返回软件解码器
+ * @param codec_id 编码器ID
+ * @return 指向AVCodec结构的指针，如果未找到则返回nullptr
+ */
 const AVCodec* FindPreferredDecoder(AVCodecID codec_id) {
 #ifdef ENABLE_RK_HARDWARE_DECODING
   const char* decoder_name = nullptr;
@@ -75,6 +118,11 @@ const AVCodec* FindPreferredDecoder(AVCodecID codec_id) {
   return avcodec_find_decoder(codec_id);
 }
 
+/**
+ * @struct DecoderPerfStats
+ * @brief 解码器性能统计结构体
+ * 记录解码过程中各阶段的帧数、字节数和耗时
+ */
 struct DecoderPerfStats {
   size_t packets_read = 0;
   size_t packets_sent = 0;
@@ -94,7 +142,16 @@ struct DecoderPerfStats {
       std::chrono::steady_clock::now();
 };
 
+/**
+ * @struct AVFrameDeleter
+ * @brief AVFrame智能指针删除器
+ * 用于shared_ptr自动释放AVFrame内存
+ */
 struct AVFrameDeleter {
+  /**
+   * @brief 删除AVFrame对象
+   * @param frame 要删除的AVFrame指针
+   */
   void operator()(AVFrame* frame) const {
     if (frame != nullptr) {
       av_frame_free(&frame);
@@ -104,6 +161,12 @@ struct AVFrameDeleter {
 
 using AVFramePtr = std::shared_ptr<AVFrame>;
 
+/**
+ * @brief 克隆AVFrame引用
+ * 复制源帧的元数据和缓冲区引用（非深拷贝）
+ * @param source_frame 源AVFrame指针
+ * @return 包含帧引用的shared_ptr，如果失败则返回空指针
+ */
 AVFramePtr CloneFrameReference(const AVFrame* source_frame) {
   if (source_frame == nullptr) {
     return AVFramePtr();
@@ -122,6 +185,12 @@ AVFramePtr CloneFrameReference(const AVFrame* source_frame) {
   return AVFramePtr(frame_ref, AVFrameDeleter{});
 }
 
+/**
+ * @brief 填充DRM_PRIME帧元数据
+ * 从DRM_PRIME格式的AVFrame中提取DMA-BUF文件描述符和步长信息
+ * @param frame AVFrame指针，应为DRM_PRIME格式
+ * @param queued_frame 待填充的QueuedFrame结构
+ */
 void FillDrmPrimeMetadata(const AVFrame* frame, QueuedFrame& queued_frame) {
   queued_frame.width = frame != nullptr ? frame->width : 0;
   queued_frame.height = frame != nullptr ? frame->height : 0;
@@ -153,6 +222,13 @@ void FillDrmPrimeMetadata(const AVFrame* frame, QueuedFrame& queued_frame) {
   }
 }
 
+/**
+ * @brief 选择解码器输出像素格式
+ * 在支持的格式列表中优先选择DRM_PRIME硬件格式
+ * @param codec_context 编码器上下文
+ * @param pixel_formats 支持的像素格式数组（以AV_PIX_FMT_NONE结尾）
+ * @return 选定的像素格式
+ */
 AVPixelFormat SelectDecoderPixelFormat(AVCodecContext* codec_context,
                                        const AVPixelFormat* pixel_formats) {
   if (pixel_formats == nullptr) {
@@ -191,6 +267,15 @@ AVPixelFormat SelectDecoderPixelFormat(AVCodecContext* codec_context,
   return pixel_formats[0];
 }
 
+/**
+ * @brief 格式化解码器性能日志
+ * @param decoder_index 解码器索引（通道号）
+ * @param decoder_name 解码器名称
+ * @param frame_format_name 输出帧格式名称
+ * @param stats 性能统计数据
+ * @param elapsed_seconds 统计时间间隔（秒）
+ * @return 格式化的日志字符串
+ */
 std::string FormatDecoderPerfLog(size_t decoder_index,
                                  const std::string& decoder_name,
                                  const std::string& frame_format_name,
@@ -221,6 +306,11 @@ std::string FormatDecoderPerfLog(size_t decoder_index,
 
 }  // namespace
 
+/**
+ * @class SensorDataInterface
+ * @brief 传感器数据接口类
+ * 负责管理多路视频解码且框管理
+ */
 SensorDataInterface::SensorDataInterface()
     : max_queue_length_(2),
       num_img_(0),
@@ -228,12 +318,25 @@ SensorDataInterface::SensorDataInterface()
       stop_requested_(false),
       decode_threads_started_(false) {}
 
+/**
+ * @brief SensorDataInterface析构函数
+ * 程序终止时止解码线程
+ */
 SensorDataInterface::~SensorDataInterface() {
   StopDecodeThreads();
 }
 
+/**
+ * @brief 初始化示例图像列表
+ * 目前不使用，仅特残帧查详素
+ */
 void SensorDataInterface::InitExampleImages() {}
 
+/**
+ * @brief 初始化视频捕取
+ * 根据视频文件列表创建接接缓冲区和解码线程
+ * @param num_img 数组大小（口数），传回实际【文件数量
+ */
 void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   const std::string video_dir = "../datasets/4k-test/";
   const std::vector<std::string> video_file_name = {
@@ -266,6 +369,9 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   StartDecodeThreads();
 }
 
+/**
+ * @brief 启动解码线程
+ */
 void SensorDataInterface::StartDecodeThreads() {
   if (decode_threads_started_.exchange(true)) {
     return;
@@ -593,6 +699,10 @@ void SensorDataInterface::StartDecodeThreads() {
   }
 }
 
+/**
+ * @brief 停止解码线程
+ * 所有解码线程的停止信号，等待线程结束
+ */
 void SensorDataInterface::StopDecodeThreads() {
   stop_requested_ = true;
   for (std::thread& decode_thread : decode_threads_) {
@@ -604,10 +714,19 @@ void SensorDataInterface::StopDecodeThreads() {
   decode_threads_started_ = false;
 }
 
+/**
+ * @brief 记录视频
+ * 启动解码线程（与InitVideoCapture类似功能）
+ */
 void SensorDataInterface::RecordVideos() {
   StartDecodeThreads();
 }
 
+/**
+ * @brief 从缓冲队列提取帧
+ * 阻塞地等待每个通道的缓冲队列不空，然后获取帧并转换为QueuedFrame
+ * @param frame_vector 输出的帧向量
+ */
 void SensorDataInterface::get_frame_vector(std::vector<QueuedFrame>& frame_vector) {
   frame_vector.resize(num_img_);
   for (size_t i = 0; i < num_img_; ++i) {
@@ -648,6 +767,14 @@ void SensorDataInterface::get_frame_vector(std::vector<QueuedFrame>& frame_vecto
   }
 }
 
+/**
+ * @brief 将QueuedFrame转换为DMA-BUF格式
+ * 提取DRM_PRIME帧的DMA-buf文件描述符与NV12帧数据信息
+ * @param queued_frame 源处理队列帧结构
+ * @param frame 输出的NV12帧
+ * @param channel_index 通道索引（用于错误日志）
+ * @return 如果转换成功返回true，否则返回false
+ */
 bool SensorDataInterface::ConvertQueuedFrameToDmabuf(const QueuedFrame& queued_frame,
                                                      NV12Frame& frame,
                                                      size_t channel_index) {
@@ -672,6 +799,11 @@ bool SensorDataInterface::ConvertQueuedFrameToDmabuf(const QueuedFrame& queued_f
   return false;
 }
 
+/**
+ * @brief 获取所有通道的NV12帧
+ * 内部调用get_frame_vector()获取QueuedFrame，然后转换为NV12Frame
+ * @param image_vector 输出的NV12帧向量
+ */
 void SensorDataInterface::get_image_vector(std::vector<NV12Frame>& image_vector) {
   std::vector<QueuedFrame> frame_vector(num_img_);
   get_frame_vector(frame_vector);
@@ -684,6 +816,11 @@ void SensorDataInterface::get_image_vector(std::vector<NV12Frame>& image_vector)
   }
 }
 
+/**
+ * @brief 获取解码FPS快照
+ * 线程安全的获取最近一次解码帧速率统计
+ * @return 包含每个通道FPS的double向量
+ */
 std::vector<double> SensorDataInterface::GetDecodeFpsSnapshot() {
   std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
   return decode_fps_vector_;

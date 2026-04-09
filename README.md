@@ -104,6 +104,11 @@ cd /userdata/Projects/rknn-toolkit2/rknn-toolkit-lite2/examples/Detect2/code/UI
 - 构建MPP, RGA, FFmpeg
 - 测试: `./ffmpeg -decoders | grep rkmpp`
 
+### DMA-BUF机制
+DMA-BUF是一种用于内存管理机制，它允许设备访问内存，而无需复制数据。
+数据始终在同一块物理内存中，零拷贝。各个设备操作完毕后，需要通过一套同步机制告知其他设备“我读完了”或“我写完了”，以避免数据竞争。
+参考：https://zhuanlan.zhihu.com/p/1942149087869800464
+
 ### 测试解码器
 - 无AFBC: `./ffmpeg -hwaccel rkmpp -hwaccel_output_format drm_prime -i <video> -f null -`
 - 有AFBC: `./ffmpeg -hwaccel rkmpp -hwaccel_output_format drm_prime -afbc 1 -i <video> -f null -`
@@ -113,6 +118,7 @@ cd /userdata/Projects/rknn-toolkit2/rknn-toolkit-lite2/examples/Detect2/code/UI
 ### 性能优化路线
 - 当前瓶颈: 解码/取帧 (fetch ~121ms), 拼接 ~16ms
 - 目标: rkmpp -> DMA-BUF -> RGA/GPU零拷贝
+- 优化: 硬件解码/DMA-BUF/RGA/GPU零拷贝
 - 低风险: 去UMat用cv::Mat全链路
 - 高性能: 重构为硬件buffer直接拼接
 
@@ -130,3 +136,89 @@ bash
 程序输出两类统计:
 - **初始化**: input_init, param_generation, total等
 - **每帧**: clear, load, warp_cpu_dispatch, total, fps等
+
+## 0x08 运行逻辑
+
+### 程序架构
+- **主入口**: `main()` 创建App实例，调用`run_stitching()`
+- **App类**: 封装整个拼接应用，包含初始化和运行时逻辑
+
+### 初始化阶段 (App构造函数)
+1. **日志初始化**: Logger::GetInstance().Initialize()
+2. **视频捕获初始化**: sensorDataInterface_.InitVideoCapture(num_img_)
+3. **引导帧捕获**: 获取第一帧硬件帧，转换为BGR格式
+4. **重叠检测**: 
+   - `EstimateOverlaps()` 调用 `EstimatePairOverlap()` 检测相邻相机重叠
+   - 使用ORB特征匹配 + 模板匹配相结合的方法
+5. **ROI构建**: `BuildCameraRois()` 基于重叠估计构建相机感兴趣区域
+6. **布局构建**: `BuildStitchLayout()` 计算拼接任务和全景图尺寸
+7. **拼接器设置**: 配置ImageStitcher参数和布局
+8. **输出缓冲区分配**: drm_alloc_nv12() 分配DRM DMA-BUF
+
+### 运行时循环 (run_stitching())
+无限循环执行以下步骤:
+1. **帧获取**: sensorDataInterface_.get_image_vector() 获取所有相机帧
+2. **输出清空**: image_stitcher_.ClearOutput() 清空输出缓冲区
+3. **并行拼接**: 对每个相机调用 image_stitcher_.WarpImages() 进行变形拼接
+4. **性能统计**: 计算解码时间、拼接时间、FPS等指标
+5. **结果保存**: 按间隔保存拼接结果图像 (可选)
+
+### 关键技术点
+- **零拷贝**: 使用DRM_PRIME硬件帧，避免CPU内存拷贝
+- **硬件加速**: RK硬件解码 + RGA图像处理
+- **并行优化**: 多相机并行处理，GPU加速变形
+- **自适应ROI**: 运行时检测相机重叠区域，动态裁剪
+
+### 核心模块依赖关系
+
+#### 主程序模块 (app.cc/app.h)
+- **功能**: 应用入口和主循环控制
+- **依赖**: 
+  - SensorDataInterface: 视频数据获取
+  - ImageStitcher: 图像拼接处理
+  - Logger: 日志记录
+  - DrmAllocator: DRM缓冲区管理
+
+#### 传感器数据接口 (sensor_data_interface.cc/h)
+- **功能**: 多路视频流捕获和解码
+- **依赖**: 
+  - NV12Frame: 硬件帧结构定义
+  - FFmpeg: 硬件解码 (rkmpp)
+- **输出**: NV12硬件帧队列
+
+#### 图像拼接器 (image_stitcher.cc/h)
+- **功能**: GPU加速的图像变形和拼接
+- **依赖**: 
+  - DrmAllocator: 临时缓冲区分配
+  - NV12Frame: 帧数据结构
+- **输入**: 多路NV12帧 + 拼接任务配置
+- **输出**: 拼接后的NV12全景图
+
+#### DRM分配器 (drm_allocator.cc/h)
+- **功能**: DRM DMA-BUF内存管理
+- **依赖**: Linux DRM/KMS API
+- **提供**: 零拷贝缓冲区分配/释放
+
+#### 日志器 (logger.cc/h)
+- **功能**: 统一日志输出和性能统计
+- **依赖**: 标准输出流
+- **功能**: 帧级日志、图像保存、FPS计算
+
+#### NV12帧定义 (nv12_frame.h)
+- **功能**: 硬件帧数据结构定义
+- **依赖**: 无
+- **用途**: 在各模块间传递帧数据
+
+### 数据流向
+```
+         -> rkmppp硬件解码器    -> 硬件帧队列    ->RGA库进行拼接
+视频源 -> SensorDataInterface -> NV12Frame[] -> ImageStitcher -> DRM缓冲区 -> 保存/显示
+                              -> Logger (统计信息)
+         -> 下载软件帧用于初始化                -> 复用软件帧所获取的ROI区域
+```
+
+### 配置文件
+- **相机标定**: params/camchain_*.yaml (内参、外参、畸变系数)
+- **环境变量**: 运行时调参 (裁剪、偏移、保存控制)
+
+

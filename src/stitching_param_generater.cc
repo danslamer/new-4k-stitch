@@ -3,6 +3,15 @@
 // Modified from samples/cpp/stitching_detailed.cpp
 //
 
+/**
+ * @file stitching_param_generater.cc
+ * @brief 拼接参数生成器实现
+ * 
+ * 基于OpenCV的stitching_detailed示例修改，用于生成相机内外参数、
+ * 图像特征、单应性矩阵和变形映射，为全景拼接提供基础参数。
+ * 注意：该模块在当前工程中未被使用，保留以备技术演进。
+ */
+
 #include "stitching_param_generater.h"
 #include "logger.h"
 
@@ -20,7 +29,15 @@ using namespace cv::detail;
 #define LOG(msg) do { std::ostringstream log_stream; log_stream << msg; Logger::GetInstance().Log(log_stream.str()); } while (false)
 #define LOGLN(msg) LOG(msg)
 
-
+/**
+ * @brief StitchingParamGenerator构造函数
+ * 初始化拼接参数生成器，执行完整的参数生成流程：
+ * 1. 初始化内存空间
+ * 2. 畸变校正
+ * 3. 相机参数估计
+ * 4. 变形器初始化
+ * @param image_vector 输入的多帧图像向量，应包含待拼接的所有图像
+ */
 StitchingParamGenerator::StitchingParamGenerator(
     const vector<cv::Mat>& image_vector) {
   num_img_ = image_vector.size();
@@ -59,6 +76,16 @@ StitchingParamGenerator::StitchingParamGenerator(
   InitWarper();
 }
 
+/**
+ * @brief 初始化相机参数
+ * 
+ * 执行以下步骤：
+ * 1. 使用SIFT特征提取多张图像的特征点
+ * 2. 进行特征点匹配（根据matcher_type选择匹配策略）
+ * 3. 基于匹配的特征点估计相机间的单应性矩阵
+ * 4. 光束平差（Bundle Adjustment）优化相机参数
+ * 5. 波形校正以消除倾斜
+ */
 void StitchingParamGenerator::InitCameraParam() {
   Ptr<Feature2D> finder;
   finder = SIFT::create();
@@ -143,6 +170,17 @@ void StitchingParamGenerator::InitCameraParam() {
 }
 
 
+/**
+ * @brief 初始化变形器
+ * 
+ * 执行以下步骤：
+ * 1. 计算中位焦距用于变形
+ * 2. 创建变形器（支持平面、圆柱、球面等多种变形方式）
+ * 3. 为每幅图像构建变形映射
+ * 4. 生成图像掩码并进行变形
+ * 5. 计算拼接后的全景图ROI（感兴趣区域）
+ * 6. 对相邻图像进行边界调整以消除重叠
+ */
 void StitchingParamGenerator::InitWarper() {
 
   vector<double> focals;
@@ -317,6 +355,22 @@ void StitchingParamGenerator::InitWarper() {
 }
 
 
+/**
+ * @brief 初始化畸变校正映射
+ * 
+ * 执行以下步骤：
+ * 1. 从params文件夹加载YAML标定文件（camchain_*.yaml）
+ * 2. 读取相机内参矩阵（KMat）、畸变系数（D）、外参（RMat）
+ * 3. 处理分辨率缩放（如果输入分辨率与标定分辨率不同）
+ * 4. 生成畸变校正的坐标映射（用于cv::remap）
+ * 
+ * 标定文件格式（params/camchain_i.yaml）：
+ * - KMat: 3x3相机内参矩阵
+ * - D: 畸变系数向量
+ * - RMat: 3x3旋转矩阵（相对于第一个相机）
+ * - focal: 焦距
+ * - width/height: 标定时的图像分辨率
+ */
 void StitchingParamGenerator::InitUndistortMap() {
   std::vector<double> cam_focal_vector(num_img_);
 
@@ -398,6 +452,20 @@ void StitchingParamGenerator::InitUndistortMap() {
 
 }
 
+/**
+ * @brief 获取所有重投影参数
+ * 
+ * 返回通过初始化过程计算得到的所有参数，供外部使用：
+ * - 畸变校正映射：用于cv::remap进行图像校正
+ * - 重投影映射：用于cv::remap进行观点变换（透视投影）
+ * - 精化后的ROI：每个图像在拼接画布中的位置和大小
+ * 
+ * @param undist_xmap_vector 输出：畸变校正的X坐标映射
+ * @param undist_ymap_vector 输出：畸变校正的Y坐标映射
+ * @param reproj_xmap_vector 输出：重投影的X坐标映射
+ * @param reproj_ymap_vector 输出：重投影的Y坐标映射
+ * @param projected_image_roi_vect_refined 输出：精化后的图像ROI（每个图像在全景图中的位置）
+ */
 void StitchingParamGenerator::GetReprojParams(
     vector<cv::UMat>& undist_xmap_vector,
     vector<cv::UMat>& undist_ymap_vector,
