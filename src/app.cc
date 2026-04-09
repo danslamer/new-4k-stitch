@@ -272,7 +272,7 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
 
   const int common_w = std::min(left_gray.cols, right_gray.cols);
   const int common_h = std::min(left_gray.rows, right_gray.rows);
-  const int search_w = NormalizeEvenFloor(std::min(common_w / 2, 1200));
+  const int search_w = NormalizeEvenFloor(std::min(common_w / 2, 1920));
   const int template_w = NormalizeEvenFloor(std::max(192, search_w * 2 / 3));
   const int band_h = NormalizeEvenFloor(std::min(common_h / 5, 480));
   const int max_shift_y = std::min(240, std::max(16, common_h / 12));
@@ -342,7 +342,7 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
 
   const int common_w = std::min(left_gray.cols, right_gray.cols);
   const int common_h = std::min(left_gray.rows, right_gray.rows);
-  const int band_w = NormalizeEvenFloor(std::min(common_w / 2, 1200));
+  const int band_w = NormalizeEvenFloor(std::min(common_w / 2, 1920));
   if (band_w < 256 || common_h < 128) {
     return estimate_by_template();
   }
@@ -455,137 +455,197 @@ void SaveDetectedRoiDebug(const std::vector<cv::Mat>& bootstrap_bgr,
 }
 
 /**
- * @brief 估计所有相邻帧之间的重叠
- * @param frames 引导帧列表
- * @return 重叠估计列表
+ * @brief 结构体：2x2矩阵模式下上下相邻帧的重叠估计
  */
-std::vector<OverlapEstimate> EstimateOverlaps(const std::vector<cv::Mat>& frames) {
-  std::vector<OverlapEstimate> overlaps;
-  if (frames.size() < 2) {
-    return overlaps;
-  }
+struct MatrixOverlap {
+  OverlapEstimate h01; ///< 左右重叠 (0和1)
+  OverlapEstimate h23; ///< 左右重叠 (2和3)
+  OverlapEstimate v02; ///< 上下重叠 (0和2)
+  OverlapEstimate v13; ///< 上下重叠 (1和3)
+  double confidence = 0.0; ///< 矩阵综合置信度
+};
 
-  overlaps.reserve(frames.size() - 1);
-  for (size_t i = 0; i + 1 < frames.size(); ++i) {
-    overlaps.push_back(EstimatePairOverlap(frames[i], frames[i + 1]));
-  }
-  return overlaps;
+/**
+ * @brief 估计上下两帧之间的垂直重叠区域
+ * 利用图像旋转技巧复用水平重叠匹配算法
+ * @param top_bgr 上侧帧BGR图像
+ * @param bottom_bgr 下侧帧BGR图像
+ * @return 重叠估计结果
+ */
+OverlapEstimate EstimateVerticalOverlap(const cv::Mat& top_bgr, const cv::Mat& bottom_bgr) {
+  cv::Mat top_rot, bottom_rot;
+  // 逆时针旋转90度，使底边变右边，顶边变左边
+  cv::rotate(top_bgr, top_rot, cv::ROTATE_90_COUNTERCLOCKWISE);
+  cv::rotate(bottom_bgr, bottom_rot, cv::ROTATE_90_COUNTERCLOCKWISE);
+  
+  OverlapEstimate est = EstimatePairOverlap(top_rot, bottom_rot);
+  
+  OverlapEstimate result;
+  result.overlap = est.overlap;  // 原图像的Y轴重叠高度
+  result.shift_y = -est.shift_y; // 原图像的X轴偏移（取反是因为旋转后新Y坐标方向相反）
+  result.score = est.score;
+  return result;
 }
 
 /**
- * @brief 基于重叠估计和调参构建相机ROI
+ * @brief 估计2x2输入矩阵所有相邻帧之间的重叠
+ * @param frames 引导帧列表
+ * @return 矩阵重叠估计结构体
+ */
+MatrixOverlap EstimateOverlaps2x2(const std::vector<cv::Mat>& frames) {
+  MatrixOverlap result;
+  if (frames.size() < 4) {
+    return result;
+  }
+
+  result.h01 = EstimatePairOverlap(frames[0], frames[1]);
+  result.h23 = EstimatePairOverlap(frames[2], frames[3]);
+  result.v02 = EstimateVerticalOverlap(frames[0], frames[2]);
+  result.v13 = EstimateVerticalOverlap(frames[1], frames[3]);
+  
+  result.confidence = (result.h01.score + result.h23.score + result.v02.score + result.v13.score) / 4.0;
+  return result;
+}
+
+/**
+ * @brief 基于重叠估计构建2x2输入矩阵的相机ROI
+ * 通过对齐4个角点的全局坐标计算精确裁剪参数
  * @param frames 硬件帧列表
- * @param overlaps 重叠估计列表
+ * @param overlaps 2x2矩阵重叠估计
  * @param tuning 相机调参列表
  * @return 相机ROI列表
  */
-std::vector<CameraRoi> BuildCameraRois(const std::vector<NV12Frame>& frames,
-                                      const std::vector<OverlapEstimate>& overlaps,
-                                      const std::vector<CameraTuning>& tuning) {
-  const size_t num_img = frames.size();
-  std::vector<CameraRoi> rois(num_img);
-  std::vector<int> left_crop(num_img, 0);
-  std::vector<int> right_crop(num_img, 0);
-  std::vector<int> global_y(num_img, 0);
+std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
+                                          const MatrixOverlap& overlaps,
+                                          const std::vector<CameraTuning>& tuning) {
+  if (frames.size() < 4) return {};
+  int W[4] = { frames[0].width, frames[1].width, frames[2].width, frames[3].width };
+  int H[4] = { frames[0].height, frames[1].height, frames[2].height, frames[3].height };
+  
+  int X[4] = {0, 0, 0, 0};
+  int Y[4] = {0, 0, 0, 0};
 
-  for (size_t i = 0; i < overlaps.size(); ++i) {
-    const int overlap = overlaps[i].overlap;
-    const int left_cut = NormalizeEvenFloor(overlap / 2);
-    const int right_cut = NormalizeEvenFloor(overlap - left_cut);
-    right_crop[i] += left_cut;
-    left_crop[i + 1] += right_cut;
-    global_y[i + 1] = global_y[i] - overlaps[i].shift_y;
+  // 左上角(0)作为原点
+  X[0] = 0;
+  Y[0] = 0;
+  // 右上角(1)
+  X[1] = W[0] - overlaps.h01.overlap;
+  Y[1] = overlaps.h01.shift_y;
+  // 左下角(2)
+  X[2] = overlaps.v02.shift_y;
+  Y[2] = H[0] - overlaps.v02.overlap;
+  
+  // 右下角(3)由两条路径推导并取平均
+  int X3_1 = X[1] + overlaps.v13.shift_y;
+  int Y3_1 = Y[1] + H[1] - overlaps.v13.overlap;
+  int X3_2 = X[2] + W[2] - overlaps.h23.overlap;
+  int Y3_2 = Y[2] + overlaps.h23.shift_y;
+  X[3] = (X3_1 + X3_2) / 2;
+  Y[3] = (Y3_1 + Y3_2) / 2;
+  
+  // 加入固定校准偏移
+  for (int i = 0; i < 4; ++i) {
+    X[i] += tuning[i].offset_x;
+    Y[i] += tuning[i].offset_y;
   }
-
-  int global_top = std::numeric_limits<int>::min();
-  int global_bottom = std::numeric_limits<int>::max();
-  for (size_t i = 0; i < num_img; ++i) {
-    const NV12Frame& frame = frames[i];
-    const CameraTuning& cfg = tuning[i];
-    const int top = global_y[i] + cfg.crop_top + cfg.offset_y;
-    const int bottom = global_y[i] + frame.height - cfg.crop_bottom + cfg.offset_y;
-    global_top = std::max(global_top, top);
-    global_bottom = std::min(global_bottom, bottom);
+  
+  // 计算内侧切割线
+  int X_mid_01 = (X[1] + X[0] + W[0]) / 2;
+  int X_mid_23 = (X[3] + X[2] + W[2]) / 2;
+  int cut_x = NormalizeEvenFloor((X_mid_01 + X_mid_23) / 2);
+  
+  int Y_mid_02 = (Y[2] + Y[0] + H[0]) / 2;
+  int Y_mid_13 = (Y[3] + Y[1] + H[1]) / 2;
+  int cut_y = NormalizeEvenFloor((Y_mid_02 + Y_mid_13) / 2);
+  
+  // 全局包围盒边界
+  int min_x = NormalizeEvenCeil(std::max(X[0], X[2]));
+  int max_x = NormalizeEvenFloor(std::min(X[1] + W[1], X[3] + W[3]));
+  int min_y = NormalizeEvenCeil(std::max(Y[0], Y[1]));
+  int max_y = NormalizeEvenFloor(std::min(Y[2] + H[2], Y[3] + H[3]));
+  
+  // 确保切割线在边界内
+  cut_x = std::max(min_x + 2, std::min(max_x - 2, cut_x));
+  cut_y = std::max(min_y + 2, std::min(max_y - 2, cut_y));
+  
+  std::vector<CameraRoi> rois(4);
+  
+  // Cam 0 (左上)
+  rois[0].x = NormalizeEvenFloor(min_x - X[0] + tuning[0].crop_left);
+  rois[0].y = NormalizeEvenFloor(min_y - Y[0] + tuning[0].crop_top);
+  rois[0].width = NormalizeEvenFloor(cut_x - min_x - tuning[0].crop_left - tuning[0].crop_right);
+  rois[0].height = NormalizeEvenFloor(cut_y - min_y - tuning[0].crop_top - tuning[0].crop_bottom);
+  
+  // Cam 1 (右上)
+  rois[1].x = NormalizeEvenFloor(cut_x - X[1] + tuning[1].crop_left);
+  rois[1].y = NormalizeEvenFloor(min_y - Y[1] + tuning[1].crop_top);
+  rois[1].width = NormalizeEvenFloor(max_x - cut_x - tuning[1].crop_left - tuning[1].crop_right);
+  rois[1].height = NormalizeEvenFloor(cut_y - min_y - tuning[1].crop_top - tuning[1].crop_bottom);
+  
+  // Cam 2 (左下)
+  rois[2].x = NormalizeEvenFloor(min_x - X[2] + tuning[2].crop_left);
+  rois[2].y = NormalizeEvenFloor(cut_y - Y[2] + tuning[2].crop_top);
+  rois[2].width = NormalizeEvenFloor(cut_x - min_x - tuning[2].crop_left - tuning[2].crop_right);
+  rois[2].height = NormalizeEvenFloor(max_y - cut_y - tuning[2].crop_top - tuning[2].crop_bottom);
+  
+  // Cam 3 (右下)
+  rois[3].x = NormalizeEvenFloor(cut_x - X[3] + tuning[3].crop_left);
+  rois[3].y = NormalizeEvenFloor(cut_y - Y[3] + tuning[3].crop_top);
+  rois[3].width = NormalizeEvenFloor(max_x - cut_x - tuning[3].crop_left - tuning[3].crop_right);
+  rois[3].height = NormalizeEvenFloor(max_y - cut_y - tuning[3].crop_top - tuning[3].crop_bottom);
+  
+  for (int i = 0; i < 4; ++i) {
+    if (rois[i].x < 0) rois[i].x = 0;
+    if (rois[i].y < 0) rois[i].y = 0;
+    if (rois[i].x + rois[i].width > W[i]) rois[i].width = NormalizeEvenFloor(W[i] - rois[i].x);
+    if (rois[i].y + rois[i].height > H[i]) rois[i].height = NormalizeEvenFloor(H[i] - rois[i].y);
+    if (rois[i].width < 2 || rois[i].height < 2) {
+      throw std::runtime_error("invalid 2x2 crop mapping for camera " + std::to_string(i));
+    }
   }
-
-  const int common_height = NormalizeEvenFloor(global_bottom - global_top);
-  if (common_height < 2) {
-    throw std::runtime_error("failed to build common ROI height from overlap/shift estimation");
-  }
-
-  for (size_t i = 0; i < num_img; ++i) {
-    const NV12Frame& frame = frames[i];
-    const CameraTuning& cfg = tuning[i];
-    if (frame.empty()) {
-      throw std::runtime_error("bootstrap hardware frame is empty for camera " + std::to_string(i));
-    }
-
-    CameraRoi roi;
-    roi.x = NormalizeEvenFloor(left_crop[i] + cfg.crop_left);
-    roi.y = NormalizeEvenFloor(global_top - global_y[i] - cfg.offset_y);
-    roi.width = NormalizeEvenFloor(
-        frame.width - left_crop[i] - right_crop[i] - cfg.crop_left - cfg.crop_right);
-    roi.height = common_height;
-
-    if (roi.x < 0) {
-      roi.x = 0;
-    }
-    if (roi.y < 0) {
-      roi.y = 0;
-    }
-    if (roi.x + roi.width > frame.width) {
-      roi.width = NormalizeEvenFloor(frame.width - roi.x);
-    }
-    if (roi.y + roi.height > frame.height) {
-      roi.height = NormalizeEvenFloor(frame.height - roi.y);
-    }
-    if (roi.width < 2 || roi.height < 2) {
-      throw std::runtime_error("invalid crop configuration for camera " + std::to_string(i));
-    }
-
-    rois[i] = roi;
-  }
-
+  
   return rois;
 }
 
 /**
- * @brief 构建拼接布局任务
+ * @brief 构建2x2输入矩阵的拼接布局任务
  * @param rois 相机ROI列表
  * @param tuning 相机调参列表
  * @param panorama_width 输出全景图宽度
  * @param panorama_height 输出全景图高度
  * @return 拼接任务列表
  */
-std::vector<StitchTask> BuildStitchLayout(const std::vector<CameraRoi>& rois,
-                                          const std::vector<CameraTuning>& tuning,
-                                          int* panorama_width,
-                                          int* panorama_height) {
-  const size_t num_img = rois.size();
-  std::vector<StitchTask> tasks(num_img);
-  int cursor_x = 0;
-  int max_y = 0;
+std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
+                                             const std::vector<CameraTuning>& tuning,
+                                             int* panorama_width,
+                                             int* panorama_height) {
+  if (rois.size() < 4) return {};
+  std::vector<StitchTask> tasks(4);
 
-  for (size_t i = 0; i < num_img; ++i) {
-    StitchTask task;
-    task.enabled = tuning[i].enabled;
-    task.rotation_deg = tuning[i].rotation_deg;
-    task.src_x = rois[i].x;
-    task.src_y = rois[i].y;
-    task.src_w = rois[i].width;
-    task.src_h = rois[i].height;
-    task.dst_x = NormalizeEvenFloor(cursor_x + tuning[i].offset_x);
-    task.dst_y = 0;
-
-    const int rotated_w = NormalizeEvenCeil(RotatedWidth(task.src_w, task.src_h, task.rotation_deg));
-    const int rotated_h = NormalizeEvenCeil(RotatedHeight(task.src_w, task.src_h, task.rotation_deg));
-    cursor_x = task.dst_x + rotated_w;
-    max_y = std::max(max_y, task.dst_y + rotated_h);
-    tasks[i] = task;
+  for (size_t i = 0; i < 4; ++i) {
+    tasks[i].enabled = tuning[i].enabled;
+    tasks[i].rotation_deg = tuning[i].rotation_deg;
+    tasks[i].src_x = rois[i].x;
+    tasks[i].src_y = rois[i].y;
+    tasks[i].src_w = rois[i].width;
+    tasks[i].src_h = rois[i].height;
   }
 
-  *panorama_width = NormalizeEvenCeil(cursor_x);
-  *panorama_height = NormalizeEvenCeil(max_y);
+  tasks[0].dst_x = 0;
+  tasks[0].dst_y = 0;
+
+  tasks[1].dst_x = NormalizeEvenFloor(rois[0].width);
+  tasks[1].dst_y = 0;
+
+  tasks[2].dst_x = 0;
+  tasks[2].dst_y = NormalizeEvenFloor(rois[0].height);
+
+  tasks[3].dst_x = NormalizeEvenFloor(rois[0].width);
+  tasks[3].dst_y = NormalizeEvenFloor(rois[0].height);
+
+  *panorama_width = NormalizeEvenCeil(rois[0].width + rois[1].width);
+  *panorama_height = NormalizeEvenCeil(rois[0].height + rois[2].height);
+
   return tasks;
 }
 
@@ -619,7 +679,7 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   
   // 用于存储每次检测的结果和置信度
   struct RoiDetectionResult {
-    vector<OverlapEstimate> overlaps;
+    MatrixOverlap overlaps;
     vector<CameraRoi> rois;
     vector<StitchTask> layout;
     double confidence = 0.0;  // 综合置信度（所有重叠score的平均值）
@@ -639,29 +699,21 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
     }
     
     // 执行第frame_count+1次检测
-    const vector<OverlapEstimate> overlaps = EstimateOverlaps(bootstrap_bgr);
-    const vector<CameraRoi> rois = BuildCameraRois(image_vector_, overlaps, tuning);
+    const MatrixOverlap overlaps = EstimateOverlaps2x2(bootstrap_bgr);
+    const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, overlaps, tuning);
     
-    // 计算本次检测的综合置信度（所有重叠的score平均值）
-    double total_confidence = 0.0;
-    for (const auto& overlap : overlaps) {
-      total_confidence += overlap.score;
-    }
-    double avg_confidence = overlaps.empty() ? 0.0 : total_confidence / overlaps.size();
+    double avg_confidence = overlaps.confidence;
     
     // 检查是否所有置信度都达到阈值
-    bool all_valid = true;
-    for (const auto& overlap : overlaps) {
-      if (overlap.score < CONFIDENCE_THRESHOLD) {
-        all_valid = false;
-        break;
-      }
-    }
+    bool all_valid = (overlaps.h01.score >= CONFIDENCE_THRESHOLD &&
+                      overlaps.h23.score >= CONFIDENCE_THRESHOLD &&
+                      overlaps.v02.score >= CONFIDENCE_THRESHOLD &&
+                      overlaps.v13.score >= CONFIDENCE_THRESHOLD);
     
     int dummy_panorama_width = 0;
     int dummy_panorama_height = 0;
     const vector<StitchTask> layout = 
-        BuildStitchLayout(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+        BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
     
     RoiDetectionResult result;
     result.overlaps = overlaps;
@@ -682,10 +734,10 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
       }
       
       // 输出各相邻摄像头对的score
-      for (size_t i = 0; i < overlaps.size(); ++i) {
-        debug_msg << " cam" << i << "-" << (i+1) << "_score=" 
-                  << std::fixed << std::setprecision(3) << overlaps[i].score;
-      }
+      debug_msg << " h01_score=" << std::fixed << std::setprecision(3) << overlaps.h01.score;
+      debug_msg << " h23_score=" << std::fixed << std::setprecision(3) << overlaps.h23.score;
+      debug_msg << " v02_score=" << std::fixed << std::setprecision(3) << overlaps.v02.score;
+      debug_msg << " v13_score=" << std::fixed << std::setprecision(3) << overlaps.v13.score;
       Logger::GetInstance().Log(debug_msg.str());
     }
     
@@ -715,13 +767,13 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   }
   
   const RoiDetectionResult& best_result = detection_results[best_result_idx];
-  const vector<OverlapEstimate>& overlaps = best_result.overlaps;
+  const MatrixOverlap& overlaps = best_result.overlaps;
   const vector<CameraRoi>& rois = best_result.rois;
   const vector<StitchTask>& layout = best_result.layout;
   
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream summary_msg;
-    summary_msg << "[App] [MULTI-FRAME ROI] Detection completed: "
+    summary_msg << "[App] [MULTI-FRAME ROI 2x2] Detection completed: "
                 << "total_frames=" << detection_results.size()
                 << " best_frame=" << best_result.frame_index
                 << " best_confidence=" << std::fixed << std::setprecision(4) << max_confidence;
@@ -731,7 +783,7 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   // 计算布局参数（最终使用最优结果的尺寸）
   int dummy_panorama_width = 0;
   int dummy_panorama_height = 0;
-  BuildStitchLayout(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+  BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
   total_cols_ = dummy_panorama_width;
   height_ = dummy_panorama_height;
 
@@ -739,13 +791,11 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   image_stitcher_.SetLayout(layout);
 
   ostringstream overlap_stream;
-  overlap_stream << "[App] overlap estimation (from frame #" << best_result.frame_index << "):";
-  for (size_t i = 0; i < overlaps.size(); ++i) {
-    overlap_stream << " cam" << i << "-" << (i + 1)
-                   << "{overlap=" << overlaps[i].overlap
-                   << " shift_y=" << overlaps[i].shift_y
-                   << " score=" << overlaps[i].score << "}";
-  }
+  overlap_stream << "[App] 2x2 matrix overlap estimation (from frame #" << best_result.frame_index << "):\n"
+                 << " h01{overlap=" << overlaps.h01.overlap << " shift_y=" << overlaps.h01.shift_y << " score=" << overlaps.h01.score << "}\n"
+                 << " h23{overlap=" << overlaps.h23.overlap << " shift_y=" << overlaps.h23.shift_y << " score=" << overlaps.h23.score << "}\n"
+                 << " v02{overlap_y=" << overlaps.v02.overlap << " shift_x=" << overlaps.v02.shift_y << " score=" << overlaps.v02.score << "}\n"
+                 << " v13{overlap_y=" << overlaps.v13.overlap << " shift_x=" << overlaps.v13.shift_y << " score=" << overlaps.v13.score << "}";
   Logger::GetInstance().Log(overlap_stream.str());
 
   ostringstream layout_stream;
