@@ -340,7 +340,7 @@ void SensorDataInterface::InitExampleImages() {}
 void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   const std::string video_dir = "../datasets/4k-test/";
   const std::vector<std::string> video_file_name = {
-      "40.mp4", "41.mp4", "42.mp4", "43.mp4"};
+      "h50.mp4", "h51.mp4", "h52.mp4", "h53.mp4"};
 
   num_img_ = video_file_name.size();
   num_img = num_img_;

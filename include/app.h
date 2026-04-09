@@ -11,6 +11,16 @@
 
 using namespace std;
 
+// ============================================================================
+// 全局调试开关 - 用于多帧ROI检测优化
+// ============================================================================
+/// 是否启用多帧ROI检测调试日志输出
+/// 0: OFF (关闭), 1: INFO (基本信息), 2: DEBUG (详细调试)
+static int g_multi_frame_roi_debug_level = 1;
+
+/// 是否保存每帧的ROI检测结果和置信度分析
+static bool g_save_roi_confidence_debug = true;
+
 class App {
  public:
     App();

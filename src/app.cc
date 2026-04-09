@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -24,8 +25,17 @@ extern "C" {
 }
 
 
-bool g_save_stitched_frames = false;
+bool g_save_stitched_frames = true;
 size_t g_save_frame_interval = 30;
+
+// ============================================================================
+// 多帧ROI检测参数
+// ============================================================================
+/// 多帧ROI检测过程中要获取的帧数上限
+static constexpr size_t NUM_BOOTSTRAP_FRAMES = 10;
+
+/// 置信度阈值 - ROI检测结果的最小置信度要求
+static constexpr double CONFIDENCE_THRESHOLD = 0.25;
 
 
 namespace {
@@ -585,7 +595,7 @@ using namespace std;
 
 /**
  * @brief App构造函数，初始化拼接应用
- * 执行引导阶段：捕获第一帧，检测ROI，构建拼接布局
+ * 执行引导阶段：捕获前10帧，对每帧进行ROI检测，选择置信度最高的结果
  */
 App::App() : num_img_(0), total_cols_(0), height_(0) {
   Logger::GetInstance().Initialize();
@@ -594,26 +604,142 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   sensorDataInterface_.InitVideoCapture(num_img_);
   image_vector_.resize(num_img_);
 
-  Logger::GetInstance().Log("[App] Waiting for first DRM_PRIME frames to build stitch layout...");
-  sensorDataInterface_.get_image_vector(image_vector_);
-
-  vector<cv::Mat> bootstrap_bgr(num_img_);
-  for (size_t i = 0; i < num_img_; ++i) {
-    bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+  // ============================================================================
+  // 多帧ROI检测阶段：获取前NUM_BOOTSTRAP_FRAMES帧，进行多次ROI检测
+  // ============================================================================
+  Logger::GetInstance().Log("[App] [MULTI-FRAME ROI] Starting multi-frame ROI detection...");
+  if (g_multi_frame_roi_debug_level >= 1) {
+    ostringstream debug_msg;
+    debug_msg << "[App] [MULTI-FRAME ROI] Will capture up to " << NUM_BOOTSTRAP_FRAMES 
+              << " frames for ROI detection";
+    Logger::GetInstance().Log(debug_msg.str());
   }
 
   const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
-  const vector<OverlapEstimate> overlaps = EstimateOverlaps(bootstrap_bgr);
-  const vector<CameraRoi> rois =
-      BuildCameraRois(image_vector_, overlaps, tuning);
-  const vector<StitchTask> layout =
-      BuildStitchLayout(rois, tuning, &total_cols_, &height_);
+  
+  // 用于存储每次检测的结果和置信度
+  struct RoiDetectionResult {
+    vector<OverlapEstimate> overlaps;
+    vector<CameraRoi> rois;
+    vector<StitchTask> layout;
+    double confidence = 0.0;  // 综合置信度（所有重叠score的平均值）
+    size_t frame_index = 0;
+  };
+  
+  std::vector<RoiDetectionResult> detection_results;
+  
+  // 循环获取最多NUM_BOOTSTRAP_FRAMES帧进行检测
+  size_t frame_count = 0;
+  while (frame_count < NUM_BOOTSTRAP_FRAMES) {
+    sensorDataInterface_.get_image_vector(image_vector_);
+    
+    vector<cv::Mat> bootstrap_bgr(num_img_);
+    for (size_t i = 0; i < num_img_; ++i) {
+      bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+    }
+    
+    // 执行第frame_count+1次检测
+    const vector<OverlapEstimate> overlaps = EstimateOverlaps(bootstrap_bgr);
+    const vector<CameraRoi> rois = BuildCameraRois(image_vector_, overlaps, tuning);
+    
+    // 计算本次检测的综合置信度（所有重叠的score平均值）
+    double total_confidence = 0.0;
+    for (const auto& overlap : overlaps) {
+      total_confidence += overlap.score;
+    }
+    double avg_confidence = overlaps.empty() ? 0.0 : total_confidence / overlaps.size();
+    
+    // 检查是否所有置信度都达到阈值
+    bool all_valid = true;
+    for (const auto& overlap : overlaps) {
+      if (overlap.score < CONFIDENCE_THRESHOLD) {
+        all_valid = false;
+        break;
+      }
+    }
+    
+    int dummy_panorama_width = 0;
+    int dummy_panorama_height = 0;
+    const vector<StitchTask> layout = 
+        BuildStitchLayout(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+    
+    RoiDetectionResult result;
+    result.overlaps = overlaps;
+    result.rois = rois;
+    result.layout = layout;
+    result.confidence = avg_confidence;
+    result.frame_index = frame_count;
+    detection_results.push_back(result);
+    
+    if (g_multi_frame_roi_debug_level >= 1) {
+      ostringstream debug_msg;
+      debug_msg << "[App] [MULTI-FRAME ROI] Frame #" << frame_count << ": "
+                << "avg_confidence=" << std::fixed << std::setprecision(4) << avg_confidence;
+      if (all_valid) {
+        debug_msg << " [VALID]";
+      } else {
+        debug_msg << " [WEAK]";
+      }
+      
+      // 输出各相邻摄像头对的score
+      for (size_t i = 0; i < overlaps.size(); ++i) {
+        debug_msg << " cam" << i << "-" << (i+1) << "_score=" 
+                  << std::fixed << std::setprecision(3) << overlaps[i].score;
+      }
+      Logger::GetInstance().Log(debug_msg.str());
+    }
+    
+    frame_count++;
+    
+    // 如果已经找到高质量结果则可以提前退出
+    if (all_valid && avg_confidence > 0.7) {
+      if (g_multi_frame_roi_debug_level >= 1) {
+        ostringstream debug_msg;
+        debug_msg << "[App] [MULTI-FRAME ROI] Early exit: Found high-quality result at frame #" 
+                  << frame_count - 1 << " with confidence=" << std::fixed << std::setprecision(4) 
+                  << avg_confidence;
+        Logger::GetInstance().Log(debug_msg.str());
+      }
+      break;
+    }
+  }
+  
+  // 选择置信度最高的检测结果
+  size_t best_result_idx = 0;
+  double max_confidence = -1.0;
+  for (size_t i = 0; i < detection_results.size(); ++i) {
+    if (detection_results[i].confidence > max_confidence) {
+      max_confidence = detection_results[i].confidence;
+      best_result_idx = i;
+    }
+  }
+  
+  const RoiDetectionResult& best_result = detection_results[best_result_idx];
+  const vector<OverlapEstimate>& overlaps = best_result.overlaps;
+  const vector<CameraRoi>& rois = best_result.rois;
+  const vector<StitchTask>& layout = best_result.layout;
+  
+  if (g_multi_frame_roi_debug_level >= 1) {
+    ostringstream summary_msg;
+    summary_msg << "[App] [MULTI-FRAME ROI] Detection completed: "
+                << "total_frames=" << detection_results.size()
+                << " best_frame=" << best_result.frame_index
+                << " best_confidence=" << std::fixed << std::setprecision(4) << max_confidence;
+    Logger::GetInstance().Log(summary_msg.str());
+  }
+  
+  // 计算布局参数（最终使用最优结果的尺寸）
+  int dummy_panorama_width = 0;
+  int dummy_panorama_height = 0;
+  BuildStitchLayout(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+  total_cols_ = dummy_panorama_width;
+  height_ = dummy_panorama_height;
 
   image_stitcher_.SetParams(0, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
 
   ostringstream overlap_stream;
-  overlap_stream << "[App] overlap estimation:";
+  overlap_stream << "[App] overlap estimation (from frame #" << best_result.frame_index << "):";
   for (size_t i = 0; i < overlaps.size(); ++i) {
     overlap_stream << " cam" << i << "-" << (i + 1)
                    << "{overlap=" << overlaps[i].overlap
@@ -634,7 +760,7 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   Logger::GetInstance().Log(layout_stream.str());
 
   ostringstream roi_stream;
-  roi_stream << "[App] detected rois:";
+  roi_stream << "[App] detected rois (from frame #" << best_result.frame_index << "):";
   for (size_t i = 0; i < rois.size(); ++i) {
     roi_stream << " cam" << i
                << "{x=" << rois[i].x
@@ -643,7 +769,13 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
                << " h=" << rois[i].height << "}";
   }
   Logger::GetInstance().Log(roi_stream.str());
-  SaveDetectedRoiDebug(bootstrap_bgr, rois);
+  
+  // 保存ROI检测调试信息（使用最优结果的第一帧）
+  std::vector<cv::Mat> best_bootstrap_bgr(num_img_);
+  for (size_t i = 0; i < num_img_; ++i) {
+    best_bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+  }
+  SaveDetectedRoiDebug(best_bootstrap_bgr, rois);
 
   if (drm_alloc_nv12(total_cols_, height_, output_drm_buf_) != 0) {
     throw std::runtime_error("failed to allocate output DRM DMA-BUF");
