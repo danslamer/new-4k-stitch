@@ -29,6 +29,41 @@ bool g_save_stitched_frames = true;
 size_t g_save_frame_interval = 30;
 
 // ============================================================================
+// 手动ROI微调参数 (全局配置)
+// ============================================================================
+// 用于在自动ROI识别基础上进行手动干预，调整各路相机的裁剪和偏移。
+// 按相机索引组织：0=左上，1=右上，2=左下，3=右下
+struct ManualRoiTuning {
+  int offset_x;     ///< X轴全局偏移（正值向右偏移，负值向左偏移）
+  int offset_y;     ///< Y轴全局偏移（正值向下偏移，负值向上偏移）
+  int crop_left;    ///< 左侧额外裁剪像素
+  int crop_right;   ///< 右侧额外裁剪像素
+  int crop_top;     ///< 顶部额外裁剪像素
+  int crop_bottom;  ///< 底部额外裁剪像素
+};
+
+// 切换标识，用于区分当前是通过数据集视频调试还是使用真实相机输入
+// 后续如果改成相机输入，将此全局变量置为 true 即可
+bool g_is_using_camera = false;
+
+// 1. 用于“数据集视频输入”的手动拼接微调参数
+//offset_x（第1个元素）：X 轴全图偏移量，offset_y（第2个元素）：Y 轴全图偏移量，crop_left（第3个元素）：左侧裁剪，crop_right（第4个元素）：右侧裁剪，crop_top（第5个元素）：顶部裁剪，crop_bottom（第6个元素）：底部裁剪
+ManualRoiTuning g_dataset_roi_tuning[4] = {
+    {0, 0, 0, 0, 0, 0}, // Cam 0: 左上
+    {0, -20, 0, 0, 0, 0}, // Cam 1: 右上
+    {0, 0, 0, 0, 0, 0}, // Cam 2: 左下
+    {0, -10, 0, 0, 0, 0}  // Cam 3: 右下
+};
+
+// 2. 用于“真实相机输入”的手动拼接微调参数
+ManualRoiTuning g_camera_roi_tuning[4] = {
+    {0, 0, 0, 0, 0, 0}, // Cam 0: 左上
+    {0, 0, 0, 0, 0, 0}, // Cam 1: 右上
+    {0, 0, 0, 0, 0, 0}, // Cam 2: 左下
+    {0, 0, 0, 0, 0, 0}  // Cam 3: 右下
+};
+
+// ============================================================================
 // 多帧ROI检测参数
 // ============================================================================
 /// 多帧ROI检测过程中要获取的帧数上限
@@ -242,12 +277,23 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
  * @brief 构建默认相机调参
  * @param num_cameras 相机数量
  * @return 调参列表
- * 暂未启用
+ * 结合全局的手动微调参数
  */
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
-  // Industrial deployment should replace these defaults with fixed installation
-  // parameters measured on the target rig.
+  
+  // 选择根据当前运行模式对应的参数源
+  ManualRoiTuning* current_tuning = g_is_using_camera ? g_camera_roi_tuning : g_dataset_roi_tuning;
+  
+  // 应用全局的手动微调参数
+  for (size_t i = 0; i < num_cameras && i < 4; ++i) {
+    tuning[i].offset_x = current_tuning[i].offset_x;
+    tuning[i].offset_y = current_tuning[i].offset_y;
+    tuning[i].crop_left = current_tuning[i].crop_left;
+    tuning[i].crop_right = current_tuning[i].crop_right;
+    tuning[i].crop_top = current_tuning[i].crop_top;
+    tuning[i].crop_bottom = current_tuning[i].crop_bottom;
+  }
   return tuning;
 }
 

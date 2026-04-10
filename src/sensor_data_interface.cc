@@ -332,38 +332,55 @@ SensorDataInterface::~SensorDataInterface() {
  */
 void SensorDataInterface::InitExampleImages() {}
 
+// 从 app.cc 引入设备标志位
+extern bool g_is_using_camera;
+
 /**
  * @brief 初始化视频捕取
  * 根据视频文件列表创建接接缓冲区和解码线程
  * @param num_img 数组大小（口数），传回实际【文件数量
  */
 void SensorDataInterface::InitVideoCapture(size_t& num_img) {
-  const std::string video_dir = "../datasets/4k-test/";
-  const std::vector<std::string> video_file_name = {
-      "h50.mp4", "h51.mp4", "h52.mp4", "h53.mp4"};
+  // 根据配置标志位选择初始化逻辑
+  if (g_is_using_camera) {
+      // ====================================================================
+      // 真实相机输入初始化逻辑预留位置
+      // ====================================================================
+      // TODO: 在这里添加针对 4 路相机 (例如 /dev/video0 ~ /dev/video3
+      // 或 v4l2 节点) 的捕获初始化代码，并填充 video_file_paths_。
+      // 当前暂时留空或填充为你相机的占位配置。
+      // num_img_ = 4;
+      // ...
+  } else {
+      // 原有的数据集测试视频读取逻辑
+      const std::string video_dir = "../datasets/4k-test/";
+      const std::vector<std::string> video_file_name = {
+          "t30.mp4", "t31.mp4", "t32.mp4", "t33.mp4"};
 
-  num_img_ = video_file_name.size();
-  num_img = num_img_;
+      num_img_ = video_file_name.size();
+      num_img = num_img_;
 
-  image_queue_vector_ = std::vector<std::queue<QueuedFrame>>(num_img_);
-  image_queue_mutex_vector_ = std::vector<std::mutex>(num_img_);
-  video_capture_vector_.clear();
+      image_queue_vector_ = std::vector<std::queue<QueuedFrame>>(num_img_);
+      image_queue_mutex_vector_ = std::vector<std::mutex>(num_img_);
+      video_capture_vector_.clear();
 
-  video_file_paths_.clear();
-  decode_threads_.clear();
-  decode_threads_.reserve(num_img_);
-  decode_fps_vector_ = std::vector<double>(num_img_, 0.0);
-  decoded_frames_since_report_ = std::vector<size_t>(num_img_, 0);
-  decode_report_time_vector_ =
-      std::vector<std::chrono::steady_clock::time_point>(
-          num_img_, std::chrono::steady_clock::now());
-  decoder_ready_vector_ = std::vector<bool>(num_img_, false);
-  decoder_finished_vector_ = std::vector<bool>(num_img_, false);
-  drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
+      video_file_paths_.clear();
+      // ... (其他初始化向量保留原样)
+      decode_threads_.clear();
+      decode_threads_.reserve(num_img_);
+      decode_fps_vector_ = std::vector<double>(num_img_, 0.0);
+      decoded_frames_since_report_ = std::vector<size_t>(num_img_, 0);
+      decode_report_time_vector_ =
+          std::vector<std::chrono::steady_clock::time_point>(
+              num_img_, std::chrono::steady_clock::now());
+      decoder_ready_vector_ = std::vector<bool>(num_img_, false);
+      decoder_finished_vector_ = std::vector<bool>(num_img_, false);
+      drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
 
-  for (size_t i = 0; i < num_img_; ++i) {
-    const std::string file_name = video_dir + video_file_name[i];
-    video_file_paths_.push_back(file_name);
+      for (size_t i = 0; i < num_img_; ++i) {
+        const std::string file_name = video_dir + video_file_name[i];
+        video_file_paths_.push_back(file_name);
+      }
   }
 
   StartDecodeThreads();
