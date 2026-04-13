@@ -220,6 +220,7 @@ ImageStitcher::ImageStitcher()
  */
 ImageStitcher::~ImageStitcher() {
     ReleaseScratchBuffers();
+    gles_warper_.Shutdown();
     CleanupOpenCL();
 }
 
@@ -280,6 +281,8 @@ void ImageStitcher::CleanupOpenCL() {
 void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& output) {
     if (!cl_context_) InitOpenCL();
     if (!cl_context_ || !pfn_clImportMemoryARM) return;
+    const std::vector<NV12Frame>& blend_input =
+        (use_gles_warp_ && warped_frames_.size() == tasks_.size()) ? warped_frames_ : input;
     
     // lambda to fetch or create a mapped DMA_BUF object in the cache
     auto get_cl_mem = [&](const int* fd_ptr, int w, int h, cl_mem_flags flags) -> cl_mem {
@@ -297,10 +300,11 @@ void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& o
     
     std::vector<cl_mem> cl_in(4, nullptr);
     for(int i=0; i<4; ++i) {
-        if(input[i].empty() || !tasks_[i].enabled) continue;
-        int w = input[i].stride_w > 0 ? input[i].stride_w : input[i].width;
-        int h = input[i].stride_h > 0 ? input[i].stride_h : input[i].height;
-        cl_in[i] = get_cl_mem(&input[i].fd, w, h, CL_MEM_READ_ONLY);
+        if (i >= static_cast<int>(blend_input.size())) continue;
+        if(blend_input[i].empty() || !tasks_[i].enabled) continue;
+        int w = blend_input[i].stride_w > 0 ? blend_input[i].stride_w : blend_input[i].width;
+        int h = blend_input[i].stride_h > 0 ? blend_input[i].stride_h : blend_input[i].height;
+        cl_in[i] = get_cl_mem(&blend_input[i].fd, w, h, CL_MEM_READ_ONLY);
     }
     int out_w = output.stride_w > 0 ? output.stride_w : output.width;
     int out_h = output.stride_h > 0 ? output.stride_h : output.height;
@@ -309,11 +313,27 @@ void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& o
     auto dispatch_seam = [&](int i1, int i2, int seam_x, int seam_y, int seam_w, int seam_h, int is_vert) {
         if(!cl_in[i1] || !cl_in[i2]) return;
         const auto& t1 = tasks_[i1]; const auto& t2 = tasks_[i2];
-        const auto& f1 = input[i1]; const auto& f2 = input[i2];
+        const auto& f1 = blend_input[i1]; const auto& f2 = blend_input[i2];
         int s1w = t1.src_w, s1h = t1.src_h, str1 = f1.stride_w > 0 ? f1.stride_w : f1.width;
         int h_str1 = f1.stride_h > 0 ? f1.stride_h : f1.height;
         int s2w = t2.src_w, s2h = t2.src_h, str2 = f2.stride_w > 0 ? f2.stride_w : f2.width;
         int h_str2 = f2.stride_h > 0 ? f2.stride_h : f2.height;
+
+        const int overlap_left = std::max(t1.dst_x, t2.dst_x);
+        const int overlap_top = std::max(t1.dst_y, t2.dst_y);
+        const int overlap_right =
+            std::min(t1.dst_x + RotatedWidth(t1), t2.dst_x + RotatedWidth(t2));
+        const int overlap_bottom =
+            std::min(t1.dst_y + RotatedHeight(t1), t2.dst_y + RotatedHeight(t2));
+        seam_x = std::max(seam_x, overlap_left);
+        seam_y = std::max(seam_y, overlap_top);
+        seam_w = std::min(seam_w, overlap_right - seam_x);
+        seam_h = std::min(seam_h, overlap_bottom - seam_y);
+        seam_w = NormalizeEvenFloor(seam_w);
+        seam_h = NormalizeEvenFloor(seam_h);
+        if (seam_w < 2 || seam_h < 2) {
+            return;
+        }
         
         int a=0;
         clSetKernelArg(cl_kern_blend_v_, a++, sizeof(cl_mem), &cl_in[i1]);
@@ -390,6 +410,25 @@ void ImageStitcher::SetParams(int blend_width,
     warp_mutex_ = std::vector<std::mutex>(num_img_);
     crop_buffers_.resize(num_img_);
     rotate_buffers_.resize(num_img_);
+    warped_buffers_.resize(num_img_);
+    warped_frames_.resize(num_img_);
+}
+
+bool ImageStitcher::SetWarpData(const StitchingWarpData& warp_data,
+                                int input_width,
+                                int input_height) {
+    warp_data_ = warp_data;
+    use_gles_warp_ = warp_data_.valid() &&
+                     gles_warper_.Initialize(warp_data_.entries, input_width, input_height);
+    if (!use_gles_warp_) {
+        warp_data_ = StitchingWarpData{};
+        gles_warper_.Shutdown();
+        Logger::GetInstance().Log(
+            "[ImageStitcher] GLES warper unavailable, falling back to RGA path.");
+    } else {
+        Logger::GetInstance().Log("[ImageStitcher] GLES warper initialized.");
+    }
+    return use_gles_warp_;
 }
 
 /**
@@ -448,6 +487,9 @@ bool ImageStitcher::EnsureScratchBuffer(std::vector<DrmBuffer>* buffers,
  */
 void ImageStitcher::ReleaseScratchBuffers() {
     for (DrmBuffer& buffer : crop_buffers_) {
+        drm_free(buffer);
+    }
+    for (DrmBuffer& buffer : warped_buffers_) {
         drm_free(buffer);
     }
     for (DrmBuffer& buffer : rotate_buffers_) {
@@ -517,6 +559,52 @@ void ImageStitcher::WarpImages(int img_idx,
                << " invalid rotation_deg=" << task.rotation_deg
                << ", only 0/90/180/270 are supported.";
         Logger::GetInstance().LogError(stream.str());
+        return;
+    }
+
+    if (use_gles_warp_ &&
+        img_idx < static_cast<int>(warp_data_.entries.size()) &&
+        warp_data_.entries[img_idx].valid()) {
+        const int warped_w = warp_data_.entries[img_idx].xmap.cols;
+        const int warped_h = warp_data_.entries[img_idx].xmap.rows;
+        const int dst_x = NormalizeEvenFloor(task.dst_x);
+        const int dst_y = NormalizeEvenFloor(task.dst_y);
+        if (dst_x + warped_w > output.width || dst_y + warped_h > output.height) {
+            Logger::GetInstance().LogError(
+                "[ImageStitcher] warped dst rect is out of panorama bounds.");
+            return;
+        }
+        if (!EnsureScratchBuffer(&warped_buffers_, img_idx, warped_w, warped_h)) {
+            Logger::GetInstance().LogError("[ImageStitcher] failed to allocate warped DMA-BUF.");
+            return;
+        }
+
+        DrmBuffer& warped = warped_buffers_[img_idx];
+        if (!gles_warper_.WarpFrame(img_idx, in, warped)) {
+            Logger::GetInstance().LogError("[ImageStitcher] GLES warp failed.");
+            return;
+        }
+
+        warped_frames_[img_idx].fd = warped.fd;
+        warped_frames_[img_idx].width = warped.width;
+        warped_frames_[img_idx].height = warped.height;
+        warped_frames_[img_idx].stride_w = static_cast<int>(warped.pitch);
+        warped_frames_[img_idx].stride_h = warped.height;
+
+        if (!BlitByRect(warped.fd,
+                        static_cast<int>(warped.pitch),
+                        warped.height,
+                        0,
+                        0,
+                        warped_w,
+                        warped_h,
+                        output.fd,
+                        output.stride_w > 0 ? output.stride_w : output.width,
+                        output.stride_h > 0 ? output.stride_h : output.height,
+                        dst_x,
+                        dst_y)) {
+            Logger::GetInstance().LogError("[ImageStitcher] c_RkRgaBlit failed on warped copy path.");
+        }
         return;
     }
 

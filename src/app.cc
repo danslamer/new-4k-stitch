@@ -19,6 +19,8 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 
+#include "stitching_param_generater.h"
+
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
@@ -82,7 +84,7 @@ ManualRoiTuning g_camera_roi_tuning[4] = {
 // 多帧ROI检测参数
 // ============================================================================
 /// 多帧ROI检测过程中要获取的帧数上限
-static constexpr size_t NUM_BOOTSTRAP_FRAMES = 10;
+static constexpr size_t NUM_BOOTSTRAP_FRAMES = 3;
 
 /// 置信度阈值 - ROI检测结果的最小置信度要求
 static constexpr double CONFIDENCE_THRESHOLD = 0.25;
@@ -738,6 +740,22 @@ std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
   return tasks;
 }
 
+std::vector<StitchTask> BuildWarpLayout(const StitchingWarpData& warp_data) {
+  std::vector<StitchTask> tasks(warp_data.entries.size());
+  for (size_t i = 0; i < warp_data.entries.size(); ++i) {
+    const WarpMapEntry& entry = warp_data.entries[i];
+    tasks[i].enabled = entry.valid();
+    tasks[i].rotation_deg = 0;
+    tasks[i].src_x = 0;
+    tasks[i].src_y = 0;
+    tasks[i].src_w = entry.xmap.cols;
+    tasks[i].src_h = entry.xmap.rows;
+    tasks[i].dst_x = NormalizeEvenFloor(entry.roi.x);
+    tasks[i].dst_y = NormalizeEvenFloor(entry.roi.y);
+  }
+  return tasks;
+}
+
 }  
 
 using namespace std;
@@ -755,7 +773,12 @@ void App::BootStrapOptimalLayout() {
   }
 
   const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
-  
+  sensorDataInterface_.get_image_vector(image_vector_);
+  std::vector<cv::Mat> bootstrap_bgr(num_img_);
+  for (size_t i = 0; i < num_img_; ++i) {
+    bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+  }
+
   // 用于存储每次检测的结果和置信度
   struct RoiDetectionResult {
     MatrixOverlap overlaps;
@@ -770,11 +793,11 @@ void App::BootStrapOptimalLayout() {
   // 循环获取最多NUM_BOOTSTRAP_FRAMES帧进行检测
   size_t frame_count = 0;
   while (frame_count < NUM_BOOTSTRAP_FRAMES) {
-    sensorDataInterface_.get_image_vector(image_vector_);
-    
-    vector<cv::Mat> bootstrap_bgr(num_img_);
-    for (size_t i = 0; i < num_img_; ++i) {
-      bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+    if (frame_count > 0) {
+      sensorDataInterface_.get_image_vector(image_vector_);
+      for (size_t i = 0; i < num_img_; ++i) {
+        bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+      }
     }
     
     // 执行第frame_count+1次检测

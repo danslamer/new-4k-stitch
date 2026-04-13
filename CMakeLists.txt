@@ -20,6 +20,9 @@ find_package(OpenCL REQUIRED)
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
 pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
+pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
+pkg_check_modules(GBM REQUIRED IMPORTED_TARGET gbm)
 if(ENABLE_RGA_DMA_STITCHING)
     pkg_check_modules(RGA REQUIRED IMPORTED_TARGET librga)
     pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
@@ -37,6 +40,8 @@ add_executable(${PROJECT_NAME}
     include/nv12_frame.h
     src/image_stitcher.cc
     include/image_stitcher.h
+    src/rk_gles_warper.cc
+    include/rk_gles_warper.h
     src/logger.cc
     include/logger.h
 )
@@ -55,6 +60,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::AVFORMAT
     PkgConfig::AVCODEC
     PkgConfig::AVUTIL
+    PkgConfig::EGL
+    PkgConfig::GLESV2
+    PkgConfig::GBM
     OpenCL::OpenCL    # 增加 OpenCL 链接
 )
 

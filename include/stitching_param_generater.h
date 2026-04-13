@@ -10,6 +10,32 @@
 
 using namespace std;
 
+struct WarpMapEntry {
+    cv::Mat xmap;
+    cv::Mat ymap;
+    cv::Rect roi;
+    bool valid() const {
+        return !xmap.empty() && !ymap.empty() && roi.width > 0 && roi.height > 0;
+    }
+};
+
+struct StitchingWarpData {
+    vector<WarpMapEntry> entries;
+    cv::Size panorama_size;
+
+    bool valid() const {
+        if (panorama_size.width <= 0 || panorama_size.height <= 0 || entries.empty()) {
+            return false;
+        }
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (!entries[i].valid()) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
 class StitchingParamGenerator {
  public:
     explicit StitchingParamGenerator(const vector<cv::Mat>& image_vector);
@@ -19,6 +45,7 @@ class StitchingParamGenerator {
                          vector<cv::UMat>& reproj_xmap_vector,
                          vector<cv::UMat>& reproj_ymap_vector,
                          vector<cv::Rect>& projected_image_roi_vect_refined);
+    void GetWarpData(StitchingWarpData& warp_data);
 
 
     void InitCameraParam();
@@ -66,6 +93,8 @@ class StitchingParamGenerator {
 
     vector<cv::detail::CameraParams> camera_params_vector_;
     vector<cv::Rect> projected_image_roi_vect_refined_;
+    vector<cv::Rect> projected_image_roi_vect_normalized_;
+    vector<cv::Mat> final_xmap_vector_, final_ymap_vector_;
     cv::Ptr<cv::detail::RotationWarper> rotation_warper_;
     cv::Ptr<cv::detail::Timelapser> timelapser_;
     cv::Ptr<cv::detail::Blender> blender_;
@@ -73,4 +102,3 @@ class StitchingParamGenerator {
 
 
 #endif //IMAGE_STITCHING_STITCHING_PARAM_GENERATER_H
-

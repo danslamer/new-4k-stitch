@@ -17,7 +17,9 @@
 
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 
@@ -49,11 +51,13 @@ StitchingParamGenerator::StitchingParamGenerator(
   image_warped_size_vector_ = vector<cv::Size>(num_img_);
   reproj_xmap_vector_ = vector<cv::UMat>(num_img_);
   reproj_ymap_vector_ = vector<cv::UMat>(num_img_);
-  camera_params_vector_ =
-      vector<cv::detail::CameraParams>(camera_params_vector_);
+  camera_params_vector_ = vector<cv::detail::CameraParams>(num_img_);
+  final_xmap_vector_ = vector<cv::Mat>(num_img_);
+  final_ymap_vector_ = vector<cv::Mat>(num_img_);
 
 //      projected_image_bbox_ = vector<cv::Rect>(num_img_);
   projected_image_roi_vect_refined_ = vector<cv::Rect>(num_img_);
+  projected_image_roi_vect_normalized_ = vector<cv::Rect>(num_img_);
 
   for (size_t img_idx = 0; img_idx < num_img_; img_idx++) {
     image_size_vector_[img_idx] = image_vector_[img_idx].size();
@@ -122,7 +126,7 @@ void StitchingParamGenerator::InitCameraParam() {
     estimator = makePtr<HomographyBasedEstimator>();
   if (!(*estimator)(features, pairwise_matches, camera_params_vector_)) {
     Logger::GetInstance().LogError("Homography estimation failed.");
-    assert(false);
+    throw std::runtime_error("Homography estimation failed.");
   }
   for (auto& i : camera_params_vector_) {
     Mat R;
@@ -141,7 +145,7 @@ void StitchingParamGenerator::InitCameraParam() {
   else {
     Logger::GetInstance().LogError(
         "Unknown bundle adjustment cost function: '" + ba_cost_func + "'.");
-    assert(false);
+    throw std::runtime_error("Unknown bundle adjustment cost function.");
   }
   adjuster->setConfThresh(conf_thresh);
   Mat_<uchar> refine_mask = Mat::zeros(3, 3, CV_8U);
@@ -153,7 +157,7 @@ void StitchingParamGenerator::InitCameraParam() {
   adjuster->setRefinementMask(refine_mask);
   if (!(*adjuster)(features, pairwise_matches, camera_params_vector_)) {
     Logger::GetInstance().LogError("Camera parameters adjusting failed.");
-    assert(false);
+    throw std::runtime_error("Camera parameters adjusting failed.");
   }
 
   vector<Mat> rmats;
@@ -253,7 +257,7 @@ void StitchingParamGenerator::InitWarper() {
   if (!warper_creator) {
     Logger::GetInstance().LogError(
         "Can't create the following warper '" + warp_type + "'");
-    assert(false);
+    throw std::runtime_error("Unable to create requested warper.");
   }
   rotation_warper_ =
       warper_creator->create(static_cast<float>(median_focal_length));
@@ -273,6 +277,28 @@ void StitchingParamGenerator::InitWarper() {
     Point point(rect.x, rect.y);
 
     image_point_vect[img_idx] = point;
+  }
+
+  for (int img_idx = 0; img_idx < num_img_; ++img_idx) {
+    cv::Mat undist_x, undist_y, reproj_x, reproj_y;
+    undist_xmap_vector_[img_idx].copyTo(undist_x);
+    undist_ymap_vector_[img_idx].copyTo(undist_y);
+    reproj_xmap_vector_[img_idx].copyTo(reproj_x);
+    reproj_ymap_vector_[img_idx].copyTo(reproj_y);
+    cv::remap(undist_x,
+              final_xmap_vector_[img_idx],
+              reproj_x,
+              reproj_y,
+              cv::INTER_LINEAR,
+              cv::BORDER_CONSTANT,
+              cv::Scalar(-1.0f));
+    cv::remap(undist_y,
+              final_ymap_vector_[img_idx],
+              reproj_x,
+              reproj_y,
+              cv::INTER_LINEAR,
+              cv::BORDER_CONSTANT,
+              cv::Scalar(-1.0f));
   }
 
 
@@ -315,6 +341,7 @@ void StitchingParamGenerator::InitWarper() {
   Point y_range = Point(-9999999, 999999);
   for (int i = 0; i < num_img_; ++i) {
     projected_image_roi_vect[i] -= roi_tl_bias;
+    projected_image_roi_vect_normalized_[i] = projected_image_roi_vect[i];
     Point tl = projected_image_roi_vect[i].tl();
     Point br = projected_image_roi_vect[i].br();
 
@@ -480,4 +507,65 @@ void StitchingParamGenerator::GetReprojParams(
   reproj_ymap_vector = reproj_ymap_vector_;
   projected_image_roi_vect_refined = projected_image_roi_vect_refined_;
 
+}
+
+void StitchingParamGenerator::GetWarpData(StitchingWarpData& warp_data) {
+  warp_data = StitchingWarpData{};
+  warp_data.entries.resize(num_img_);
+
+  int min_x = std::numeric_limits<int>::max();
+  int min_y = std::numeric_limits<int>::max();
+  int max_x = std::numeric_limits<int>::min();
+  int max_y = std::numeric_limits<int>::min();
+
+  for (size_t i = 0; i < num_img_; ++i) {
+    if (final_xmap_vector_[i].empty() || final_ymap_vector_[i].empty()) {
+      continue;
+    }
+
+    cv::Rect roi = projected_image_roi_vect_refined_[i];
+    if (roi.width <= 0 || roi.height <= 0) {
+      roi = projected_image_roi_vect_normalized_[i];
+    }
+    if (roi.width <= 0 || roi.height <= 0) {
+      continue;
+    }
+
+    roi &= cv::Rect(0, 0, final_xmap_vector_[i].cols, final_xmap_vector_[i].rows);
+    roi.x &= ~1;
+    roi.y &= ~1;
+    roi.width &= ~1;
+    roi.height &= ~1;
+    if (roi.width <= 0 || roi.height <= 0) {
+      continue;
+    }
+
+    if (roi.width < 2 || roi.height < 2) {
+      continue;
+    }
+
+    warp_data.entries[i].xmap = final_xmap_vector_[i](roi).clone();
+    warp_data.entries[i].ymap = final_ymap_vector_[i](roi).clone();
+    warp_data.entries[i].roi = roi;
+
+    min_x = std::min(min_x, roi.x);
+    min_y = std::min(min_y, roi.y);
+    max_x = std::max(max_x, roi.x + roi.width);
+    max_y = std::max(max_y, roi.y + roi.height);
+  }
+
+  if (min_x == std::numeric_limits<int>::max() ||
+      min_y == std::numeric_limits<int>::max()) {
+    return;
+  }
+
+  for (size_t i = 0; i < warp_data.entries.size(); ++i) {
+    if (!warp_data.entries[i].valid()) {
+      continue;
+    }
+    warp_data.entries[i].roi.x -= min_x;
+    warp_data.entries[i].roi.y -= min_y;
+  }
+
+  warp_data.panorama_size = cv::Size(max_x - min_x, max_y - min_y);
 }

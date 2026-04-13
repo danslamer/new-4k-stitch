@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include "drm_allocator.h"
 #include "nv12_frame.h"
+#include "rk_gles_warper.h"
 
 // 引入OpenCL
 #define CL_TARGET_OPENCL_VERSION 200
@@ -32,6 +33,9 @@ public:
                    int num_img,
                    int out_w,
                    int out_h);
+    bool SetWarpData(const StitchingWarpData& warp_data,
+                     int input_width,
+                     int input_height);
 
     void SetLayout(const std::vector<StitchTask>& tasks);
     void ClearOutput(const NV12Frame& output) const;
@@ -57,7 +61,12 @@ private:
     int out_w_, out_h_;
 
     std::vector<StitchTask> tasks_;
+    StitchingWarpData warp_data_;
     std::vector<DrmBuffer> crop_buffers_;
+    std::vector<DrmBuffer> warped_buffers_;
+    std::vector<NV12Frame> warped_frames_;
+    RkGlesWarper gles_warper_;
+    bool use_gles_warp_ = false;
 
     // OpenCL members
     cl_context cl_context_ = nullptr;
