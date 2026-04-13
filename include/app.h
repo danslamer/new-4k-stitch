@@ -29,6 +29,8 @@ class App {
     [[noreturn]] void run_stitching();
 
  private:
+    void BootStrapOptimalLayout();
+
     size_t num_img_;
 
     SensorDataInterface sensorDataInterface_;

@@ -201,6 +201,18 @@ double MedianDouble(std::vector<double> values) {
 }
 
 /**
+ * @brief 将 NV12 格式内存拷贝到统一的 Mat 中
+ */
+inline void CopyNv12DataToMat(const uint8_t* y_src, const uint8_t* uv_src, int width, int height, int pitch_y, int pitch_uv, cv::Mat& dst) {
+  for (int row = 0; row < height; ++row) {
+    std::memcpy(dst.ptr(row), y_src + static_cast<size_t>(row) * pitch_y, static_cast<size_t>(width));
+  }
+  for (int row = 0; row < height / 2; ++row) {
+    std::memcpy(dst.ptr(height + row), uv_src + static_cast<size_t>(row) * pitch_uv, static_cast<size_t>(width));
+  }
+}
+
+/**
  * @brief 将硬件NV12帧导出为BGR格式
  * @param frame NV12帧
  * @return BGR图像
@@ -227,16 +239,12 @@ cv::Mat ExportHardwareFrameToBgr(const NV12Frame& frame) {
   }
 
   cv::Mat nv12(sw_frame->height * 3 / 2, sw_frame->width, CV_8UC1);
-  for (int row = 0; row < sw_frame->height; ++row) {
-    std::memcpy(nv12.ptr(row),
-                sw_frame->data[0] + static_cast<size_t>(row) * sw_frame->linesize[0],
-                static_cast<size_t>(sw_frame->width));
-  }
-  for (int row = 0; row < sw_frame->height / 2; ++row) {
-    std::memcpy(nv12.ptr(sw_frame->height + row),
-                sw_frame->data[1] + static_cast<size_t>(row) * sw_frame->linesize[1],
-                static_cast<size_t>(sw_frame->width));
-  }
+  CopyNv12DataToMat(
+      sw_frame->data[0], sw_frame->data[1],
+      sw_frame->width, sw_frame->height,
+      sw_frame->linesize[0], sw_frame->linesize[1],
+      nv12
+  );
 
   cv::Mat bgr;
   cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
@@ -263,19 +271,14 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   const int y_rows = buffer.height * 3 / 2;
   cv::Mat nv12_host(y_rows, buffer.width, CV_8UC1);
   const uint8_t* src = static_cast<const uint8_t*>(mapped);
-
-  for (int row = 0; row < buffer.height; ++row) {
-    std::memcpy(nv12_host.ptr(row),
-                src + static_cast<size_t>(row) * buffer.pitch,
-                static_cast<size_t>(buffer.width));
-  }
-
   const uint8_t* uv_src = src + static_cast<size_t>(buffer.pitch) * buffer.height;
-  for (int row = 0; row < buffer.height / 2; ++row) {
-    std::memcpy(nv12_host.ptr(buffer.height + row),
-                uv_src + static_cast<size_t>(row) * buffer.pitch,
-                static_cast<size_t>(buffer.width));
-  }
+
+  CopyNv12DataToMat(
+      src, uv_src,
+      buffer.width, buffer.height,
+      buffer.pitch, buffer.pitch,
+      nv12_host
+  );
 
   drm_unmap(buffer, mapped);
 
@@ -313,23 +316,16 @@ std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
 }
 
 /**
- * @brief 估计两帧之间的重叠区域
- * 使用ORB特征匹配和模板匹配相结合的方法
- * @param left_bgr 左侧帧BGR图像
- * @param right_bgr 右侧帧BGR图像
+ * @brief 使用模板匹配估计候选重叠位置(当特征点匹配失败时的降级方案)
+ * @param left_gray 左图灰度
+ * @param right_gray 右图灰度
  * @return 重叠估计结果
  */
-OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& right_bgr) {
-  auto estimate_by_template = [&]() {
+OverlapEstimate EstimateOverlapByTemplate(const cv::Mat& left_gray, const cv::Mat& right_gray) {
   OverlapEstimate estimate;
-  if (left_bgr.empty() || right_bgr.empty()) {
+  if (left_gray.empty() || right_gray.empty()) {
     return estimate;
   }
-
-  cv::Mat left_gray;
-  cv::Mat right_gray;
-  cv::cvtColor(left_bgr, left_gray, cv::COLOR_BGR2GRAY);
-  cv::cvtColor(right_bgr, right_gray, cv::COLOR_BGR2GRAY);
 
   const int common_w = std::min(left_gray.cols, right_gray.cols);
   const int common_h = std::min(left_gray.rows, right_gray.rows);
@@ -337,6 +333,7 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   const int template_w = NormalizeEvenFloor(std::max(192, search_w * 2 / 3));
   const int band_h = NormalizeEvenFloor(std::min(common_h / 5, 480));
   const int max_shift_y = std::min(240, std::max(16, common_h / 12));
+  
   if (search_w <= template_w || band_h <= 0) {
     estimate.overlap = NormalizeEvenFloor(common_w / 8);
     return estimate;
@@ -390,8 +387,16 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   estimate.shift_y = MedianInt(shift_candidates);
   estimate.score = MedianDouble(score_candidates);
   return estimate;
-  };
+}
 
+/**
+ * @brief 估计两帧之间的重叠区域
+ * 使用ORB特征匹配和模板匹配相结合的方法
+ * @param left_bgr 左侧帧BGR图像
+ * @param right_bgr 右侧帧BGR图像
+ * @return 重叠估计结果
+ */
+OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& right_bgr) {
   if (left_bgr.empty() || right_bgr.empty()) {
     return OverlapEstimate{};
   }
@@ -405,7 +410,7 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   const int common_h = std::min(left_gray.rows, right_gray.rows);
   const int band_w = NormalizeEvenFloor(std::min(common_w / 2, 1920));
   if (band_w < 256 || common_h < 128) {
-    return estimate_by_template();
+    return EstimateOverlapByTemplate(left_gray, right_gray);
   }
 
   const cv::Rect left_roi(left_gray.cols - band_w, 0, band_w, left_gray.rows);
@@ -422,7 +427,7 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   orb->detectAndCompute(right_band, cv::noArray(), kp_right, desc_right);
 
   if (desc_left.empty() || desc_right.empty()) {
-    return estimate_by_template();
+    return EstimateOverlapByTemplate(left_gray, right_gray);
   }
 
   cv::BFMatcher matcher(cv::NORM_HAMMING);
@@ -450,14 +455,14 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   }
 
   if (pts_left.size() < 12) {
-    return estimate_by_template();
+    return EstimateOverlapByTemplate(left_gray, right_gray);
   }
 
   cv::Mat inliers;
   cv::Mat affine = cv::estimateAffinePartial2D(
       pts_right, pts_left, inliers, cv::RANSAC, 3.0, 2000, 0.99, 15);
   if (affine.empty()) {
-    return estimate_by_template();
+    return EstimateOverlapByTemplate(left_gray, right_gray);
   }
 
   const double dx = affine.at<double>(0, 2);
@@ -476,7 +481,7 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   estimate.score = pts_left.empty() ? 0.0 : static_cast<double>(inlier_count) / pts_left.size();
 
   if (estimate.score < 0.25 || estimate.overlap >= left_gray.cols || estimate.overlap <= 32) {
-    return estimate_by_template();
+    return EstimateOverlapByTemplate(left_gray, right_gray);
   }
   return estimate;
 }
@@ -610,7 +615,7 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
     Y[i] += tuning[i].offset_y;
   }
   
-  // 计算内侧切割线
+  // 计算内侧切割线（即相邻两个相机画面的初始绝对中线）
   int X_mid_01 = (X[1] + X[0] + W[0]) / 2;
   int X_mid_23 = (X[3] + X[2] + W[2]) / 2;
   int cut_x = NormalizeEvenFloor((X_mid_01 + X_mid_23) / 2);
@@ -622,7 +627,7 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   // ==========================================
   // 更新逻辑：修改布局生成机制创造重叠区
   // ==========================================
-  // 使用全局配置的羽化宽度
+  // 使用全局配置的羽化宽度，让四个画面的边界各自向外凸出本该裁掉的像素
   int blend_w = NormalizeEvenFloor(g_feather_width);
   
   int cut_x_left   = cut_x;
@@ -630,6 +635,7 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   int cut_y_top    = cut_y;
   int cut_y_bottom = cut_y;
   
+  // 左侧画面向右延伸一半羽化框，右侧画面向左延伸一半羽化框...
   cut_x_left  += blend_w / 2;
   cut_x_right -= blend_w / 2;
   cut_y_top += blend_w / 2;
@@ -713,15 +719,19 @@ std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
   tasks[0].dst_x = 0;
   tasks[0].dst_y = 0;
 
+  // 右上的画布起点向左平移整整一个 g_feather_width 宽度，使它物理盖在左上画面的像素上方
   tasks[1].dst_x = NormalizeEvenFloor(rois[0].width) - NormalizeEvenFloor(g_feather_width);
   tasks[1].dst_y = 0;
 
+  // 左下的画布起点向上平移
   tasks[2].dst_x = 0;
   tasks[2].dst_y = NormalizeEvenFloor(rois[0].height) - NormalizeEvenFloor(g_feather_width);
 
+  // 右下角的画布同时向左向上的叠加覆盖
   tasks[3].dst_x = NormalizeEvenFloor(rois[0].width) - NormalizeEvenFloor(g_feather_width);
   tasks[3].dst_y = NormalizeEvenFloor(rois[0].height) - NormalizeEvenFloor(g_feather_width);
 
+  // 计算拼接后的总画幅分辨率
   *panorama_width = NormalizeEvenCeil(tasks[1].dst_x + rois[1].width);
   *panorama_height = NormalizeEvenCeil(tasks[2].dst_y + rois[2].height);
 
@@ -733,19 +743,9 @@ std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
 using namespace std;
 
 /**
- * @brief App构造函数，初始化拼接应用
- * 执行引导阶段：捕获前10帧，对每帧进行ROI检测，选择置信度最高的结果
+ * @brief 提取最优ROI布局向导
  */
-App::App() : num_img_(0), total_cols_(0), height_(0) {
-  Logger::GetInstance().Initialize();
-  Logger::GetInstance().Log("[App] Application starting...");
-
-  sensorDataInterface_.InitVideoCapture(num_img_);
-  image_vector_.resize(num_img_);
-
-  // ============================================================================
-  // 多帧ROI检测阶段：获取前NUM_BOOTSTRAP_FRAMES帧，进行多次ROI检测
-  // ============================================================================
+void App::BootStrapOptimalLayout() {
   Logger::GetInstance().Log("[App] [MULTI-FRAME ROI] Starting multi-frame ROI detection...");
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream debug_msg;
@@ -905,6 +905,20 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
     best_bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
   }
   SaveDetectedRoiDebug(best_bootstrap_bgr, rois);
+}
+
+/**
+ * @brief App构造函数，初始化拼接应用
+ * 执行引导阶段：捕获前10帧，对每帧进行ROI检测，选择置信度最高的结果
+ */
+App::App() : num_img_(0), total_cols_(0), height_(0) {
+  Logger::GetInstance().Initialize();
+  Logger::GetInstance().Log("[App] Application starting...");
+
+  sensorDataInterface_.InitVideoCapture(num_img_);
+  image_vector_.resize(num_img_);
+
+  BootStrapOptimalLayout();
 
   if (drm_alloc_nv12(total_cols_, height_, output_drm_buf_) != 0) {
     throw std::runtime_error("failed to allocate output DRM DMA-BUF");
@@ -933,11 +947,15 @@ App::~App() {
 
   while (true) {
     const double t0 = cv::getTickCount();
+    // 1️⃣ 从硬件解码器（rkmpp等）或者V4L2驱动提取最新的 4 路 NV12 数据帧到内存
     sensorDataInterface_.get_image_vector(image_vector_);
     const double t1 = cv::getTickCount();
 
+    // 2️⃣ 准备阶段：清理输出的拼图画布大画板的底色
     image_stitcher_.ClearOutput(image_concat_);
 
+    // 3️⃣ 硬件加速处理（RGA）：利用 Rockchip 的 2D 硬件处理大面图像搬运与旋转裁剪
+    // *RGA 直接覆盖目标画布的底层，形成带有边界生硬过渡的基础拼接图
     for (size_t img_idx = 0; img_idx < num_img_; ++img_idx) {
       image_stitcher_.WarpImages(static_cast<int>(img_idx),
                                  frame_idx,
@@ -946,14 +964,17 @@ App::~App() {
     }
 
     if (g_debug_opencl_feathering && frame_idx == 10) {
+      // 导出一张仅仅经过RGA阶段拼接的“未羽化”原始图层结构，供离线比对排错
       cv::UMat debug_rga = ExportNv12DrmBufferToBgr(output_drm_buf_);
       Logger::GetInstance().SaveImage(debug_rga, "debug_rga_hollow_body.png");
     }
 
-    // 执行 OpenCL 重叠带融合
+    // 4️⃣ 高级特效后处理（OpenCL）：启动 Mali GPU 利用 Alpha mask 并行计算边缘软过渡
+    // *将画布重叠部分的生硬切割线平滑羽化，融合图像边缘
     image_stitcher_.BlendSeams(image_vector_, image_concat_);
 
     if (g_debug_opencl_feathering && frame_idx == 10) {
+      // 导出一张纯羽化阶段处理掉缝隙后的全效图层
       cv::UMat debug_cl = ExportNv12DrmBufferToBgr(output_drm_buf_);
       Logger::GetInstance().SaveImage(debug_cl, "debug_opencl_seam_blended.png");
     }

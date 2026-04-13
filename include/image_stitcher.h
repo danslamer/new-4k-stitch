@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <mutex>
+#include <unordered_map>
 #include "drm_allocator.h"
 #include "nv12_frame.h"
 
@@ -66,6 +67,9 @@ private:
     cl_kernel cl_kern_blend_h_ = nullptr;
     cl_mem cl_alpha_mask_v_ = nullptr;
     cl_mem cl_alpha_mask_h_ = nullptr;
+
+    // DMA-BUF to cl_mem mapping cache to avoid MMU mapping overhead every frame
+    std::unordered_map<int, cl_mem> dma_buf_cache_;
     
     void InitOpenCL();
     void CleanupOpenCL();

@@ -266,6 +266,13 @@ void ImageStitcher::CleanupOpenCL() {
     if (cl_alpha_mask_v_) clReleaseMemObject(cl_alpha_mask_v_);
     if (cl_kern_blend_v_) clReleaseKernel(cl_kern_blend_v_);
     if (cl_prog_) clReleaseProgram(cl_prog_);
+
+    // Release all cached cl_mems
+    for (auto& pair : dma_buf_cache_) {
+        clReleaseMemObject(pair.second);
+    }
+    dma_buf_cache_.clear();
+
     if (cl_queue_) clReleaseCommandQueue(cl_queue_);
     if (cl_context_) clReleaseContext(cl_context_);
 }
@@ -274,19 +281,30 @@ void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& o
     if (!cl_context_) InitOpenCL();
     if (!cl_context_ || !pfn_clImportMemoryARM) return;
     
-    cl_import_properties_arm props[] = { CL_IMPORT_TYPE_ARM, CL_IMPORT_TYPE_DMA_BUF_ARM, 0 };
-    cl_int err;
+    // lambda to fetch or create a mapped DMA_BUF object in the cache
+    auto get_cl_mem = [&](const int* fd_ptr, int w, int h, cl_mem_flags flags) -> cl_mem {
+        int fd = *fd_ptr;
+        if (dma_buf_cache_.count(fd) > 0) return dma_buf_cache_[fd];
+        
+        cl_import_properties_arm props[] = { CL_IMPORT_TYPE_ARM, CL_IMPORT_TYPE_DMA_BUF_ARM, 0 };
+        cl_int err;
+        cl_mem mem = pfn_clImportMemoryARM(cl_context_, flags, props, (void*)fd_ptr, w * h * 3 / 2, &err);
+        if (mem && err == CL_SUCCESS) {
+            dma_buf_cache_[fd] = mem;
+        }
+        return mem;
+    };
     
     std::vector<cl_mem> cl_in(4, nullptr);
     for(int i=0; i<4; ++i) {
         if(input[i].empty() || !tasks_[i].enabled) continue;
         int w = input[i].stride_w > 0 ? input[i].stride_w : input[i].width;
         int h = input[i].stride_h > 0 ? input[i].stride_h : input[i].height;
-        cl_in[i] = pfn_clImportMemoryARM(cl_context_, CL_MEM_READ_ONLY, props, (void*)&input[i].fd, w * h * 3/2, &err);
+        cl_in[i] = get_cl_mem(&input[i].fd, w, h, CL_MEM_READ_ONLY);
     }
     int out_w = output.stride_w > 0 ? output.stride_w : output.width;
     int out_h = output.stride_h > 0 ? output.stride_h : output.height;
-    cl_mem cl_out = pfn_clImportMemoryARM(cl_context_, CL_MEM_READ_WRITE, props, (void*)&output.fd, out_w * out_h * 3/2, &err);
+    cl_mem cl_out = get_cl_mem(&output.fd, out_w, out_h, CL_MEM_READ_WRITE);
 
     auto dispatch_seam = [&](int i1, int i2, int seam_x, int seam_y, int seam_w, int seam_h, int is_vert) {
         if(!cl_in[i1] || !cl_in[i2]) return;
@@ -350,9 +368,6 @@ void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& o
     dispatch_seam(1, 3, tasks_[1].dst_x, tasks_[3].dst_y, h_w2, blend_width_, 0);
 
     clFinish(cl_queue_);
-    
-    for(int i=0; i<4; ++i) if(cl_in[i]) clReleaseMemObject(cl_in[i]);
-    clReleaseMemObject(cl_out);
 }
 
 /**
