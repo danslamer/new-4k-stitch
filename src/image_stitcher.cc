@@ -10,6 +10,92 @@
 
 #include "logger.h"
 
+#include <cmath>
+#ifndef CL_IMPORT_TYPE_ARM
+#define CL_IMPORT_TYPE_ARM 0x40B2
+#endif
+#ifndef CL_IMPORT_TYPE_DMA_BUF_ARM
+#define CL_IMPORT_TYPE_DMA_BUF_ARM 0x40B4
+#endif
+typedef cl_mem(CL_API_CALL *PFN_clImportMemoryARM)(cl_context, cl_mem_flags, const cl_import_properties_arm*, void*, size_t, cl_int*);
+static PFN_clImportMemoryARM pfn_clImportMemoryARM = nullptr;
+
+extern double g_feather_strength;
+
+const char* ocl_kernel_src = R"CLC(
+int get_src_x(int X, int Y, int t_dst_x, int t_dst_y, int t_src_x, int t_src_y, int t_rot, int t_sw, int t_sh) {
+    int lx = X - t_dst_x;
+    int ly = Y - t_dst_y;
+    if(t_rot == 0) return t_src_x + lx;
+    if(t_rot == 90) return t_src_x + ly;
+    if(t_rot == 180) return t_src_x + t_sw - 1 - lx;
+    if(t_rot == 270) return t_src_x + t_sh - 1 - ly;
+    return t_src_x + lx;
+}
+int get_src_y(int X, int Y, int t_dst_x, int t_dst_y, int t_src_x, int t_src_y, int t_rot, int t_sw, int t_sh) {
+    int lx = X - t_dst_x;
+    int ly = Y - t_dst_y;
+    if(t_rot == 0) return t_src_y + ly;
+    if(t_rot == 90) return t_src_y + t_sw - 1 - lx;
+    if(t_rot == 180) return t_src_y + t_sh - 1 - ly;
+    if(t_rot == 270) return t_src_y + lx;
+    return t_src_y + ly;
+}
+
+__kernel void blend_seam(
+    __global const uchar* img1, int s1_w, int s1_h, int str1, int h_str1, int d1_x, int d1_y, int sx1, int sy1, int rot1,
+    __global const uchar* img2, int s2_w, int s2_h, int str2, int h_str2, int d2_x, int d2_y, int sx2, int sy2, int rot2,
+    __global const uchar* mask, int is_vertical,
+    __global uchar* out_img, int out_w, int out_h, int out_str, int out_h_str,
+    int seam_x, int seam_y, int blend_w, int blend_h)
+{
+    int gx = get_global_id(0) * 2;
+    int gy = get_global_id(1) * 2;
+    if (gx >= blend_w || gy >= blend_h) return;
+    
+    __global const uchar* uv1 = img1 + str1 * h_str1;
+    __global const uchar* uv2 = img2 + str2 * h_str2;
+    __global       uchar* uv_out = out_img + out_str * out_h_str;
+    
+    int alpha = mask[is_vertical ? gx : gy];
+    int inv_a = 255 - alpha;
+
+    for(int dy = 0; dy < 2; ++dy) {
+        for(int dx = 0; dx < 2; ++dx) {
+            int out_px = seam_x + gx + dx;
+            int out_py = seam_y + gy + dy;
+            
+            int px1 = get_src_x(out_px, out_py, d1_x, d1_y, sx1, sy1, rot1, s1_w, s1_h);
+            int py1 = get_src_y(out_px, out_py, d1_x, d1_y, sx1, sy1, rot1, s1_w, s1_h);
+            int y1 = img1[py1 * str1 + px1];
+            
+            int px2 = get_src_x(out_px, out_py, d2_x, d2_y, sx2, sy2, rot2, s2_w, s2_h);
+            int py2 = get_src_y(out_px, out_py, d2_x, d2_y, sx2, sy2, rot2, s2_w, s2_h);
+            int y2 = img2[py2 * str2 + px2];
+            
+            out_img[out_py * out_str + out_px] = (uchar)((y1 * inv_a + y2 * alpha) / 255);
+        }
+    }
+    
+    int out_px = seam_x + gx;
+    int out_py = seam_y + gy;
+    int px1 = get_src_x(out_px, out_py, d1_x, d1_y, sx1, sy1, rot1, s1_w, s1_h) / 2 * 2;
+    int py1 = get_src_y(out_px, out_py, d1_x, d1_y, sx1, sy1, rot1, s1_w, s1_h) / 2;
+    int px2 = get_src_x(out_px, out_py, d2_x, d2_y, sx2, sy2, rot2, s2_w, s2_h) / 2 * 2;
+    int py2 = get_src_y(out_px, out_py, d2_x, d2_y, sx2, sy2, rot2, s2_w, s2_h) / 2;
+    
+    int u1 = uv1[py1 * str1 + px1];
+    int v1 = uv1[py1 * str1 + px1 + 1];
+    int u2 = uv2[py2 * str2 + px2];
+    int v2 = uv2[py2 * str2 + px2 + 1];
+    
+    int out_uv_y = out_py / 2;
+    int out_uv_x = out_px / 2 * 2;
+    uv_out[out_uv_y * out_str + out_uv_x]     = (uchar)((u1 * inv_a + u2 * alpha) / 255);
+    uv_out[out_uv_y * out_str + out_uv_x + 1] = (uchar)((v1 * inv_a + v2 * alpha) / 255);
+}
+)CLC";
+
 namespace {
 /**
  * @brief NV12像素格式常量定义
@@ -134,6 +220,139 @@ ImageStitcher::ImageStitcher()
  */
 ImageStitcher::~ImageStitcher() {
     ReleaseScratchBuffers();
+    CleanupOpenCL();
+}
+
+void ImageStitcher::InitOpenCL() {
+    cl_uint num_platforms;
+    clGetPlatformIDs(0, nullptr, &num_platforms);
+    if (num_platforms == 0) return;
+    std::vector<cl_platform_id> platforms(num_platforms);
+    clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+    cl_platform_id platform = platforms[0];
+    
+    cl_uint num_devices;
+    clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices);
+    if (num_devices == 0) return;
+    std::vector<cl_device_id> devices(num_devices);
+    clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr);
+    cl_device_id device = devices[0];
+    
+    cl_context_ = clCreateContext(nullptr, 1, &device, nullptr, nullptr, nullptr);
+    cl_queue_ = clCreateCommandQueueWithProperties(cl_context_, device, nullptr, nullptr);
+    
+    pfn_clImportMemoryARM = (PFN_clImportMemoryARM)clGetExtensionFunctionAddressForPlatform(platform, "clImportMemoryARM");
+    
+    const char* src = ocl_kernel_src;
+    cl_prog_ = clCreateProgramWithSource(cl_context_, 1, &src, nullptr, nullptr);
+    clBuildProgram(cl_prog_, 1, &device, nullptr, nullptr, nullptr);
+    cl_kern_blend_v_ = clCreateKernel(cl_prog_, "blend_seam", nullptr); // 均复用这一个
+    
+    int bw = blend_width_ > 0 ? blend_width_ : 120;
+    std::vector<uint8_t> mask(bw);
+    for(int i = 0; i < bw; ++i) {
+        double x = (double)i / (bw - 1);
+        double val = x;
+        if (g_feather_strength > 1.0) { // S型曲线过缓
+            val = (x < 0.5) ? 0.5 * std::pow(2.0 * x, g_feather_strength) 
+                            : 1.0 - 0.5 * std::pow(2.0 * (1.0 - x), g_feather_strength);
+        }
+        mask[i] = (uint8_t)std::max(0.0, std::min(255.0, val * 255.0));
+    }
+    cl_alpha_mask_v_ = clCreateBuffer(cl_context_, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bw, mask.data(), nullptr);
+}
+
+void ImageStitcher::CleanupOpenCL() {
+    if (cl_alpha_mask_v_) clReleaseMemObject(cl_alpha_mask_v_);
+    if (cl_kern_blend_v_) clReleaseKernel(cl_kern_blend_v_);
+    if (cl_prog_) clReleaseProgram(cl_prog_);
+    if (cl_queue_) clReleaseCommandQueue(cl_queue_);
+    if (cl_context_) clReleaseContext(cl_context_);
+}
+
+void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& output) {
+    if (!cl_context_) InitOpenCL();
+    if (!cl_context_ || !pfn_clImportMemoryARM) return;
+    
+    cl_import_properties_arm props[] = { CL_IMPORT_TYPE_ARM, CL_IMPORT_TYPE_DMA_BUF_ARM, 0 };
+    cl_int err;
+    
+    std::vector<cl_mem> cl_in(4, nullptr);
+    for(int i=0; i<4; ++i) {
+        if(input[i].empty() || !tasks_[i].enabled) continue;
+        int w = input[i].stride_w > 0 ? input[i].stride_w : input[i].width;
+        int h = input[i].stride_h > 0 ? input[i].stride_h : input[i].height;
+        cl_in[i] = pfn_clImportMemoryARM(cl_context_, CL_MEM_READ_ONLY, props, (void*)&input[i].fd, w * h * 3/2, &err);
+    }
+    int out_w = output.stride_w > 0 ? output.stride_w : output.width;
+    int out_h = output.stride_h > 0 ? output.stride_h : output.height;
+    cl_mem cl_out = pfn_clImportMemoryARM(cl_context_, CL_MEM_READ_WRITE, props, (void*)&output.fd, out_w * out_h * 3/2, &err);
+
+    auto dispatch_seam = [&](int i1, int i2, int seam_x, int seam_y, int seam_w, int seam_h, int is_vert) {
+        if(!cl_in[i1] || !cl_in[i2]) return;
+        const auto& t1 = tasks_[i1]; const auto& t2 = tasks_[i2];
+        const auto& f1 = input[i1]; const auto& f2 = input[i2];
+        int s1w = t1.src_w, s1h = t1.src_h, str1 = f1.stride_w > 0 ? f1.stride_w : f1.width;
+        int h_str1 = f1.stride_h > 0 ? f1.stride_h : f1.height;
+        int s2w = t2.src_w, s2h = t2.src_h, str2 = f2.stride_w > 0 ? f2.stride_w : f2.width;
+        int h_str2 = f2.stride_h > 0 ? f2.stride_h : f2.height;
+        
+        int a=0;
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(cl_mem), &cl_in[i1]);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &s1w);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &s1h);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &str1);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &h_str1);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t1.dst_x);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t1.dst_y);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t1.src_x);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t1.src_y);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t1.rotation_deg);
+        
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(cl_mem), &cl_in[i2]);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &s2w);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &s2h);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &str2);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &h_str2);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t2.dst_x);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t2.dst_y);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t2.src_x);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t2.src_y);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &t2.rotation_deg);
+        
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(cl_mem), &cl_alpha_mask_v_);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &is_vert);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(cl_mem), &cl_out);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &out_w);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &out_h);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &out_w);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &out_h);
+        
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &seam_x);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &seam_y);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &seam_w);
+        clSetKernelArg(cl_kern_blend_v_, a++, sizeof(int), &seam_h);
+        
+        size_t global_work_size[2] = { (size_t)seam_w / 2, (size_t)seam_h / 2 };
+        clEnqueueNDRangeKernel(cl_queue_, cl_kern_blend_v_, 2, nullptr, global_work_size, nullptr, 0, nullptr, nullptr);
+    };
+
+    // 执行纵向 0+1 与 2+3
+    int v_h1 = RotatedHeight(tasks_[0]);
+    int v_h2 = RotatedHeight(tasks_[2]);
+    dispatch_seam(0, 1, tasks_[1].dst_x, tasks_[0].dst_y, blend_width_, v_h1, 1);
+    dispatch_seam(2, 3, tasks_[3].dst_x, tasks_[2].dst_y, blend_width_, v_h2, 1);
+    
+    // 执行横向 0+2 与 1+3 (会覆盖中心十字交叉区)
+    int h_w1 = RotatedWidth(tasks_[0]);
+    int h_w2 = RotatedWidth(tasks_[1]);
+    dispatch_seam(0, 2, tasks_[0].dst_x, tasks_[2].dst_y, h_w1, blend_width_, 0);
+    dispatch_seam(1, 3, tasks_[1].dst_x, tasks_[3].dst_y, h_w2, blend_width_, 0);
+
+    clFinish(cl_queue_);
+    
+    for(int i=0; i<4; ++i) if(cl_in[i]) clReleaseMemObject(cl_in[i]);
+    clReleaseMemObject(cl_out);
 }
 
 /**

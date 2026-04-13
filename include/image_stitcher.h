@@ -6,6 +6,11 @@
 #include "drm_allocator.h"
 #include "nv12_frame.h"
 
+// 引入OpenCL
+#define CL_TARGET_OPENCL_VERSION 200
+#include <CL/cl.h>
+#include <CL/cl_ext.h>
+
 struct StitchTask {
     bool enabled = true;
     int rotation_deg = 0;
@@ -35,6 +40,8 @@ public:
                     const std::vector<NV12Frame>& input,
                     NV12Frame& output);
 
+    void BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& output);
+
 private:
     bool EnsureScratchBuffer(std::vector<DrmBuffer>* buffers,
                              int img_idx,
@@ -50,6 +57,18 @@ private:
 
     std::vector<StitchTask> tasks_;
     std::vector<DrmBuffer> crop_buffers_;
+
+    // OpenCL members
+    cl_context cl_context_ = nullptr;
+    cl_command_queue cl_queue_ = nullptr;
+    cl_program cl_prog_ = nullptr;
+    cl_kernel cl_kern_blend_v_ = nullptr;
+    cl_kernel cl_kern_blend_h_ = nullptr;
+    cl_mem cl_alpha_mask_v_ = nullptr;
+    cl_mem cl_alpha_mask_h_ = nullptr;
+    
+    void InitOpenCL();
+    void CleanupOpenCL();
     std::vector<DrmBuffer> rotate_buffers_;
     std::vector<std::mutex> warp_mutex_;
 };

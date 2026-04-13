@@ -14,6 +14,8 @@ set(ENV{LD_LIBRARY_PATH} "${FFMPEG_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
 find_package(OpenCV 4 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
+# 增加 OpenCL 查找
+find_package(OpenCL REQUIRED)
 
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
@@ -53,6 +55,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::AVFORMAT
     PkgConfig::AVCODEC
     PkgConfig::AVUTIL
+    OpenCL::OpenCL    # 增加 OpenCL 链接
 )
 
 if(ENABLE_RK_HARDWARE_DECODING)

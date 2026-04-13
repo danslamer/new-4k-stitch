@@ -252,3 +252,10 @@ h23{overlap=1126 shift_y=-45 score=0.082}
 同时将模板匹配（Template Matching）的参数 search_w 亦提升至 1920。
 
 如果有微小偏移，可以适当调节 CameraTuning 中的 offset_x 即可。
+
+
+由于 NV12 到 RGBA 的转换极其消耗带宽，不建议使用多次 RGA 操作。推荐方案是使用 Mali GPU 和 OpenCL，通过 ARM 的扩展 cl_arm_import_memory 零拷贝直接导入 NV12 的 DMA-buf（文件描述符 fd）。在 OpenCL Kernel 中直接对 Y 和交织的 UV 分量进行数学加权混合，直接输出到目标 NV12 缓冲区，从而实现高性能且无额外内存拷贝的边缘羽化。
+
+RGA 方案在裁剪、旋转的时候保留，而仅仅对于重叠的一小条交界区域使用 OpenCL 处理。
+
+不使用 OpenGL ES 和 FBO：在标准的移动端 OpenGL ES 环境下，渲染目标往往不支持 NV12 (需要罕见的 GL_EXT_YUV_target)，强行通过 FBO 输出 RGBA 还需要一步额外的 RGA 色彩空间逆转换，严重浪费内存带宽。OpenCL 直接支持线性内存操作。

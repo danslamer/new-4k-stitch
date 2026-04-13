@@ -28,6 +28,21 @@ extern "C" {
 bool g_save_stitched_frames = true;
 size_t g_save_frame_interval = 30;
 
+// 新增的离线文件调试支持 (全局变量打点)
+bool g_debug_opencl_feathering = true;
+
+// ============================================================================
+// 羽化(Feathering) 融合参数配置
+// ============================================================================
+// 羽化宽度 (像素)：决定相邻两路相机在拼接缝相交重叠的像素带宽度。
+// 注意：该值必须为偶数，且不能大于相机的物理重合盲区。
+int g_feather_width = 120; 
+
+// 羽化强度 (控制 Alpha 渐变曲线的形状)：
+// 1.0 : 纯线性渐变 (Linear)
+// > 1.0 : S型平滑曲线 (如 2.0 或 3.0，中心过渡快，边缘更融合)
+double g_feather_strength = 2.0;
+
 // ============================================================================
 // 手动ROI微调参数 (全局配置)
 // ============================================================================
@@ -50,7 +65,7 @@ bool g_is_using_camera = false;
 //offset_x（第1个元素）：X 轴全图偏移量，offset_y（第2个元素）：Y 轴全图偏移量，crop_left（第3个元素）：左侧裁剪，crop_right（第4个元素）：右侧裁剪，crop_top（第5个元素）：顶部裁剪，crop_bottom（第6个元素）：底部裁剪
 ManualRoiTuning g_dataset_roi_tuning[4] = {
     {0, 0, 0, 0, 0, 0}, // Cam 0: 左上
-    {0, -20, 0, 0, 0, 0}, // Cam 1: 右上
+    {0, -10, 0, 0, 0, 0}, // Cam 1: 右上
     {0, 0, 0, 0, 0, 0}, // Cam 2: 左下
     {0, -10, 0, 0, 0, 0}  // Cam 3: 右下
 };
@@ -604,6 +619,22 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   int Y_mid_13 = (Y[3] + Y[1] + H[1]) / 2;
   int cut_y = NormalizeEvenFloor((Y_mid_02 + Y_mid_13) / 2);
   
+  // ==========================================
+  // 更新逻辑：修改布局生成机制创造重叠区
+  // ==========================================
+  // 使用全局配置的羽化宽度
+  int blend_w = NormalizeEvenFloor(g_feather_width);
+  
+  int cut_x_left   = cut_x;
+  int cut_x_right  = cut_x;
+  int cut_y_top    = cut_y;
+  int cut_y_bottom = cut_y;
+  
+  cut_x_left  += blend_w / 2;
+  cut_x_right -= blend_w / 2;
+  cut_y_top += blend_w / 2;
+  cut_y_bottom -= blend_w / 2;
+
   // 全局包围盒边界
   int min_x = NormalizeEvenCeil(std::max(X[0], X[2]));
   int max_x = NormalizeEvenFloor(std::min(X[1] + W[1], X[3] + W[3]));
@@ -611,34 +642,36 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   int max_y = NormalizeEvenFloor(std::min(Y[2] + H[2], Y[3] + H[3]));
   
   // 确保切割线在边界内
-  cut_x = std::max(min_x + 2, std::min(max_x - 2, cut_x));
-  cut_y = std::max(min_y + 2, std::min(max_y - 2, cut_y));
+  cut_x_left = std::max(min_x + 2, std::min(max_x - 2, cut_x_left));
+  cut_x_right = std::max(min_x + 2, std::min(max_x - 2, cut_x_right));
+  cut_y_top = std::max(min_y + 2, std::min(max_y - 2, cut_y_top));
+  cut_y_bottom = std::max(min_y + 2, std::min(max_y - 2, cut_y_bottom));
   
   std::vector<CameraRoi> rois(4);
   
   // Cam 0 (左上)
   rois[0].x = NormalizeEvenFloor(min_x - X[0] + tuning[0].crop_left);
   rois[0].y = NormalizeEvenFloor(min_y - Y[0] + tuning[0].crop_top);
-  rois[0].width = NormalizeEvenFloor(cut_x - min_x - tuning[0].crop_left - tuning[0].crop_right);
-  rois[0].height = NormalizeEvenFloor(cut_y - min_y - tuning[0].crop_top - tuning[0].crop_bottom);
+  rois[0].width = NormalizeEvenFloor(cut_x_left - min_x - tuning[0].crop_left - tuning[0].crop_right);
+  rois[0].height = NormalizeEvenFloor(cut_y_top - min_y - tuning[0].crop_top - tuning[0].crop_bottom);
   
   // Cam 1 (右上)
-  rois[1].x = NormalizeEvenFloor(cut_x - X[1] + tuning[1].crop_left);
+  rois[1].x = NormalizeEvenFloor(cut_x_right - X[1] + tuning[1].crop_left);
   rois[1].y = NormalizeEvenFloor(min_y - Y[1] + tuning[1].crop_top);
-  rois[1].width = NormalizeEvenFloor(max_x - cut_x - tuning[1].crop_left - tuning[1].crop_right);
-  rois[1].height = NormalizeEvenFloor(cut_y - min_y - tuning[1].crop_top - tuning[1].crop_bottom);
+  rois[1].width = NormalizeEvenFloor(max_x - cut_x_right - tuning[1].crop_left - tuning[1].crop_right);
+  rois[1].height = NormalizeEvenFloor(cut_y_top - min_y - tuning[1].crop_top - tuning[1].crop_bottom);
   
   // Cam 2 (左下)
   rois[2].x = NormalizeEvenFloor(min_x - X[2] + tuning[2].crop_left);
-  rois[2].y = NormalizeEvenFloor(cut_y - Y[2] + tuning[2].crop_top);
-  rois[2].width = NormalizeEvenFloor(cut_x - min_x - tuning[2].crop_left - tuning[2].crop_right);
-  rois[2].height = NormalizeEvenFloor(max_y - cut_y - tuning[2].crop_top - tuning[2].crop_bottom);
+  rois[2].y = NormalizeEvenFloor(cut_y_bottom - Y[2] + tuning[2].crop_top);
+  rois[2].width = NormalizeEvenFloor(cut_x_left - min_x - tuning[2].crop_left - tuning[2].crop_right);
+  rois[2].height = NormalizeEvenFloor(max_y - cut_y_bottom - tuning[2].crop_top - tuning[2].crop_bottom);
   
   // Cam 3 (右下)
-  rois[3].x = NormalizeEvenFloor(cut_x - X[3] + tuning[3].crop_left);
-  rois[3].y = NormalizeEvenFloor(cut_y - Y[3] + tuning[3].crop_top);
-  rois[3].width = NormalizeEvenFloor(max_x - cut_x - tuning[3].crop_left - tuning[3].crop_right);
-  rois[3].height = NormalizeEvenFloor(max_y - cut_y - tuning[3].crop_top - tuning[3].crop_bottom);
+  rois[3].x = NormalizeEvenFloor(cut_x_right - X[3] + tuning[3].crop_left);
+  rois[3].y = NormalizeEvenFloor(cut_y_bottom - Y[3] + tuning[3].crop_top);
+  rois[3].width = NormalizeEvenFloor(max_x - cut_x_right - tuning[3].crop_left - tuning[3].crop_right);
+  rois[3].height = NormalizeEvenFloor(max_y - cut_y_bottom - tuning[3].crop_top - tuning[3].crop_bottom);
   
   for (int i = 0; i < 4; ++i) {
     if (rois[i].x < 0) rois[i].x = 0;
@@ -680,17 +713,17 @@ std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
   tasks[0].dst_x = 0;
   tasks[0].dst_y = 0;
 
-  tasks[1].dst_x = NormalizeEvenFloor(rois[0].width);
+  tasks[1].dst_x = NormalizeEvenFloor(rois[0].width) - NormalizeEvenFloor(g_feather_width);
   tasks[1].dst_y = 0;
 
   tasks[2].dst_x = 0;
-  tasks[2].dst_y = NormalizeEvenFloor(rois[0].height);
+  tasks[2].dst_y = NormalizeEvenFloor(rois[0].height) - NormalizeEvenFloor(g_feather_width);
 
-  tasks[3].dst_x = NormalizeEvenFloor(rois[0].width);
-  tasks[3].dst_y = NormalizeEvenFloor(rois[0].height);
+  tasks[3].dst_x = NormalizeEvenFloor(rois[0].width) - NormalizeEvenFloor(g_feather_width);
+  tasks[3].dst_y = NormalizeEvenFloor(rois[0].height) - NormalizeEvenFloor(g_feather_width);
 
-  *panorama_width = NormalizeEvenCeil(rois[0].width + rois[1].width);
-  *panorama_height = NormalizeEvenCeil(rois[0].height + rois[2].height);
+  *panorama_width = NormalizeEvenCeil(tasks[1].dst_x + rois[1].width);
+  *panorama_height = NormalizeEvenCeil(tasks[2].dst_y + rois[2].height);
 
   return tasks;
 }
@@ -833,7 +866,7 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   total_cols_ = dummy_panorama_width;
   height_ = dummy_panorama_height;
 
-  image_stitcher_.SetParams(0, static_cast<int>(num_img_), total_cols_, height_);
+  image_stitcher_.SetParams(g_feather_width, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
 
   ostringstream overlap_stream;
@@ -911,6 +944,20 @@ App::~App() {
                                  image_vector_,
                                  image_concat_);
     }
+
+    if (g_debug_opencl_feathering && frame_idx == 10) {
+      cv::UMat debug_rga = ExportNv12DrmBufferToBgr(output_drm_buf_);
+      Logger::GetInstance().SaveImage(debug_rga, "debug_rga_hollow_body.png");
+    }
+
+    // 执行 OpenCL 重叠带融合
+    image_stitcher_.BlendSeams(image_vector_, image_concat_);
+
+    if (g_debug_opencl_feathering && frame_idx == 10) {
+      cv::UMat debug_cl = ExportNv12DrmBufferToBgr(output_drm_buf_);
+      Logger::GetInstance().SaveImage(debug_cl, "debug_opencl_seam_blended.png");
+    }
+
     const double t2 = cv::getTickCount();
 
     const double tn = cv::getTickCount();
