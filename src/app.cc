@@ -1,14 +1,7 @@
-/**
- * @file app.cc
- * @brief 视频拼接应用主文件
- *
- * 此文件实现了视频拼接应用的核心逻辑，包括初始化、ROI检测、拼接布局构建和运行循环。
- * 使用ffmpeg库里的rkmpp解码器硬件解码和OpenCV进行实时视频拼接，RGA用于剪裁拼接处理。
- */
-
 #include "app.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -18,6 +11,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
+#include <opencv2/highgui.hpp>
 
 #include "stitching_param_generater.h"
 
@@ -26,161 +20,58 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 }
 
+StitchGlobalConfig g_config;
 
-bool g_save_stitched_frames = true;
-size_t g_save_frame_interval = 30;
-
-// 新增的离线文件调试支持 (全局变量打点)
-bool g_debug_opencl_feathering = true;
-
-// ============================================================================
-// 羽化(Feathering) 融合参数配置
-// ============================================================================
-// 羽化宽度 (像素)：决定相邻两路相机在拼接缝相交重叠的像素带宽度。
-// 注意：该值必须为偶数，且不能大于相机的物理重合盲区。
-int g_feather_width = 120; 
-
-// 羽化强度 (控制 Alpha 渐变曲线的形状)：
-// 1.0 : 纯线性渐变 (Linear)
-// > 1.0 : S型平滑曲线 (如 2.0 或 3.0，中心过渡快，边缘更融合)
-double g_feather_strength = 2.0;
-
-// ============================================================================
-// 手动ROI微调参数 (全局配置)
-// ============================================================================
-// 用于在自动ROI识别基础上进行手动干预，调整各路相机的裁剪和偏移。
-// 按相机索引组织：0=左上，1=右上，2=左下，3=右下
-struct ManualRoiTuning {
-  int offset_x;     ///< X轴全局偏移（正值向右偏移，负值向左偏移）
-  int offset_y;     ///< Y轴全局偏移（正值向下偏移，负值向上偏移）
-  int crop_left;    ///< 左侧额外裁剪像素
-  int crop_right;   ///< 右侧额外裁剪像素
-  int crop_top;     ///< 顶部额外裁剪像素
-  int crop_bottom;  ///< 底部额外裁剪像素
-};
-
-// 切换标识，用于区分当前是通过数据集视频调试还是使用真实相机输入
-// 后续如果改成相机输入，将此全局变量置为 true 即可
 bool g_is_using_camera = false;
+bool g_enable_visual_tuning = true;
+bool g_show_roi_markers = true;
+bool g_use_roi_config = true;
 
-// 1. 用于“数据集视频输入”的手动拼接微调参数
-//offset_x（第1个元素）：X 轴全图偏移量，offset_y（第2个元素）：Y 轴全图偏移量，crop_left（第3个元素）：左侧裁剪，crop_right（第4个元素）：右侧裁剪，crop_top（第5个元素）：顶部裁剪，crop_bottom（第6个元素）：底部裁剪
-ManualRoiTuning g_dataset_roi_tuning[4] = {
-    {0, 0, 0, 0, 0, 0}, // Cam 0: 左上
-    {0, -10, 0, 0, 0, 0}, // Cam 1: 右上
-    {0, 0, 0, 0, 0, 0}, // Cam 2: 左下
-    {0, -10, 0, 0, 0, 0}  // Cam 3: 右下
-};
-
-// 2. 用于“真实相机输入”的手动拼接微调参数
-ManualRoiTuning g_camera_roi_tuning[4] = {
-    {0, 0, 0, 0, 0, 0}, // Cam 0: 左上
-    {0, 0, 0, 0, 0, 0}, // Cam 1: 右上
-    {0, 0, 0, 0, 0, 0}, // Cam 2: 左下
-    {0, 0, 0, 0, 0, 0}  // Cam 3: 右下
-};
-
-// ============================================================================
-// 多帧ROI检测参数
-// ============================================================================
-/// 多帧ROI检测过程中要获取的帧数上限
 static constexpr size_t NUM_BOOTSTRAP_FRAMES = 3;
-
-/// 置信度阈值 - ROI检测结果的最小置信度要求
 static constexpr double CONFIDENCE_THRESHOLD = 0.25;
-
 
 namespace {
 
-/**
- * @struct CameraTuning
- * @brief 相机调参结构体
- *
- * 包含相机旋转、裁剪和偏移参数，用于调整拼接效果。
- */
 struct CameraTuning {
-  int rotation_deg = 0;  ///< 旋转角度（度）
-  int crop_left = 0;     ///< 左侧裁剪像素
-  int crop_right = 0;    ///< 右侧裁剪像素
-  int crop_top = 0;      ///< 顶部裁剪像素
-  int crop_bottom = 0;   ///< 底部裁剪像素
-  int offset_x = 0;      ///< X轴偏移
-  int offset_y = 0;      ///< Y轴偏移
-  bool enabled = true;   ///< 是否启用该相机
+  int rotation_deg = 0;
+  int crop_left = 0;
+  int crop_right = 0;
+  int crop_top = 0;
+  int crop_bottom = 0;
+  int offset_x = 0;
+  int offset_y = 0;
+  bool enabled = true;
 };
 
-/**
- * @struct OverlapEstimate
- * @brief 重叠区域估计结构体
- *
- * 存储相邻相机间的重叠宽度、Y轴偏移和匹配分数。
- */
 struct OverlapEstimate {
-  int overlap = 0;     ///< 重叠宽度（像素）
-  int shift_y = 0;     ///< Y轴偏移
-  double score = 0.0;  ///< 匹配分数
+  int overlap = 0;
+  int shift_y = 0;
+  double score = 0.0;
 };
 
-/**
- * @struct CameraRoi
- * @brief 相机感兴趣区域结构体
- *
- * 定义每个相机的ROI坐标和尺寸。
- */
 struct CameraRoi {
-  int x = 0;      ///< ROI起始X坐标
-  int y = 0;      ///< ROI起始Y坐标
-  int width = 0;  ///< ROI宽度
-  int height = 0; ///< ROI高度
+  int x = 0;
+  int y = 0;
+  int width = 0;
+  int height = 0;
 };
 
-/**
- * @brief 向下取整到偶数
- * @param value 输入值
- * @return 偶数结果
- * 因为硬件加速库要求偶数尺寸，所以这里提供了一个工具函数来确保尺寸是偶数。
- */
 int NormalizeEvenFloor(int value) {
   return std::max(0, value & ~1);
 }
 
-/**
- * @brief 向上取整到偶数
- * @param value 输入值
- * @return 偶数结果
- * 因为NV12帧结构要求偶数尺寸，所以这里提供了一个工具函数来确保尺寸是偶数。
- */
 int NormalizeEvenCeil(int value) {
   return std::max(2, (value + 1) & ~1);
 }
 
-/**
- * @brief 计算旋转后的宽度
- * @param width 原始宽度
- * @param height 原始高度
- * @param rotation_deg 旋转角度
- * @return 旋转后宽度
- */
 int RotatedWidth(int width, int height, int rotation_deg) {
   return (rotation_deg == 90 || rotation_deg == 270) ? height : width;
 }
 
-/**
- * @brief 计算旋转后的高度
- * @param width 原始宽度
- * @param height 原始高度
- * @param rotation_deg 旋转角度
- * @return 旋转后高度
- */
 int RotatedHeight(int width, int height, int rotation_deg) {
   return (rotation_deg == 90 || rotation_deg == 270) ? width : height;
 }
 
-/**
- * @brief 计算整数中位数
- * @param values 值列表
- * @return 中位数
- */
 int MedianInt(std::vector<int> values) {
   if (values.empty()) {
     return 0;
@@ -189,11 +80,6 @@ int MedianInt(std::vector<int> values) {
   return values[values.size() / 2];
 }
 
-/**
- * @brief 计算浮点数中位数
- * @param values 值列表
- * @return 中位数
- */
 double MedianDouble(std::vector<double> values) {
   if (values.empty()) {
     return 0.0;
@@ -202,9 +88,6 @@ double MedianDouble(std::vector<double> values) {
   return values[values.size() / 2];
 }
 
-/**
- * @brief 将 NV12 格式内存拷贝到统一的 Mat 中
- */
 inline void CopyNv12DataToMat(const uint8_t* y_src, const uint8_t* uv_src, int width, int height, int pitch_y, int pitch_uv, cv::Mat& dst) {
   for (int row = 0; row < height; ++row) {
     std::memcpy(dst.ptr(row), y_src + static_cast<size_t>(row) * pitch_y, static_cast<size_t>(width));
@@ -214,11 +97,6 @@ inline void CopyNv12DataToMat(const uint8_t* y_src, const uint8_t* uv_src, int w
   }
 }
 
-/**
- * @brief 将硬件NV12帧导出为BGR格式
- * @param frame NV12帧
- * @return BGR图像
- */
 cv::Mat ExportHardwareFrameToBgr(const NV12Frame& frame) {
   if (frame.empty() || !frame.owner) {
     return cv::Mat();
@@ -254,12 +132,6 @@ cv::Mat ExportHardwareFrameToBgr(const NV12Frame& frame) {
   return bgr;
 }
 
-/**
- * @brief 将NV12 DRM缓冲区导出为BGR UMat
- * @param buffer DRM缓冲区
- * @return BGR UMat
- * 用于初始化时使用opencv读取DRM_PRIME帧进行ROI检测和拼接布局构建。
- */
 cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   if (buffer.fd < 0 || buffer.width <= 0 || buffer.height <= 0 || buffer.pitch == 0) {
     return cv::UMat();
@@ -293,36 +165,16 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   return bgr_host.getUMat(cv::ACCESS_READ);
 }
 
-/**
- * @brief 构建默认相机调参
- * @param num_cameras 相机数量
- * @return 调参列表
- * 结合全局的手动微调参数
- */
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
   
-  // 选择根据当前运行模式对应的参数源
-  ManualRoiTuning* current_tuning = g_is_using_camera ? g_camera_roi_tuning : g_dataset_roi_tuning;
-  
-  // 应用全局的手动微调参数
   for (size_t i = 0; i < num_cameras && i < 4; ++i) {
-    tuning[i].offset_x = current_tuning[i].offset_x;
-    tuning[i].offset_y = current_tuning[i].offset_y;
-    tuning[i].crop_left = current_tuning[i].crop_left;
-    tuning[i].crop_right = current_tuning[i].crop_right;
-    tuning[i].crop_top = current_tuning[i].crop_top;
-    tuning[i].crop_bottom = current_tuning[i].crop_bottom;
+    tuning[i].offset_x = g_config.roi_offsets[i].offset_x;
+    tuning[i].offset_y = g_config.roi_offsets[i].offset_y;
   }
   return tuning;
 }
 
-/**
- * @brief 使用模板匹配估计候选重叠位置(当特征点匹配失败时的降级方案)
- * @param left_gray 左图灰度
- * @param right_gray 右图灰度
- * @return 重叠估计结果
- */
 OverlapEstimate EstimateOverlapByTemplate(const cv::Mat& left_gray, const cv::Mat& right_gray) {
   OverlapEstimate estimate;
   if (left_gray.empty() || right_gray.empty()) {
@@ -391,13 +243,6 @@ OverlapEstimate EstimateOverlapByTemplate(const cv::Mat& left_gray, const cv::Ma
   return estimate;
 }
 
-/**
- * @brief 估计两帧之间的重叠区域
- * 使用ORB特征匹配和模板匹配相结合的方法
- * @param left_bgr 左侧帧BGR图像
- * @param right_bgr 右侧帧BGR图像
- * @return 重叠估计结果
- */
 OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& right_bgr) {
   if (left_bgr.empty() || right_bgr.empty()) {
     return OverlapEstimate{};
@@ -488,11 +333,6 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   return estimate;
 }
 
-/**
- * @brief 保存检测到的ROI调试图像
- * @param bootstrap_bgr 引导帧BGR图像
- * @param rois ROI列表
- */
 void SaveDetectedRoiDebug(const std::vector<cv::Mat>& bootstrap_bgr,
                           const std::vector<CameraRoi>& rois) {
   for (size_t i = 0; i < bootstrap_bgr.size() && i < rois.size(); ++i) {
@@ -522,44 +362,64 @@ void SaveDetectedRoiDebug(const std::vector<cv::Mat>& bootstrap_bgr,
   }
 }
 
-/**
- * @brief 结构体：2x2矩阵模式下上下相邻帧的重叠估计
- */
 struct MatrixOverlap {
-  OverlapEstimate h01; ///< 左右重叠 (0和1)
-  OverlapEstimate h23; ///< 左右重叠 (2和3)
-  OverlapEstimate v02; ///< 上下重叠 (0和2)
-  OverlapEstimate v13; ///< 上下重叠 (1和3)
-  double confidence = 0.0; ///< 矩阵综合置信度
+  OverlapEstimate h01;
+  OverlapEstimate h23;
+  OverlapEstimate v02;
+  OverlapEstimate v13;
+  double confidence = 0.0;
 };
 
-/**
- * @brief 估计上下两帧之间的垂直重叠区域
- * 利用图像旋转技巧复用水平重叠匹配算法
- * @param top_bgr 上侧帧BGR图像
- * @param bottom_bgr 下侧帧BGR图像
- * @return 重叠估计结果
- */
+CachedOverlap MatrixOverlapToCached(const MatrixOverlap& mo) {
+  CachedOverlap co;
+  co.h01_overlap = mo.h01.overlap;
+  co.h01_shift_y = mo.h01.shift_y;
+  co.h01_score = mo.h01.score;
+  co.h23_overlap = mo.h23.overlap;
+  co.h23_shift_y = mo.h23.shift_y;
+  co.h23_score = mo.h23.score;
+  co.v02_overlap = mo.v02.overlap;
+  co.v02_shift_y = mo.v02.shift_y;
+  co.v02_score = mo.v02.score;
+  co.v13_overlap = mo.v13.overlap;
+  co.v13_shift_y = mo.v13.shift_y;
+  co.v13_score = mo.v13.score;
+  co.confidence = mo.confidence;
+  return co;
+}
+
+MatrixOverlap CachedToMatrixOverlap(const CachedOverlap& co) {
+  MatrixOverlap mo;
+  mo.h01.overlap = co.h01_overlap;
+  mo.h01.shift_y = co.h01_shift_y;
+  mo.h01.score = co.h01_score;
+  mo.h23.overlap = co.h23_overlap;
+  mo.h23.shift_y = co.h23_shift_y;
+  mo.h23.score = co.h23_score;
+  mo.v02.overlap = co.v02_overlap;
+  mo.v02.shift_y = co.v02_shift_y;
+  mo.v02.score = co.v02_score;
+  mo.v13.overlap = co.v13_overlap;
+  mo.v13.shift_y = co.v13_shift_y;
+  mo.v13.score = co.v13_score;
+  mo.confidence = co.confidence;
+  return mo;
+}
+
 OverlapEstimate EstimateVerticalOverlap(const cv::Mat& top_bgr, const cv::Mat& bottom_bgr) {
   cv::Mat top_rot, bottom_rot;
-  // 逆时针旋转90度，使底边变右边，顶边变左边
   cv::rotate(top_bgr, top_rot, cv::ROTATE_90_COUNTERCLOCKWISE);
   cv::rotate(bottom_bgr, bottom_rot, cv::ROTATE_90_COUNTERCLOCKWISE);
   
   OverlapEstimate est = EstimatePairOverlap(top_rot, bottom_rot);
   
   OverlapEstimate result;
-  result.overlap = est.overlap;  // 原图像的Y轴重叠高度
-  result.shift_y = -est.shift_y; // 原图像的X轴偏移（取反是因为旋转后新Y坐标方向相反）
+  result.overlap = est.overlap;
+  result.shift_y = -est.shift_y;
   result.score = est.score;
   return result;
 }
 
-/**
- * @brief 估计2x2输入矩阵所有相邻帧之间的重叠
- * @param frames 引导帧列表
- * @return 矩阵重叠估计结构体
- */
 MatrixOverlap EstimateOverlaps2x2(const std::vector<cv::Mat>& frames) {
   MatrixOverlap result;
   if (frames.size() < 4) {
@@ -575,14 +435,6 @@ MatrixOverlap EstimateOverlaps2x2(const std::vector<cv::Mat>& frames) {
   return result;
 }
 
-/**
- * @brief 基于重叠估计构建2x2输入矩阵的相机ROI
- * 通过对齐4个角点的全局坐标计算精确裁剪参数
- * @param frames 硬件帧列表
- * @param overlaps 2x2矩阵重叠估计
- * @param tuning 相机调参列表
- * @return 相机ROI列表
- */
 std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
                                           const MatrixOverlap& overlaps,
                                           const std::vector<CameraTuning>& tuning) {
@@ -593,17 +445,13 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   int X[4] = {0, 0, 0, 0};
   int Y[4] = {0, 0, 0, 0};
 
-  // 左上角(0)作为原点
   X[0] = 0;
   Y[0] = 0;
-  // 右上角(1)
   X[1] = W[0] - overlaps.h01.overlap;
   Y[1] = overlaps.h01.shift_y;
-  // 左下角(2)
   X[2] = overlaps.v02.shift_y;
   Y[2] = H[0] - overlaps.v02.overlap;
   
-  // 右下角(3)由两条路径推导并取平均
   int X3_1 = X[1] + overlaps.v13.shift_y;
   int Y3_1 = Y[1] + H[1] - overlaps.v13.overlap;
   int X3_2 = X[2] + W[2] - overlaps.h23.overlap;
@@ -611,13 +459,11 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   X[3] = (X3_1 + X3_2) / 2;
   Y[3] = (Y3_1 + Y3_2) / 2;
   
-  // 加入固定校准偏移
   for (int i = 0; i < 4; ++i) {
     X[i] += tuning[i].offset_x;
     Y[i] += tuning[i].offset_y;
   }
   
-  // 计算内侧切割线（即相邻两个相机画面的初始绝对中线）
   int X_mid_01 = (X[1] + X[0] + W[0]) / 2;
   int X_mid_23 = (X[3] + X[2] + W[2]) / 2;
   int cut_x = NormalizeEvenFloor((X_mid_01 + X_mid_23) / 2);
@@ -626,30 +472,23 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   int Y_mid_13 = (Y[3] + Y[1] + H[1]) / 2;
   int cut_y = NormalizeEvenFloor((Y_mid_02 + Y_mid_13) / 2);
   
-  // ==========================================
-  // 更新逻辑：修改布局生成机制创造重叠区
-  // ==========================================
-  // 使用全局配置的羽化宽度，让四个画面的边界各自向外凸出本该裁掉的像素
-  int blend_w = NormalizeEvenFloor(g_feather_width);
+  int blend_w = NormalizeEvenFloor(std::max(20, g_config.feather_width));
   
   int cut_x_left   = cut_x;
   int cut_x_right  = cut_x;
   int cut_y_top    = cut_y;
   int cut_y_bottom = cut_y;
   
-  // 左侧画面向右延伸一半羽化框，右侧画面向左延伸一半羽化框...
   cut_x_left  += blend_w / 2;
   cut_x_right -= blend_w / 2;
   cut_y_top += blend_w / 2;
   cut_y_bottom -= blend_w / 2;
 
-  // 全局包围盒边界
   int min_x = NormalizeEvenCeil(std::max(X[0], X[2]));
   int max_x = NormalizeEvenFloor(std::min(X[1] + W[1], X[3] + W[3]));
   int min_y = NormalizeEvenCeil(std::max(Y[0], Y[1]));
   int max_y = NormalizeEvenFloor(std::min(Y[2] + H[2], Y[3] + H[3]));
   
-  // 确保切割线在边界内
   cut_x_left = std::max(min_x + 2, std::min(max_x - 2, cut_x_left));
   cut_x_right = std::max(min_x + 2, std::min(max_x - 2, cut_x_right));
   cut_y_top = std::max(min_y + 2, std::min(max_y - 2, cut_y_top));
@@ -657,25 +496,21 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   
   std::vector<CameraRoi> rois(4);
   
-  // Cam 0 (左上)
   rois[0].x = NormalizeEvenFloor(min_x - X[0] + tuning[0].crop_left);
   rois[0].y = NormalizeEvenFloor(min_y - Y[0] + tuning[0].crop_top);
   rois[0].width = NormalizeEvenFloor(cut_x_left - min_x - tuning[0].crop_left - tuning[0].crop_right);
   rois[0].height = NormalizeEvenFloor(cut_y_top - min_y - tuning[0].crop_top - tuning[0].crop_bottom);
   
-  // Cam 1 (右上)
   rois[1].x = NormalizeEvenFloor(cut_x_right - X[1] + tuning[1].crop_left);
   rois[1].y = NormalizeEvenFloor(min_y - Y[1] + tuning[1].crop_top);
   rois[1].width = NormalizeEvenFloor(max_x - cut_x_right - tuning[1].crop_left - tuning[1].crop_right);
   rois[1].height = NormalizeEvenFloor(cut_y_top - min_y - tuning[1].crop_top - tuning[1].crop_bottom);
   
-  // Cam 2 (左下)
   rois[2].x = NormalizeEvenFloor(min_x - X[2] + tuning[2].crop_left);
   rois[2].y = NormalizeEvenFloor(cut_y_bottom - Y[2] + tuning[2].crop_top);
   rois[2].width = NormalizeEvenFloor(cut_x_left - min_x - tuning[2].crop_left - tuning[2].crop_right);
   rois[2].height = NormalizeEvenFloor(max_y - cut_y_bottom - tuning[2].crop_top - tuning[2].crop_bottom);
   
-  // Cam 3 (右下)
   rois[3].x = NormalizeEvenFloor(cut_x_right - X[3] + tuning[3].crop_left);
   rois[3].y = NormalizeEvenFloor(cut_y_bottom - Y[3] + tuning[3].crop_top);
   rois[3].width = NormalizeEvenFloor(max_x - cut_x_right - tuning[3].crop_left - tuning[3].crop_right);
@@ -694,14 +529,6 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   return rois;
 }
 
-/**
- * @brief 构建2x2输入矩阵的拼接布局任务
- * @param rois 相机ROI列表
- * @param tuning 相机调参列表
- * @param panorama_width 输出全景图宽度
- * @param panorama_height 输出全景图高度
- * @return 拼接任务列表
- */
 std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
                                              const std::vector<CameraTuning>& tuning,
                                              int* panorama_width,
@@ -718,22 +545,20 @@ std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
     tasks[i].src_h = rois[i].height;
   }
 
+  int blend_w = NormalizeEvenFloor(std::max(20, g_config.feather_width));
+
   tasks[0].dst_x = 0;
   tasks[0].dst_y = 0;
 
-  // 右上的画布起点向左平移整整一个 g_feather_width 宽度，使它物理盖在左上画面的像素上方
-  tasks[1].dst_x = NormalizeEvenFloor(rois[0].width) - NormalizeEvenFloor(g_feather_width);
+  tasks[1].dst_x = NormalizeEvenFloor(rois[0].width) - blend_w;
   tasks[1].dst_y = 0;
 
-  // 左下的画布起点向上平移
   tasks[2].dst_x = 0;
-  tasks[2].dst_y = NormalizeEvenFloor(rois[0].height) - NormalizeEvenFloor(g_feather_width);
+  tasks[2].dst_y = NormalizeEvenFloor(rois[0].height) - blend_w;
 
-  // 右下角的画布同时向左向上的叠加覆盖
-  tasks[3].dst_x = NormalizeEvenFloor(rois[0].width) - NormalizeEvenFloor(g_feather_width);
-  tasks[3].dst_y = NormalizeEvenFloor(rois[0].height) - NormalizeEvenFloor(g_feather_width);
+  tasks[3].dst_x = NormalizeEvenFloor(rois[0].width) - blend_w;
+  tasks[3].dst_y = NormalizeEvenFloor(rois[0].height) - blend_w;
 
-  // 计算拼接后的总画幅分辨率
   *panorama_width = NormalizeEvenCeil(tasks[1].dst_x + rois[1].width);
   *panorama_height = NormalizeEvenCeil(tasks[2].dst_y + rois[2].height);
 
@@ -756,13 +581,10 @@ std::vector<StitchTask> BuildWarpLayout(const StitchingWarpData& warp_data) {
   return tasks;
 }
 
-}  
+}
 
 using namespace std;
 
-/**
- * @brief 提取最优ROI布局向导
- */
 void App::BootStrapOptimalLayout() {
   Logger::GetInstance().Log("[App] [MULTI-FRAME ROI] Starting multi-frame ROI detection...");
   if (g_multi_frame_roi_debug_level >= 1) {
@@ -779,18 +601,16 @@ void App::BootStrapOptimalLayout() {
     bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
   }
 
-  // 用于存储每次检测的结果和置信度
   struct RoiDetectionResult {
     MatrixOverlap overlaps;
     vector<CameraRoi> rois;
     vector<StitchTask> layout;
-    double confidence = 0.0;  // 综合置信度（所有重叠score的平均值）
+    double confidence = 0.0;
     size_t frame_index = 0;
   };
   
   std::vector<RoiDetectionResult> detection_results;
   
-  // 循环获取最多NUM_BOOTSTRAP_FRAMES帧进行检测
   size_t frame_count = 0;
   while (frame_count < NUM_BOOTSTRAP_FRAMES) {
     if (frame_count > 0) {
@@ -800,13 +620,11 @@ void App::BootStrapOptimalLayout() {
       }
     }
     
-    // 执行第frame_count+1次检测
     const MatrixOverlap overlaps = EstimateOverlaps2x2(bootstrap_bgr);
     const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, overlaps, tuning);
     
     double avg_confidence = overlaps.confidence;
     
-    // 检查是否所有置信度都达到阈值
     bool all_valid = (overlaps.h01.score >= CONFIDENCE_THRESHOLD &&
                       overlaps.h23.score >= CONFIDENCE_THRESHOLD &&
                       overlaps.v02.score >= CONFIDENCE_THRESHOLD &&
@@ -835,7 +653,6 @@ void App::BootStrapOptimalLayout() {
         debug_msg << " [WEAK]";
       }
       
-      // 输出各相邻摄像头对的score
       debug_msg << " h01_score=" << std::fixed << std::setprecision(3) << overlaps.h01.score;
       debug_msg << " h23_score=" << std::fixed << std::setprecision(3) << overlaps.h23.score;
       debug_msg << " v02_score=" << std::fixed << std::setprecision(3) << overlaps.v02.score;
@@ -845,7 +662,6 @@ void App::BootStrapOptimalLayout() {
     
     frame_count++;
     
-    // 如果已经找到高质量结果则可以提前退出
     if (all_valid && avg_confidence > 0.7) {
       if (g_multi_frame_roi_debug_level >= 1) {
         ostringstream debug_msg;
@@ -858,7 +674,6 @@ void App::BootStrapOptimalLayout() {
     }
   }
   
-  // 选择置信度最高的检测结果
   size_t best_result_idx = 0;
   double max_confidence = -1.0;
   for (size_t i = 0; i < detection_results.size(); ++i) {
@@ -882,14 +697,14 @@ void App::BootStrapOptimalLayout() {
     Logger::GetInstance().Log(summary_msg.str());
   }
   
-  // 计算布局参数（最终使用最优结果的尺寸）
   int dummy_panorama_width = 0;
   int dummy_panorama_height = 0;
   BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
   total_cols_ = dummy_panorama_width;
   height_ = dummy_panorama_height;
 
-  image_stitcher_.SetParams(g_feather_width, static_cast<int>(num_img_), total_cols_, height_);
+  int blend_width = NormalizeEvenFloor(std::max(20, g_config.feather_width));
+  image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
 
   ostringstream overlap_stream;
@@ -922,7 +737,6 @@ void App::BootStrapOptimalLayout() {
   }
   Logger::GetInstance().Log(roi_stream.str());
   
-  // 保存ROI检测调试信息（使用最优结果的第一帧）
   std::vector<cv::Mat> best_bootstrap_bgr(num_img_);
   for (size_t i = 0; i < num_img_; ++i) {
     best_bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
@@ -930,18 +744,95 @@ void App::BootStrapOptimalLayout() {
   SaveDetectedRoiDebug(best_bootstrap_bgr, rois);
 }
 
-/**
- * @brief App构造函数，初始化拼接应用
- * 执行引导阶段：捕获前10帧，对每帧进行ROI检测，选择置信度最高的结果
- */
-App::App() : num_img_(0), total_cols_(0), height_(0) {
+void App::SyncConfigToGlobals() {
+}
+
+void App::InitFromConfig() {
+  const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
+
+  sensorDataInterface_.get_image_vector(image_vector_);
+  std::vector<cv::Mat> bootstrap_bgr(num_img_);
+  for (size_t i = 0; i < num_img_; ++i) {
+    bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+  }
+  cached_overlaps_ = MatrixOverlapToCached(EstimateOverlaps2x2(bootstrap_bgr));
+
+  const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, CachedToMatrixOverlap(cached_overlaps_), tuning);
+  int w = 0, h = 0;
+  const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &w, &h);
+
+  total_cols_ = w;
+  height_ = h;
+  
+  int blend_width = NormalizeEvenFloor(std::max(20, g_config.feather_width));
+  image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
+  image_stitcher_.SetLayout(layout);
+
+  if (g_multi_frame_roi_debug_level >= 1) {
+    ostringstream msg;
+    msg << "[App] [CONFIG INIT] Panorama size: " << total_cols_ << "x" << height_;
+    Logger::GetInstance().Log(msg.str());
+  }
+}
+
+void App::RebuildLayout() {
+  const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
+
+  const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, CachedToMatrixOverlap(cached_overlaps_), tuning);
+  int new_w = 0, new_h = 0;
+  const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
+
+  if (new_w != total_cols_ || new_h != height_) {
+    Logger::GetInstance().Log("[App] [REBUILD] Panorama size changed, reallocating DRM buffer");
+    drm_free(output_drm_buf_);
+    if (drm_alloc_nv12(new_w, new_h, output_drm_buf_) != 0) {
+      throw std::runtime_error("failed to reallocate output DRM DMA-BUF");
+    }
+    total_cols_ = new_w;
+    height_ = new_h;
+    image_concat_.fd = output_drm_buf_.fd;
+    image_concat_.width = total_cols_;
+    image_concat_.height = height_;
+    image_concat_.stride_w = static_cast<int>(output_drm_buf_.pitch);
+    image_concat_.stride_h = height_;
+  }
+
+  int blend_width = NormalizeEvenFloor(std::max(20, g_config.feather_width));
+  image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
+  image_stitcher_.SetLayout(layout);
+}
+
+App::App() : num_img_(0), total_cols_(0), height_(0),
+             visual_mode_(g_enable_visual_tuning), debug_mode_(false) {
   Logger::GetInstance().Initialize();
   Logger::GetInstance().Log("[App] Application starting...");
+  Logger::GetInstance().Log(string("[App] Visual tuning: ") + (visual_mode_ ? "ENABLED" : "DISABLED (set ENABLE_VISUAL_TUNING=1 to enable)"));
 
   sensorDataInterface_.InitVideoCapture(num_img_);
   image_vector_.resize(num_img_);
 
-  BootStrapOptimalLayout();
+  bool config_loaded = false;
+  if (g_use_roi_config) {
+    config_loaded = RoiConfig::LoadFromFile("params/roi_tuning.yaml", g_config);
+  }
+
+  if (config_loaded) {
+    Logger::GetInstance().Log("[App] ROI config loaded from params/roi_tuning.yaml");
+    InitFromConfig();
+  } else {
+    Logger::GetInstance().Log("[App] No ROI config or USE_ROI_CONFIG=0, running auto-detection...");
+    BootStrapOptimalLayout();
+
+    sensorDataInterface_.get_image_vector(image_vector_);
+    std::vector<cv::Mat> bootstrap_bgr(num_img_);
+    for (size_t i = 0; i < num_img_; ++i) {
+      bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+    }
+    cached_overlaps_ = MatrixOverlapToCached(EstimateOverlaps2x2(bootstrap_bgr));
+
+    RoiConfig::SaveToFile("params/roi_tuning.yaml", g_config);
+    Logger::GetInstance().Log("[App] ROI config saved to params/roi_tuning.yaml");
+  }
 
   if (drm_alloc_nv12(total_cols_, height_, output_drm_buf_) != 0) {
     throw std::runtime_error("failed to allocate output DRM DMA-BUF");
@@ -952,33 +843,35 @@ App::App() : num_img_(0), total_cols_(0), height_(0) {
   image_concat_.height = height_;
   image_concat_.stride_w = static_cast<int>(output_drm_buf_.pitch);
   image_concat_.stride_h = height_;
+
+  if (visual_mode_) {
+    Logger::GetInstance().Log("[App] Initializing visualizer with panorama size: " + 
+                              std::to_string(total_cols_) + "x" + std::to_string(height_));
+    if (!RoiVisualizer::Init(total_cols_, height_)) {
+      Logger::GetInstance().Log("[App] OpenCV highgui init failed, disabling visual mode");
+      Logger::GetInstance().Log("[App] Check if DISPLAY environment variable is set correctly");
+      visual_mode_ = false;
+    } else {
+      Logger::GetInstance().Log("[App] Visualizer initialized successfully");
+    }
+  }
 }
 
-/**
- * @brief App析构函数，释放DRM缓冲区
- */
 App::~App() {
+  if (visual_mode_) RoiVisualizer::Shutdown();
   drm_free(output_drm_buf_);
 }
 
-/**
- * @brief 运行拼接主循环
- * 无限循环：获取帧 -> 拼接 -> 保存结果 -> 记录性能
- */
 [[noreturn]] void App::run_stitching() {
   size_t frame_idx = 0;
 
   while (true) {
     const double t0 = cv::getTickCount();
-    // 1️⃣ 从硬件解码器（rkmpp等）或者V4L2驱动提取最新的 4 路 NV12 数据帧到内存
     sensorDataInterface_.get_image_vector(image_vector_);
     const double t1 = cv::getTickCount();
 
-    // 2️⃣ 准备阶段：清理输出的拼图画布大画板的底色
     image_stitcher_.ClearOutput(image_concat_);
 
-    // 3️⃣ 硬件加速处理（RGA）：利用 Rockchip 的 2D 硬件处理大面图像搬运与旋转裁剪
-    // *RGA 直接覆盖目标画布的底层，形成带有边界生硬过渡的基础拼接图
     for (size_t img_idx = 0; img_idx < num_img_; ++img_idx) {
       image_stitcher_.WarpImages(static_cast<int>(img_idx),
                                  frame_idx,
@@ -986,56 +879,67 @@ App::~App() {
                                  image_concat_);
     }
 
-    if (g_debug_opencl_feathering && frame_idx == 10) {
-      // 导出一张仅仅经过RGA阶段拼接的“未羽化”原始图层结构，供离线比对排错
-      cv::UMat debug_rga = ExportNv12DrmBufferToBgr(output_drm_buf_);
-      Logger::GetInstance().SaveImage(debug_rga, "debug_rga_hollow_body.png");
-    }
-
-    // 4️⃣ 高级特效后处理（OpenCL）：启动 Mali GPU 利用 Alpha mask 并行计算边缘软过渡
-    // *将画布重叠部分的生硬切割线平滑羽化，融合图像边缘
-    image_stitcher_.BlendSeams(image_vector_, image_concat_);
-
-    if (g_debug_opencl_feathering && frame_idx == 10) {
-      // 导出一张纯羽化阶段处理掉缝隙后的全效图层
-      cv::UMat debug_cl = ExportNv12DrmBufferToBgr(output_drm_buf_);
-      Logger::GetInstance().SaveImage(debug_cl, "debug_opencl_seam_blended.png");
+    if (g_config.feather_enabled) {
+      image_stitcher_.BlendSeams(image_vector_, image_concat_);
     }
 
     const double t2 = cv::getTickCount();
+    double fps = 1.0 / ((t2 - t0) / cv::getTickFrequency());
 
-    const double tn = cv::getTickCount();
-    string timing_msg =
-        "[app] " +
-        to_string((t1 - t0) / cv::getTickFrequency()) + ";" +
-        to_string((t2 - t1) / cv::getTickFrequency());
-    string fps_msg =
-        to_string(1.0 / ((t2 - t0) / cv::getTickFrequency())) + " FPS; " +
-        to_string(1.0 / ((tn - t0) / cv::getTickFrequency())) + " Real FPS.";
+    if (visual_mode_) {
+      cv::UMat stitched_umat = ExportNv12DrmBufferToBgr(output_drm_buf_);
+      cv::Mat stitched_bgr = stitched_umat.getMat(cv::ACCESS_READ);
 
-    vector<double> decode_fps_vector = sensorDataInterface_.GetDecodeFpsSnapshot();
-    ostringstream decode_fps_stream;
-    decode_fps_stream << "[decode_fps]";
-    for (size_t i = 0; i < decode_fps_vector.size(); ++i) {
-      decode_fps_stream << " ch" << i << "=" << decode_fps_vector[i];
-    }
-
-    Logger::GetInstance().LogFrame(frame_idx, timing_msg);
-    Logger::GetInstance().LogFrame(frame_idx, fps_msg);
-    Logger::GetInstance().LogFrame(frame_idx, decode_fps_stream.str());
-
-    if (g_save_stitched_frames &&
-        g_save_frame_interval > 0 &&
-        (frame_idx % g_save_frame_interval == 0)) {
-      cv::UMat stitched_bgr = ExportNv12DrmBufferToBgr(output_drm_buf_);
-      if (!stitched_bgr.empty()) {
-        ostringstream filename;
-        filename << "stitched_" << frame_idx << ".png";
-        Logger::GetInstance().SaveImage(stitched_bgr, filename.str(), frame_idx);
+      VisAction action;
+      if (!debug_mode_) {
+        action = RoiVisualizer::ShowStreamingFrame(stitched_bgr.data,
+                                                     stitched_bgr.cols, stitched_bgr.rows,
+                                                     static_cast<int>(stitched_bgr.step), fps);
+        if (action == kVisEnterDebug) {
+          debug_mode_ = true;
+          Logger::GetInstance().Log("[App] Entered ROI debug mode");
+        }
       } else {
-        Logger::GetInstance().LogFrame(
-            frame_idx,
-            "[App] failed to mmap/export stitched DRM buffer for saving.");
+        action = RoiVisualizer::ShowDebugFrame(stitched_bgr.data,
+                                                stitched_bgr.cols, stitched_bgr.rows,
+                                                static_cast<int>(stitched_bgr.step), fps,
+                                                image_stitcher_.GetLayout());
+
+        if (action == kVisFeatherToggle || action == kVisFeatherWidthUp || action == kVisFeatherWidthDown) {
+          RebuildLayout();
+        }
+        
+        if (action == kVisSaveConfig) {
+          RoiConfig::SaveToFile("params/roi_tuning.yaml", g_config);
+          Logger::GetInstance().Log("[App] ROI config saved to params/roi_tuning.yaml");
+        }
+        
+        if (action == kVisExitDebug) {
+          debug_mode_ = false;
+          Logger::GetInstance().Log("[App] Exited ROI debug mode");
+        }
+      }
+    } else {
+      string fps_msg = to_string(fps) + " FPS;";
+      vector<double> decode_fps_vector = sensorDataInterface_.GetDecodeFpsSnapshot();
+      ostringstream decode_fps_stream;
+      decode_fps_stream << "[decode_fps]";
+      for (size_t i = 0; i < decode_fps_vector.size(); ++i) {
+        decode_fps_stream << " ch" << i << "=" << decode_fps_vector[i];
+      }
+
+      Logger::GetInstance().LogFrame(frame_idx, fps_msg);
+      Logger::GetInstance().LogFrame(frame_idx, decode_fps_stream.str());
+
+      if (g_config.save_enabled &&
+          g_config.save_interval > 0 &&
+          (frame_idx % g_config.save_interval == 0)) {
+        cv::UMat stitched_bgr = ExportNv12DrmBufferToBgr(output_drm_buf_);
+        if (!stitched_bgr.empty()) {
+          ostringstream filename;
+          filename << "stitched_" << frame_idx << ".png";
+          Logger::GetInstance().SaveImage(stitched_bgr, filename.str(), frame_idx);
+        }
       }
     }
 
@@ -1043,11 +947,16 @@ App::~App() {
   }
 }
 
-/**
- * @brief 主函数，创建App实例并运行拼接
- * @return 程序退出码（实际不会返回，因为run_stitching是noreturn）
- */
 int main() {
+  const char* env_visual = getenv("ENABLE_VISUAL_TUNING");
+  g_enable_visual_tuning = (env_visual == nullptr || atoi(env_visual) != 0);
+
+  const char* env_markers = getenv("SHOW_ROI_MARKERS");
+  g_show_roi_markers = (env_markers == nullptr || atoi(env_markers) != 0);
+
+  const char* env_config = getenv("USE_ROI_CONFIG");
+  g_use_roi_config = (env_config == nullptr || atoi(env_config) != 0);
+
   App app;
   app.run_stitching();
 }

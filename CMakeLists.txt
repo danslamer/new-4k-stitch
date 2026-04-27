@@ -11,11 +11,12 @@ set(FFMPEG_ROOT "$ENV{HOME}/dev/ffmpeg60")
 set(ENV{PKG_CONFIG_PATH} "${FFMPEG_ROOT}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 set(ENV{LD_LIBRARY_PATH} "${FFMPEG_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
 
-find_package(OpenCV 4 REQUIRED)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs videoio features2d stitching)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 # 增加 OpenCL 查找
 find_package(OpenCL REQUIRED)
+pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
 
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
@@ -44,6 +45,10 @@ add_executable(${PROJECT_NAME}
     include/rk_gles_warper.h
     src/logger.cc
     include/logger.h
+    src/roi_config.cc
+    include/roi_config.h
+    src/roi_visualizer.cc
+    include/roi_visualizer.h
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -63,7 +68,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::EGL
     PkgConfig::GLESV2
     PkgConfig::GBM
-    OpenCL::OpenCL    # 增加 OpenCL 链接
+    PkgConfig::SDL2
+    OpenCL::OpenCL
 )
 
 if(ENABLE_RK_HARDWARE_DECODING)

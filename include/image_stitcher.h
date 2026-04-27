@@ -7,8 +7,8 @@
 #include "drm_allocator.h"
 #include "nv12_frame.h"
 #include "rk_gles_warper.h"
+#include "roi_config.h"
 
-// 引入OpenCL
 #define CL_TARGET_OPENCL_VERSION 200
 #include <CL/cl.h>
 #include <CL/cl_ext.h>
@@ -37,7 +37,8 @@ public:
                      int input_width,
                      int input_height);
 
-    void SetLayout(const std::vector<StitchTask>& tasks);
+void SetLayout(const std::vector<StitchTask>& tasks);
+    const std::vector<StitchTask>& GetLayout() const { return tasks_; }
     void ClearOutput(const NV12Frame& output) const;
 
     void WarpImages(int img_idx,

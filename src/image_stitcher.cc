@@ -20,7 +20,7 @@
 typedef cl_mem(CL_API_CALL *PFN_clImportMemoryARM)(cl_context, cl_mem_flags, const cl_import_properties_arm*, void*, size_t, cl_int*);
 static PFN_clImportMemoryARM pfn_clImportMemoryARM = nullptr;
 
-extern double g_feather_strength;
+extern StitchGlobalConfig g_config;
 
 const char* ocl_kernel_src = R"CLC(
 int get_src_x(int X, int Y, int t_dst_x, int t_dst_y, int t_src_x, int t_src_y, int t_rot, int t_sw, int t_sh) {
@@ -249,14 +249,14 @@ void ImageStitcher::InitOpenCL() {
     clBuildProgram(cl_prog_, 1, &device, nullptr, nullptr, nullptr);
     cl_kern_blend_v_ = clCreateKernel(cl_prog_, "blend_seam", nullptr); // 均复用这一个
     
-    int bw = blend_width_ > 0 ? blend_width_ : 120;
+    int bw = blend_width_ > 0 ? blend_width_ : g_config.feather_width;
     std::vector<uint8_t> mask(bw);
     for(int i = 0; i < bw; ++i) {
         double x = (double)i / (bw - 1);
         double val = x;
-        if (g_feather_strength > 1.0) { // S型曲线过缓
-            val = (x < 0.5) ? 0.5 * std::pow(2.0 * x, g_feather_strength) 
-                            : 1.0 - 0.5 * std::pow(2.0 * (1.0 - x), g_feather_strength);
+        if (g_config.feather_strength > 1.0) {
+            val = (x < 0.5) ? 0.5 * std::pow(2.0 * x, g_config.feather_strength) 
+                            : 1.0 - 0.5 * std::pow(2.0 * (1.0 - x), g_config.feather_strength);
         }
         mask[i] = (uint8_t)std::max(0.0, std::min(255.0, val * 255.0));
     }

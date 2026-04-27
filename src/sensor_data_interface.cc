@@ -355,7 +355,7 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
       // 原有的数据集测试视频读取逻辑
       const std::string video_dir = "../datasets/4k-test/";
       const std::vector<std::string> video_file_name = {
-          "t30.mp4", "t31.mp4", "t32.mp4", "t33.mp4"};
+          "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4"};
 
       num_img_ = video_file_name.size();
       num_img = num_img_;
