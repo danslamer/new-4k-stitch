@@ -16,6 +16,10 @@
 #include "stitching_param_generater.h"
 
 extern "C" {
+#include <rga/RgaApi.h>
+}
+
+extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 }
@@ -778,7 +782,9 @@ void App::InitFromConfig() {
 void App::RebuildLayout() {
   const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
 
-  const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, CachedToMatrixOverlap(cached_overlaps_), tuning);
+  const vector<CameraRoi> rois = BuildCameraRois2x2(
+      frames_locked_ ? saved_frames_ : image_vector_,
+      CachedToMatrixOverlap(cached_overlaps_), tuning);
   int new_w = 0, new_h = 0;
   const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
 
@@ -802,8 +808,86 @@ void App::RebuildLayout() {
   image_stitcher_.SetLayout(layout);
 }
 
+void App::SaveCurrentFrames() {
+  ReleaseSavedFrames();
+  
+  saved_frames_.resize(num_img_);
+  saved_drm_bufs_.resize(num_img_);
+  
+  for (size_t i = 0; i < num_img_; ++i) {
+    if (image_vector_[i].empty()) continue;
+    
+    int w = image_vector_[i].width;
+    int h = image_vector_[i].height;
+    
+    if (drm_alloc_nv12(w, h, saved_drm_bufs_[i]) != 0) {
+      Logger::GetInstance().LogError("[App] Failed to allocate saved frame buffer for cam" + to_string(i));
+      continue;
+    }
+    
+    int src_stride_w = image_vector_[i].stride_w > 0 ? image_vector_[i].stride_w : w;
+    int src_stride_h = image_vector_[i].stride_h > 0 ? image_vector_[i].stride_h : h;
+    
+    rga_info_t src_info;
+    memset(&src_info, 0, sizeof(src_info));
+    src_info.fd = image_vector_[i].fd;
+    src_info.mmuFlag = 1;
+    rga_set_rect(&src_info.rect, 0, 0, w, h, src_stride_w, src_stride_h, RK_FORMAT_YCbCr_420_SP);
+    
+    rga_info_t dst_info;
+    memset(&dst_info, 0, sizeof(dst_info));
+    dst_info.fd = saved_drm_bufs_[i].fd;
+    dst_info.mmuFlag = 1;
+    rga_set_rect(&dst_info.rect, 0, 0, w, h, saved_drm_bufs_[i].pitch, h, RK_FORMAT_YCbCr_420_SP);
+    
+    if (c_RkRgaBlit(&src_info, &dst_info, nullptr) != 0) {
+      Logger::GetInstance().LogError("[App] RGA blit failed for saving frame cam" + to_string(i));
+      drm_free(saved_drm_bufs_[i]);
+      continue;
+    }
+    
+    saved_frames_[i].fd = saved_drm_bufs_[i].fd;
+    saved_frames_[i].width = w;
+    saved_frames_[i].height = h;
+    saved_frames_[i].stride_w = saved_drm_bufs_[i].pitch;
+    saved_frames_[i].stride_h = h;
+    saved_frames_[i].owner = nullptr;
+  }
+  
+  frames_locked_ = true;
+  locked_frame_idx_ = 0;
+  Logger::GetInstance().Log("[App] [FRAME LOCK] Saved current frames for debug tuning");
+}
+
+void App::ReleaseSavedFrames() {
+  for (size_t i = 0; i < saved_drm_bufs_.size(); ++i) {
+    drm_free(saved_drm_bufs_[i]);
+  }
+  saved_drm_bufs_.clear();
+  saved_frames_.clear();
+  frames_locked_ = false;
+}
+
+void App::RestitchSavedFrames() {
+  const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
+  const vector<CameraRoi> rois = BuildCameraRois2x2(saved_frames_, CachedToMatrixOverlap(cached_overlaps_), tuning);
+  int new_w = 0, new_h = 0;
+  const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
+  
+  image_stitcher_.SetLayout(layout);
+  
+  image_stitcher_.ClearOutput(image_concat_);
+  for (size_t img_idx = 0; img_idx < num_img_; ++img_idx) {
+    image_stitcher_.WarpImages(static_cast<int>(img_idx), locked_frame_idx_, saved_frames_, image_concat_);
+  }
+  if (g_config.feather_enabled) {
+    image_stitcher_.BlendSeams(saved_frames_, image_concat_);
+  }
+}
+
 App::App() : num_img_(0), total_cols_(0), height_(0),
-             visual_mode_(g_enable_visual_tuning), debug_mode_(false) {
+             visual_mode_(g_enable_visual_tuning), debug_mode_(false),
+             frames_locked_(false), locked_frame_idx_(0) {
   Logger::GetInstance().Initialize();
   Logger::GetInstance().Log("[App] Application starting...");
   Logger::GetInstance().Log(string("[App] Visual tuning: ") + (visual_mode_ ? "ENABLED" : "DISABLED (set ENABLE_VISUAL_TUNING=1 to enable)"));
@@ -813,11 +897,11 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
 
   bool config_loaded = false;
   if (g_use_roi_config) {
-    config_loaded = RoiConfig::LoadFromFile("params/roi_tuning.yaml", g_config);
+    config_loaded = RoiConfig::LoadFromFile("../params/roi_tuning.yaml", g_config);
   }
 
   if (config_loaded) {
-    Logger::GetInstance().Log("[App] ROI config loaded from params/roi_tuning.yaml");
+    Logger::GetInstance().Log("[App] ROI config loaded from ../params/roi_tuning.yaml");
     InitFromConfig();
   } else {
     Logger::GetInstance().Log("[App] No ROI config or USE_ROI_CONFIG=0, running auto-detection...");
@@ -830,8 +914,8 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
     }
     cached_overlaps_ = MatrixOverlapToCached(EstimateOverlaps2x2(bootstrap_bgr));
 
-    RoiConfig::SaveToFile("params/roi_tuning.yaml", g_config);
-    Logger::GetInstance().Log("[App] ROI config saved to params/roi_tuning.yaml");
+    RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);
+    Logger::GetInstance().Log("[App] ROI config saved to ../params/roi_tuning.yaml");
   }
 
   if (drm_alloc_nv12(total_cols_, height_, output_drm_buf_) != 0) {
@@ -858,6 +942,7 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
 }
 
 App::~App() {
+  ReleaseSavedFrames();
   if (visual_mode_) RoiVisualizer::Shutdown();
   drm_free(output_drm_buf_);
 }
@@ -867,22 +952,26 @@ App::~App() {
 
   while (true) {
     const double t0 = cv::getTickCount();
-    sensorDataInterface_.get_image_vector(image_vector_);
-    const double t1 = cv::getTickCount();
-
+    
+    if (!debug_mode_ || !frames_locked_) {
+      sensorDataInterface_.get_image_vector(image_vector_);
+    }
+    
+    const vector<NV12Frame>& stitch_input = debug_mode_ && frames_locked_ ? saved_frames_ : image_vector_;
+    
     image_stitcher_.ClearOutput(image_concat_);
-
+    
     for (size_t img_idx = 0; img_idx < num_img_; ++img_idx) {
       image_stitcher_.WarpImages(static_cast<int>(img_idx),
-                                 frame_idx,
-                                 image_vector_,
+                                 debug_mode_ && frames_locked_ ? locked_frame_idx_ : frame_idx,
+                                 stitch_input,
                                  image_concat_);
     }
-
+    
     if (g_config.feather_enabled) {
-      image_stitcher_.BlendSeams(image_vector_, image_concat_);
+      image_stitcher_.BlendSeams(stitch_input, image_concat_);
     }
-
+    
     const double t2 = cv::getTickCount();
     double fps = 1.0 / ((t2 - t0) / cv::getTickFrequency());
 
@@ -897,7 +986,9 @@ App::~App() {
                                                      static_cast<int>(stitched_bgr.step), fps);
         if (action == kVisEnterDebug) {
           debug_mode_ = true;
-          Logger::GetInstance().Log("[App] Entered ROI debug mode");
+          locked_frame_idx_ = frame_idx;
+          SaveCurrentFrames();
+          Logger::GetInstance().Log("[App] [DEBUG] Entered ROI debug mode, frame #" + to_string(frame_idx) + " locked");
         }
       } else {
         action = RoiVisualizer::ShowDebugFrame(stitched_bgr.data,
@@ -905,18 +996,26 @@ App::~App() {
                                                 static_cast<int>(stitched_bgr.step), fps,
                                                 image_stitcher_.GetLayout());
 
-        if (action == kVisFeatherToggle || action == kVisFeatherWidthUp || action == kVisFeatherWidthDown) {
+        if (action == kVisNeedRestitch) {
+          RestitchSavedFrames();
+          Logger::GetInstance().Log("[App] [DEBUG] ROI offset adjusted, restitched saved frame");
+        }
+        
+        if (action == kVisNeedRebuild) {
           RebuildLayout();
+          RestitchSavedFrames();
+          Logger::GetInstance().Log("[App] [DEBUG] Feather params changed, layout rebuilt and restitched");
         }
         
         if (action == kVisSaveConfig) {
-          RoiConfig::SaveToFile("params/roi_tuning.yaml", g_config);
-          Logger::GetInstance().Log("[App] ROI config saved to params/roi_tuning.yaml");
+          RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);
+          Logger::GetInstance().Log("[App] [DEBUG] ROI config saved to ../params/roi_tuning.yaml");
         }
         
         if (action == kVisExitDebug) {
           debug_mode_ = false;
-          Logger::GetInstance().Log("[App] Exited ROI debug mode");
+          ReleaseSavedFrames();
+          Logger::GetInstance().Log("[App] [DEBUG] Exited ROI debug mode, resumed live stitching");
         }
       }
     } else {
@@ -943,7 +1042,7 @@ App::~App() {
       }
     }
 
-    ++frame_idx;
+    if (!debug_mode_) ++frame_idx;
   }
 }
 

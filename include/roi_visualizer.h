@@ -30,7 +30,9 @@ enum VisAction {
     kVisFeatherWidthDown,
     kVisSaveToggle,
     kVisSaveIntervalUp,
-    kVisSaveIntervalDown
+    kVisSaveIntervalDown,
+    kVisNeedRestitch,
+    kVisNeedRebuild
 };
 
 struct StitchTask;

@@ -17,7 +17,7 @@ struct StitchGlobalConfig {
     double feather_strength = 2.0;
     bool feather_enabled = true;
     
-    bool save_enabled = true;
+    bool save_enabled = false;
     int save_interval = 30;
     
     int step_size = 1;

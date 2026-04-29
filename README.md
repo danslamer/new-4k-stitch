@@ -178,7 +178,7 @@ htop
 bash
 **sudo ifconfig end1 192.168.1.10 netmask 255.255.255.0 up**
 （将 eth0 替换为实际网卡名，如 enp0s 等）
-2. 测试: `ping 192.168.1.100`
+2. 测试: `ping 192.168.1.10`
 3. 连接: `ssh root@192.168.1.10` 或 PuTTY
 
 
@@ -425,6 +425,7 @@ sk-b9d876beac5d42e1afdf92fbc9f2001e
 继续某个会话：opencode --session ses_24bd59cfdffey30xKPIf68AG39
 删除无用会话）：opencode session delete <ID>
 
+使用SDL2库实现了可视化
 
 按键映射
 按键	功能
@@ -439,3 +440,12 @@ E	保存配置到 YAML
 M	ROI 标记开关
 Q/Esc	退出调试模式
 Enter/D	进入调试模式
+
+功能行为
+操作	行为
+进入调试模式 (Enter)	保存当前帧，锁定帧索引，暂停获取新帧
+ROI 偏移调整 (↑↓←→)	重新拼接保存的帧，实时显示调整效果
+羽化参数调整 (F/+/-)	重新布局 + 重拼接
+切换摄像头 (Tab)	仅切换选中状态，不影响帧
+保存配置 (E)	写入 YAML 文件
+退出调试模式 (Q/Esc)	清除保存帧，恢复实时拼接流程

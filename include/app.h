@@ -46,6 +46,9 @@ class App {
     void InitFromConfig();
     void RebuildLayout();
     void SyncConfigToGlobals();
+    void SaveCurrentFrames();
+    void ReleaseSavedFrames();
+    void RestitchSavedFrames();
 
     size_t num_img_;
 
@@ -63,6 +66,11 @@ class App {
     CachedOverlap cached_overlaps_;
     bool visual_mode_;
     bool debug_mode_;
+
+    vector<NV12Frame> saved_frames_;
+    vector<DrmBuffer> saved_drm_bufs_;
+    bool frames_locked_;
+    size_t locked_frame_idx_;
 };
 
 #endif

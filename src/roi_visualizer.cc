@@ -492,27 +492,27 @@ VisAction RoiVisualizer::HandleDebugAction(VisAction action) {
             return kVisNone;
         case kVisStepUp:
             g_config.roi_offsets[cam].offset_y -= g_config.step_size;
-            return action;
+            return kVisNeedRestitch;
         case kVisStepDown:
             g_config.roi_offsets[cam].offset_y += g_config.step_size;
-            return action;
+            return kVisNeedRestitch;
         case kVisStepLeft:
             g_config.roi_offsets[cam].offset_x -= g_config.step_size;
-            return action;
+            return kVisNeedRestitch;
         case kVisStepRight:
             g_config.roi_offsets[cam].offset_x += g_config.step_size;
-            return action;
+            return kVisNeedRestitch;
         case kVisFeatherToggle:
             g_config.feather_enabled = !g_config.feather_enabled;
-            return action;
+            return kVisNeedRebuild;
         case kVisFeatherWidthUp:
             g_config.feather_width = NormalizeEvenFloor(
                 std::max(20, g_config.feather_width + 10));
-            return action;
+            return kVisNeedRebuild;
         case kVisFeatherWidthDown:
             g_config.feather_width = NormalizeEvenFloor(
                 std::max(20, g_config.feather_width - 10));
-            return action;
+            return kVisNeedRebuild;
         case kVisSaveToggle:
             g_config.save_enabled = !g_config.save_enabled;
             return kVisNone;

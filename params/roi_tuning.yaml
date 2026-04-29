@@ -1,0 +1,24 @@
+%YAML:1.0
+---
+mode: dataset
+step_size: 1
+selected_cam: 1
+feather:
+   enabled: 1
+   width: 120
+   strength: 2.
+save:
+   enabled: 0
+   interval: 30
+cam0:
+   offset_x: 0
+   offset_y: 0
+cam1:
+   offset_x: -39
+   offset_y: -38
+cam2:
+   offset_x: 0
+   offset_y: 0
+cam3:
+   offset_x: 0
+   offset_y: 0
