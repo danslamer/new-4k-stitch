@@ -1,0 +1,48 @@
+%YAML:1.0
+---
+# v2 输入源描述 (阶段 2 引入).
+# InitVideoCapture 优先读本文件, 加载失败时 fallback 到 t50..t53.mp4 数据集路径.
+# 阶段 3 之前: type: mipi 会被跳过 (走告警, 不进 FFmpeg 线程).
+# 阶段 3 之后: type: mipi 会启动 V4L2 采集线程, type: file 走原 FFmpeg 线程.
+#
+# 字段:
+#   type:        mipi | file
+#   uri:         /dev/videoN (mipi) 或 ../datasets/4k-test/tXX.mp4 (file)
+#   width/height: 期望分辨率, 启动时校验
+#   fps:         目标帧率, 阶段 5 写死 30
+#   pixel_format: NV12 (从 rkisp_mainpath 出来的格式, 阶段 1 验证后填入)
+#
+# 顶层:
+#   sync_window_ms:  阶段 4 时间戳同步窗口, 默认 16ms (60fps 一帧预算)
+#   auto_calibrate:  阶段 3 启动期自标定, 默认 0 (off)
+#
+# 当前默认: type: file, 走数据集调试 (与 v1 行为一致, 不依赖摄像头驱动).
+# 切换到摄像头: 把 type 改成 mipi, uri 改成 /dev/videoN. 4 路同改.
+---
+sync_window_ms: 16
+auto_calibrate: 0
+cameras:
+   -   type: file
+       uri: ../datasets/4k-test/t50.mp4
+       width: 2560
+       height: 1440
+       fps: 30
+       pixel_format: NV12
+   -   type: file
+       uri: ../datasets/4k-test/t51.mp4
+       width: 2560
+       height: 1440
+       fps: 30
+       pixel_format: NV12
+   -   type: file
+       uri: ../datasets/4k-test/t52.mp4
+       width: 2560
+       height: 1440
+       fps: 30
+       pixel_format: NV12
+   -   type: file
+       uri: ../datasets/4k-test/t53.mp4
+       width: 2560
+       height: 1440
+       fps: 30
+       pixel_format: NV12

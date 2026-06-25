@@ -36,6 +36,7 @@ GetDecodeFpsSnapshot() - 获取解码FPS快照
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -332,55 +333,189 @@ SensorDataInterface::~SensorDataInterface() {
  */
 void SensorDataInterface::InitExampleImages() {}
 
-// 从 app.cc 引入设备标志位
-extern bool g_is_using_camera;
+// v2: 输入源描述 (阶段 2 引入, 由 InitVideoCapture 填充).
+// 加载自 params/camera_sources.yaml, 不存在则 fallback 到原 t50..t53.mp4 列表.
+// 阶段 3 才会用 kMipi 实际跑 V4L2 采集线程; 当前 kMipi 也 fallback 到 file
+// (仅日志告警, 不破坏数据集调试).
+static CameraSourceList g_camera_source_list;
+const CameraSourceList& GetCameraSourceList() { return g_camera_source_list; }
+
+// 解析 params/camera_sources.yaml, 用 OpenCV FileStorage (项目已依赖).
+// 失败时 (文件不存在 / 解析错) 返回 false, 保持 g_camera_source_list 为空,
+// 触发 InitVideoCapture 的 fallback 逻辑 (与 v1 行为一致).
+static bool LoadCameraSourceList(const std::string& path) {
+  cv::FileStorage fs(path, cv::FileStorage::READ);
+  if (!fs.isOpened()) {
+    return false;
+  }
+  cv::FileNode root = fs.root();
+  if (root.empty() || !root.isMap()) {
+    return false;
+  }
+  cv::FileNode cameras = root["cameras"];
+  if (cameras.empty() || !cameras.isSeq()) {
+    return false;
+  }
+  g_camera_source_list.cameras.clear();
+  for (cv::FileNodeIterator it = cameras.begin(); it != cameras.end(); ++it) {
+    cv::FileNode cam = *it;
+    CameraSource src;
+    std::string type_str;
+    cam["type"] >> type_str;
+    if (type_str == "mipi") {
+      src.type = CameraSource::Type::kMipi;
+    } else {
+      src.type = CameraSource::Type::kFile;
+    }
+    cam["uri"] >> src.uri;
+    cam["width"] >> src.width;
+    cam["height"] >> src.height;
+    cam["fps"] >> src.fps;
+    cam["pixel_format"] >> src.pixel_format;
+    if (src.uri.empty()) {
+      Logger::GetInstance().LogError(
+          "[sensor_data_interface] camera_sources.yaml: empty uri, skipped");
+      continue;
+    }
+    g_camera_source_list.cameras.push_back(src);
+  }
+  if (root["sync_window_ms"].isInt()) {
+    root["sync_window_ms"] >> g_camera_source_list.sync_window_ms;
+  }
+  if (root["auto_calibrate"].isInt()) {
+    int v = 0;
+    root["auto_calibrate"] >> v;
+    g_camera_source_list.auto_calibrate = (v != 0);
+  }
+  return !g_camera_source_list.cameras.empty();
+}
+
+// 默认 4 路数据集 t50..t53.mp4 (v1 时代命名遗留, 实际是 2K 2560x1440).
+// 目录名 "4k-test" 不改以避免破坏路径书签; 实际内容是 2K.
+static std::vector<CameraSource> LoadDefaultDatasetSources() {
+  const std::string video_dir = "../datasets/4k-test/";
+  const std::vector<std::string> default_files = {
+      "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4"};
+  std::vector<CameraSource> sources;
+  sources.reserve(default_files.size());
+  for (const auto& f : default_files) {
+    CameraSource src;
+    src.type = CameraSource::Type::kFile;
+    src.uri = video_dir + f;
+    src.fps = 30;
+    sources.push_back(src);
+  }
+  Logger::GetInstance().Log(
+      "[sensor_data_interface] INPUT_SOURCE_MODE=dataset, use " +
+      std::to_string(sources.size()) + " file source(s) from " + video_dir);
+  return sources;
+}
 
 /**
  * @brief 初始化视频捕取
- * 根据视频文件列表创建接接缓冲区和解码线程
- * @param num_img 数组大小（口数），传回实际【文件数量
+ * 根据输入源描述创建缓冲队列和解码线程
+ * @param num_img 数组大小（口数），传回实际路数
+ *
+ * v2 行为: 优先读 params/camera_sources.yaml (4 路 mipi / file),
+ * 加载失败时 fallback 到原 t50..t53.mp4 数据集路径 (保持向后兼容).
  */
 void SensorDataInterface::InitVideoCapture(size_t& num_img) {
-  // 根据配置标志位选择初始化逻辑
-  if (g_is_using_camera) {
-      // ====================================================================
-      // 真实相机输入初始化逻辑预留位置
-      // ====================================================================
-      // TODO: 在这里添加针对 4 路相机 (例如 /dev/video0 ~ /dev/video3
-      // 或 v4l2 节点) 的捕获初始化代码，并填充 video_file_paths_。
-      // 当前暂时留空或填充为你相机的占位配置。
-      // num_img_ = 4;
-      // ...
+  num_img_ = 0;
+  num_img = 0;
+  image_queue_vector_.clear();
+  image_queue_mutex_vector_.clear();
+  video_capture_vector_.clear();
+  video_file_paths_.clear();
+  decode_threads_.clear();
+  decode_fps_vector_.clear();
+  decoded_frames_since_report_.clear();
+  decode_report_time_vector_.clear();
+  decoder_ready_vector_.clear();
+  decoder_finished_vector_.clear();
+  drm_prime_fallback_logged_vector_.clear();
+
+  const std::string sources_path = "../params/camera_sources.yaml";
+  const bool loaded = LoadCameraSourceList(sources_path);
+  std::vector<CameraSource> effective_sources;
+
+  // INPUT_SOURCE_MODE: dataset | camera, 默认 dataset (无 env 走历史数据集路径).
+  //   dataset - 走默认 t50..t53.mp4 数据集, 忽略 yaml
+  //   camera  - 走 params/camera_sources.yaml, 阶段 3 启用 V4L2 线程
+  const char* env_mode = std::getenv("INPUT_SOURCE_MODE");
+  std::string mode = env_mode ? env_mode : "dataset";
+  if (mode != "dataset" && mode != "camera") {
+    Logger::GetInstance().LogError(
+        "[sensor_data_interface] INPUT_SOURCE_MODE='" + mode +
+        "' invalid, expected dataset/camera, fallback to dataset");
+    mode = "dataset";
+  }
+
+  if (mode == "camera") {
+    if (!loaded) {
+      Logger::GetInstance().LogError(
+          "[sensor_data_interface] INPUT_SOURCE_MODE=camera but " +
+          sources_path + " not found or invalid");
+      return;
+    }
+    effective_sources = g_camera_source_list.cameras;
+    Logger::GetInstance().Log(
+        "[sensor_data_interface] INPUT_SOURCE_MODE=camera, loaded " +
+        std::to_string(effective_sources.size()) +
+        " camera source(s) from " + sources_path);
   } else {
-      // 原有的数据集测试视频读取逻辑
-      const std::string video_dir = "../datasets/4k-test/";
-      const std::vector<std::string> video_file_name = {
-          "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4"};
+    effective_sources = LoadDefaultDatasetSources();
+  }
 
-      num_img_ = video_file_name.size();
-      num_img = num_img_;
+  // 阶段 3 之前: kMipi 暂跳过, 仅日志告警.
+  int n_mipi = 0;
+  for (const auto& src : effective_sources) {
+    if (src.is_mipi()) {
+      ++n_mipi;
+      Logger::GetInstance().LogError(
+          "[sensor_data_interface] MIPI type not yet implemented (phase 3), "
+          "uri=" + src.uri + " -> skipped. Wait for V4L2 capture thread.");
+    }
+  }
+  const bool all_mipi = (n_mipi == static_cast<int>(effective_sources.size())
+                         && !effective_sources.empty());
+  if (all_mipi && mode == "camera") {
+    Logger::GetInstance().LogError(
+        "[sensor_data_interface] INPUT_SOURCE_MODE=camera but all sources are "
+        "MIPI and V4L2 capture thread not implemented yet (phase 3). "
+        "Either install GC4683 driver + finish phase 3, or set "
+        "INPUT_SOURCE_MODE=dataset to use t50..t53.mp4");
+    return;
+  }
 
-      image_queue_vector_ = std::vector<std::queue<QueuedFrame>>(num_img_);
-      image_queue_mutex_vector_ = std::vector<std::mutex>(num_img_);
-      video_capture_vector_.clear();
+  std::vector<CameraSource> file_sources;
+  for (const auto& src : effective_sources) {
+    if (src.is_mipi()) continue;  // phase 3 后才会用
+    file_sources.push_back(src);
+  }
+  if (file_sources.empty()) {
+    Logger::GetInstance().LogError(
+        "[sensor_data_interface] no usable file sources, num_img=0");
+    return;
+  }
 
-      video_file_paths_.clear();
-      // ... (其他初始化向量保留原样)
-      decode_threads_.clear();
-      decode_threads_.reserve(num_img_);
-      decode_fps_vector_ = std::vector<double>(num_img_, 0.0);
-      decoded_frames_since_report_ = std::vector<size_t>(num_img_, 0);
-      decode_report_time_vector_ =
-          std::vector<std::chrono::steady_clock::time_point>(
-              num_img_, std::chrono::steady_clock::now());
-      decoder_ready_vector_ = std::vector<bool>(num_img_, false);
-      decoder_finished_vector_ = std::vector<bool>(num_img_, false);
-      drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
+  num_img_ = file_sources.size();
+  num_img = static_cast<int>(num_img_);
 
-      for (size_t i = 0; i < num_img_; ++i) {
-        const std::string file_name = video_dir + video_file_name[i];
-        video_file_paths_.push_back(file_name);
-      }
+  image_queue_vector_ = std::vector<std::queue<QueuedFrame>>(num_img_);
+  image_queue_mutex_vector_ = std::vector<std::mutex>(num_img_);
+
+  decode_threads_.reserve(num_img_);
+  decode_fps_vector_ = std::vector<double>(num_img_, 0.0);
+  decoded_frames_since_report_ = std::vector<size_t>(num_img_, 0);
+  decode_report_time_vector_ =
+      std::vector<std::chrono::steady_clock::time_point>(
+          num_img_, std::chrono::steady_clock::now());
+  decoder_ready_vector_ = std::vector<bool>(num_img_, false);
+  decoder_finished_vector_ = std::vector<bool>(num_img_, false);
+  drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
+
+  for (size_t i = 0; i < num_img_; ++i) {
+    video_file_paths_.push_back(file_sources[i].uri);
   }
 
   StartDecodeThreads();

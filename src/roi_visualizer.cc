@@ -168,7 +168,7 @@ bool RoiVisualizer::Init(int panorama_width, int panorama_height) {
             return true;
         }
         
-        window_ = SDL_CreateWindow("4K Stitch ROI Tuner",
+        window_ = SDL_CreateWindow("2K Stitch ROI Tuner",
                                     SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                                     DISPLAY_DEFAULT_W, DISPLAY_DEFAULT_H,
                                     SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);

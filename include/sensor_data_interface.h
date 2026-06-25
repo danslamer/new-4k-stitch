@@ -28,6 +28,34 @@ enum class QueuedFrameStorage {
     kDrmPrime = 2,
 };
 
+// v2: 输入源描述 (替代 4-cam 硬编码 t50..t53.mp4 列表).
+// 加载自 params/camera_sources.yaml, 暂未启用 mipi 采集线程 (阶段 3 待写),
+// 当前 InitVideoCapture 按 type 路由: file 走 FFmpeg 线程, mipi 暂 fallback 到 file.
+struct CameraSource {
+    enum class Type {
+        kFile,    // 本地视频文件 (走 FFmpeg avformat_open_input)
+        kMipi,    // V4L2 节点 (阶段 3 实现, 当前 fallback 到 file)
+    };
+
+    Type type = Type::kFile;
+    std::string uri;       // 文件路径 或 /dev/videoN
+    int width = 0;
+    int height = 0;
+    int fps = 30;
+    std::string pixel_format;  // "NV12" (期望, 仅日志用)
+
+    bool is_mipi() const { return type == Type::kMipi; }
+    bool is_file() const { return type == Type::kFile; }
+};
+
+// 全局输入源列表 (启动时由 SensorDataInterface 填充, 供 app.cc 路由).
+// 默认空 (fallback 到原 t50..t53.mp4 数据集路径).
+struct CameraSourceList {
+    std::vector<CameraSource> cameras;
+    int sync_window_ms = 16;  // 阶段 4 时间戳同步窗口, 默认 1 帧 60fps 预算
+    bool auto_calibrate = false;  // 阶段 3 启动期自标定, 默认 off
+};
+
 struct QueuedFrame {
     QueuedFrameStorage storage = QueuedFrameStorage::kEmpty;
     std::shared_ptr<AVFrame> hardware_frame;

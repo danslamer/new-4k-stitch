@@ -26,7 +26,9 @@ extern "C" {
 
 StitchGlobalConfig g_config;
 
-bool g_is_using_camera = false;
+// v2 改动: g_is_using_camera 死代码删除 (从未被任何代码置 true).
+// 输入源路由已下沉到 SensorDataInterface::InitVideoCapture
+// (按 CameraSource.type 分发, 见 include/sensor_data_interface.h).
 bool g_enable_visual_tuning = true;
 bool g_show_roi_markers = true;
 bool g_use_roi_config = true;
@@ -187,7 +189,10 @@ OverlapEstimate EstimateOverlapByTemplate(const cv::Mat& left_gray, const cv::Ma
 
   const int common_w = std::min(left_gray.cols, right_gray.cols);
   const int common_h = std::min(left_gray.rows, right_gray.rows);
-  const int search_w = NormalizeEvenFloor(std::min(common_w / 2, 1920));
+  // v2: 2K 视频 (2560x1440) 下 common_w=2560, common_w/2=1280 自动覆盖水平重叠
+  // 候选区, 不再需要 4K 时代的 1920 magic number. 这里改用 common_w 自身做软上限,
+  // 对 2K/4K 都自适应. (4K 时代 bug: 上限 1200 不足以覆盖 1400-1600 真实重叠)
+  const int search_w = NormalizeEvenFloor(common_w / 2);
   const int template_w = NormalizeEvenFloor(std::max(192, search_w * 2 / 3));
   const int band_h = NormalizeEvenFloor(std::min(common_h / 5, 480));
   const int max_shift_y = std::min(240, std::max(16, common_h / 12));
@@ -259,7 +264,8 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
 
   const int common_w = std::min(left_gray.cols, right_gray.cols);
   const int common_h = std::min(left_gray.rows, right_gray.rows);
-  const int band_w = NormalizeEvenFloor(std::min(common_w / 2, 1920));
+  // v2: 同 EstimateOverlapByTemplate 的注释, 改用 common_w 自适应.
+  const int band_w = NormalizeEvenFloor(common_w / 2);
   if (band_w < 256 || common_h < 128) {
     return EstimateOverlapByTemplate(left_gray, right_gray);
   }

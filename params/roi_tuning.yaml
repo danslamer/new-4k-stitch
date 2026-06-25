@@ -15,7 +15,7 @@ cam0:
    offset_y: 0
 cam1:
    offset_x: -39
-   offset_y: -38
+   offset_y: 95
 cam2:
    offset_x: 0
    offset_y: 0
