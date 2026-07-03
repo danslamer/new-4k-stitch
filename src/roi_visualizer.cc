@@ -155,7 +155,9 @@ bool RoiVisualizer::Init(int panorama_width, int panorama_height) {
         const char* driver = drivers[i];
         Logger::GetInstance().Log("[RoiVisualizer] Trying video driver: " + std::string(driver));
         
-        SDL_SetHint(SDL_HINT_VIDEODRIVER, driver);
+        // SDL 2.0.22+ 重命名为 SDL_HINT_VIDEO_DRIVER, 老常量在某些发行版头文件已删除。
+        // 用 env var 走 SDL_VIDEODRIVER 兜底, 跨版本都生效 (SDL_Init 时会读取)。
+        setenv("SDL_VIDEODRIVER", driver, 1);
         
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
             Logger::GetInstance().Log("[RoiVisualizer] SDL_Init with " + std::string(driver) + " failed: " + std::string(SDL_GetError()));

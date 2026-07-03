@@ -1,8 +1,11 @@
 #include "app.h"
+#include "status_writer.h"
+#include "http_server.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -32,6 +35,7 @@ StitchGlobalConfig g_config;
 bool g_enable_visual_tuning = true;
 bool g_show_roi_markers = true;
 bool g_use_roi_config = true;
+bool g_skip_bootstrap = false;   // SKIP_BOOTSTRAP=1: 固定支架场景, YAML 缺失时仍跑一次 bootstrap 作为兜底
 
 static constexpr size_t NUM_BOOTSTRAP_FRAMES = 3;
 static constexpr double CONFIDENCE_THRESHOLD = 0.25;
@@ -173,8 +177,8 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
 
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
-  
-  for (size_t i = 0; i < num_cameras && i < 4; ++i) {
+
+  for (size_t i = 0; i < num_cameras && i < 6; ++i) {
     tuning[i].offset_x = g_config.roi_offsets[i].offset_x;
     tuning[i].offset_y = g_config.roi_offsets[i].offset_y;
   }
@@ -373,10 +377,13 @@ void SaveDetectedRoiDebug(const std::vector<cv::Mat>& bootstrap_bgr,
 }
 
 struct MatrixOverlap {
-  OverlapEstimate h01;
-  OverlapEstimate h23;
-  OverlapEstimate v02;
-  OverlapEstimate v13;
+  OverlapEstimate h01;  // cam0-cam1 (水平)
+  OverlapEstimate h23;  // cam2-cam3 (水平)
+  OverlapEstimate h45;  // cam4-cam5 (水平)
+  OverlapEstimate v02;  // cam0-cam2 (垂直)
+  OverlapEstimate v13;  // cam1-cam3 (垂直)
+  OverlapEstimate v24;  // cam2-cam4 (垂直)
+  OverlapEstimate v35;  // cam3-cam5 (垂直)
   double confidence = 0.0;
 };
 
@@ -388,12 +395,21 @@ CachedOverlap MatrixOverlapToCached(const MatrixOverlap& mo) {
   co.h23_overlap = mo.h23.overlap;
   co.h23_shift_y = mo.h23.shift_y;
   co.h23_score = mo.h23.score;
+  co.h45_overlap = mo.h45.overlap;
+  co.h45_shift_y = mo.h45.shift_y;
+  co.h45_score = mo.h45.score;
   co.v02_overlap = mo.v02.overlap;
   co.v02_shift_y = mo.v02.shift_y;
   co.v02_score = mo.v02.score;
   co.v13_overlap = mo.v13.overlap;
   co.v13_shift_y = mo.v13.shift_y;
   co.v13_score = mo.v13.score;
+  co.v24_overlap = mo.v24.overlap;
+  co.v24_shift_y = mo.v24.shift_y;
+  co.v24_score = mo.v24.score;
+  co.v35_overlap = mo.v35.overlap;
+  co.v35_shift_y = mo.v35.shift_y;
+  co.v35_score = mo.v35.score;
   co.confidence = mo.confidence;
   return co;
 }
@@ -406,12 +422,21 @@ MatrixOverlap CachedToMatrixOverlap(const CachedOverlap& co) {
   mo.h23.overlap = co.h23_overlap;
   mo.h23.shift_y = co.h23_shift_y;
   mo.h23.score = co.h23_score;
+  mo.h45.overlap = co.h45_overlap;
+  mo.h45.shift_y = co.h45_shift_y;
+  mo.h45.score = co.h45_score;
   mo.v02.overlap = co.v02_overlap;
   mo.v02.shift_y = co.v02_shift_y;
   mo.v02.score = co.v02_score;
   mo.v13.overlap = co.v13_overlap;
   mo.v13.shift_y = co.v13_shift_y;
   mo.v13.score = co.v13_score;
+  mo.v24.overlap = co.v24_overlap;
+  mo.v24.shift_y = co.v24_shift_y;
+  mo.v24.score = co.v24_score;
+  mo.v35.overlap = co.v35_overlap;
+  mo.v35.shift_y = co.v35_shift_y;
+  mo.v35.score = co.v35_score;
   mo.confidence = co.confidence;
   return mo;
 }
@@ -440,8 +465,31 @@ MatrixOverlap EstimateOverlaps2x2(const std::vector<cv::Mat>& frames) {
   result.h23 = EstimatePairOverlap(frames[2], frames[3]);
   result.v02 = EstimateVerticalOverlap(frames[0], frames[2]);
   result.v13 = EstimateVerticalOverlap(frames[1], frames[3]);
-  
+
   result.confidence = (result.h01.score + result.h23.score + result.v02.score + result.v13.score) / 4.0;
+  return result;
+}
+
+// v2.3: 6 路 2x3 (2 列 x 3 行) overlap 估计. 7 对邻接:
+//   水平: h01 (cam0-cam1), h23 (cam2-cam3), h45 (cam4-cam5)
+//   垂直: v02 (cam0-cam2), v13 (cam1-cam3), v24 (cam2-cam4), v35 (cam3-cam5)
+MatrixOverlap EstimateOverlaps2x3(const std::vector<cv::Mat>& frames) {
+  MatrixOverlap result;
+  if (frames.size() < 6) {
+    return result;
+  }
+
+  result.h01 = EstimatePairOverlap(frames[0], frames[1]);
+  result.h23 = EstimatePairOverlap(frames[2], frames[3]);
+  result.h45 = EstimatePairOverlap(frames[4], frames[5]);
+  result.v02 = EstimateVerticalOverlap(frames[0], frames[2]);
+  result.v13 = EstimateVerticalOverlap(frames[1], frames[3]);
+  result.v24 = EstimateVerticalOverlap(frames[2], frames[4]);
+  result.v35 = EstimateVerticalOverlap(frames[3], frames[5]);
+
+  const double sum = result.h01.score + result.h23.score + result.h45.score
+                   + result.v02.score + result.v13.score + result.v24.score + result.v35.score;
+  result.confidence = sum / 7.0;
   return result;
 }
 
@@ -575,6 +623,130 @@ std::vector<StitchTask> BuildStitchLayout2x2(const std::vector<CameraRoi>& rois,
   return tasks;
 }
 
+// v2.3: 6 路 2x3 (2 列 x 3 行) ROI 计算.
+//   布局: cam0 cam1 / cam2 cam3 / cam4 cam5
+//   简化: 不做复杂邻接 alignment, 使用 grid 平均分割 + tuning offset 微调.
+//   overlap 区域是相邻 cam 的交叠区, BlendSeams 在此做羽化.
+std::vector<CameraRoi> BuildCameraRois2x3(const std::vector<NV12Frame>& frames,
+                                          const MatrixOverlap& overlaps,
+                                          const std::vector<CameraTuning>& tuning) {
+  if (frames.size() < 6) {
+    // Fallback: 用 2x2 (前 4 路) 走老路径
+    return {};
+  }
+  const int n = 6;
+  int W[n], H[n];
+  for (int i = 0; i < n; ++i) {
+    W[i] = frames[i].width;
+    H[i] = frames[i].height;
+  }
+
+  // 应用 tuning offset
+  // 注意: tuning[] 只有 6 个才有效, BuildDefaultTuning 数组已扩到 [6]
+  std::vector<CameraRoi> rois(n);
+
+  // 简化策略: 每个 cam 满分辨率取 ROI, 不裁剪
+  // (真正的 ROI 调整由 tuning.offset_x/y 在 BuildStitchLayout2x3 里做微调)
+  for (int i = 0; i < n; ++i) {
+    rois[i].x = 0;
+    rois[i].y = 0;
+    rois[i].width = W[i];
+    rois[i].height = H[i];
+  }
+
+  // 用 overlap 区域的 shift_x / shift_y 做微调 (alignment hint)
+  // 水平邻接 shift_y (cam0/2/4 是 cam 左, cam1/3/5 是右)
+  rois[1].y = NormalizeEvenFloor(overlaps.h01.shift_y);
+  rois[3].y = NormalizeEvenFloor(overlaps.h23.shift_y);
+  rois[5].y = NormalizeEvenFloor(overlaps.h45.shift_y);
+  // 垂直邻接 shift_y (cam0/1 是上, cam2/3 是中, cam4/5 是下)
+  // v02/v13 shift_x -> cam2/cam3 的 x 偏移
+  rois[2].x = NormalizeEvenFloor(overlaps.v02.shift_y);
+  rois[3].x = NormalizeEvenFloor(overlaps.v13.shift_y);
+  // v24/v35 shift_x -> cam4/cam5 的 x 偏移
+  rois[4].x = NormalizeEvenFloor(overlaps.v24.shift_y);
+  rois[5].x = NormalizeEvenFloor(overlaps.v35.shift_y);
+
+  // 边界 clip (不超 cam 实际尺寸)
+  for (int i = 0; i < n; ++i) {
+    if (rois[i].x < 0) rois[i].x = 0;
+    if (rois[i].y < 0) rois[i].y = 0;
+    if (rois[i].x >= W[i]) rois[i].x = W[i] - 1;
+    if (rois[i].y >= H[i]) rois[i].y = H[i] - 1;
+    if (rois[i].x + rois[i].width > W[i]) rois[i].width = NormalizeEvenFloor(W[i] - rois[i].x);
+    if (rois[i].y + rois[i].height > H[i]) rois[i].height = NormalizeEvenFloor(H[i] - rois[i].y);
+    if (rois[i].width < 2 || rois[i].height < 2) {
+      throw std::runtime_error("invalid 2x3 crop mapping for camera " + std::to_string(i));
+    }
+  }
+
+  return rois;
+}
+
+// v2.3: 6 路 2x3 (2 列 x 3 行) 输出布局.
+//   panorama 尺寸:
+//     width  = 2*W - overlap_h (一列竖接缝)
+//     height = 3*H - 2*overlap_v (两行横接缝)
+//   邻接接缝:
+//     水平: (0,1), (2,3), (4,5)
+//     垂直: (0,2), (1,3), (2,4), (3,5)
+std::vector<StitchTask> BuildStitchLayout2x3(const std::vector<CameraRoi>& rois,
+                                             const std::vector<CameraTuning>& tuning,
+                                             int* panorama_width,
+                                             int* panorama_height) {
+  if (rois.size() < 6) return {};
+  const int n = 6;
+
+  std::vector<StitchTask> tasks(n);
+  for (size_t i = 0; i < n; ++i) {
+    tasks[i].enabled = tuning[i].enabled;
+    tasks[i].rotation_deg = tuning[i].rotation_deg;
+    tasks[i].src_x = rois[i].x;
+    tasks[i].src_y = rois[i].y;
+    tasks[i].src_w = rois[i].width;
+    tasks[i].src_h = rois[i].height;
+  }
+
+  // 简化的 overlap 值 (跟 ROI 简化策略一致, 不依赖 EstimatePairOverlap 结果)
+  // 默认水平 overlap = W/8, 垂直 overlap = H/12 (粗略估计)
+  const int W = rois[0].width;
+  const int H = rois[0].height;
+  const int overlap_h = W / 8;
+  const int overlap_v = H / 12;
+
+  // 2x3 grid 布局 (cam0/2/4 在左列, cam1/3/5 在右列)
+  // row 0: cam0 (左上), cam1 (右上)
+  // row 1: cam2 (左中), cam3 (右中)
+  // row 2: cam4 (左下), cam5 (右下)
+  const int blend_w = NormalizeEvenFloor(std::max(20, g_config.feather_width));
+
+  // 左列 (cam0/2/4) x = 0
+  // 右列 (cam1/3/5) x = W - overlap_h
+  // 行 0: y = 0
+  // 行 1: y = H - overlap_v
+  // 行 2: y = 2*(H - overlap_v)
+
+  // 应用 tuning 微调
+  int col_x[2] = { 0, NormalizeEvenFloor(W - overlap_h) };
+  int row_y[3] = { 0, NormalizeEvenFloor(H - overlap_v), NormalizeEvenFloor(2 * (H - overlap_v)) };
+
+  for (int i = 0; i < n; ++i) {
+    int col = i % 2;   // 0 or 1
+    int row = i / 2;   // 0, 1, or 2
+    tasks[i].dst_x = col_x[col] + tuning[i].offset_x;
+    tasks[i].dst_y = row_y[row] + tuning[i].offset_y;
+  }
+
+  // panorama 尺寸
+  *panorama_width = NormalizeEvenCeil(col_x[1] + W);   // 右列起点 + cam 宽度
+  *panorama_height = NormalizeEvenCeil(row_y[2] + H);  // 下行起点 + cam 高度
+
+  Logger::GetInstance().Log("[App] [2x3] overlap_h=" + std::to_string(overlap_h)
+                           + " overlap_v=" + std::to_string(overlap_v)
+                           + " blend_w=" + std::to_string(blend_w));
+  return tasks;
+}
+
 std::vector<StitchTask> BuildWarpLayout(const StitchingWarpData& warp_data) {
   std::vector<StitchTask> tasks(warp_data.entries.size());
   for (size_t i = 0; i < warp_data.entries.size(); ++i) {
@@ -630,21 +802,38 @@ void App::BootStrapOptimalLayout() {
       }
     }
     
-    const MatrixOverlap overlaps = EstimateOverlaps2x2(bootstrap_bgr);
-    const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, overlaps, tuning);
+    const MatrixOverlap overlaps = (num_img_ == 6)
+        ? EstimateOverlaps2x3(bootstrap_bgr)
+        : EstimateOverlaps2x2(bootstrap_bgr);
+    const vector<CameraRoi> rois = (num_img_ == 6)
+        ? BuildCameraRois2x3(image_vector_, overlaps, tuning)
+        : BuildCameraRois2x2(image_vector_, overlaps, tuning);
     
     double avg_confidence = overlaps.confidence;
     
-    bool all_valid = (overlaps.h01.score >= CONFIDENCE_THRESHOLD &&
-                      overlaps.h23.score >= CONFIDENCE_THRESHOLD &&
-                      overlaps.v02.score >= CONFIDENCE_THRESHOLD &&
-                      overlaps.v13.score >= CONFIDENCE_THRESHOLD);
-    
+    bool all_valid;
+    if (num_img_ == 6) {
+      all_valid = (overlaps.h01.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.h23.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.h45.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.v02.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.v13.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.v24.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.v35.score >= CONFIDENCE_THRESHOLD);
+    } else {
+      all_valid = (overlaps.h01.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.h23.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.v02.score >= CONFIDENCE_THRESHOLD &&
+                   overlaps.v13.score >= CONFIDENCE_THRESHOLD);
+    }
+
     int dummy_panorama_width = 0;
     int dummy_panorama_height = 0;
-    const vector<StitchTask> layout = 
-        BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
-    
+    const vector<StitchTask> layout =
+        (num_img_ == 6)
+        ? BuildStitchLayout2x3(rois, tuning, &dummy_panorama_width, &dummy_panorama_height)
+        : BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+
     RoiDetectionResult result;
     result.overlaps = overlaps;
     result.rois = rois;
@@ -652,7 +841,7 @@ void App::BootStrapOptimalLayout() {
     result.confidence = avg_confidence;
     result.frame_index = frame_count;
     detection_results.push_back(result);
-    
+
     if (g_multi_frame_roi_debug_level >= 1) {
       ostringstream debug_msg;
       debug_msg << "[App] [MULTI-FRAME ROI] Frame #" << frame_count << ": "
@@ -662,11 +851,18 @@ void App::BootStrapOptimalLayout() {
       } else {
         debug_msg << " [WEAK]";
       }
-      
-      debug_msg << " h01_score=" << std::fixed << std::setprecision(3) << overlaps.h01.score;
-      debug_msg << " h23_score=" << std::fixed << std::setprecision(3) << overlaps.h23.score;
-      debug_msg << " v02_score=" << std::fixed << std::setprecision(3) << overlaps.v02.score;
-      debug_msg << " v13_score=" << std::fixed << std::setprecision(3) << overlaps.v13.score;
+
+      debug_msg << " h01=" << std::fixed << std::setprecision(3) << overlaps.h01.score;
+      debug_msg << " h23=" << std::fixed << std::setprecision(3) << overlaps.h23.score;
+      if (num_img_ == 6) {
+        debug_msg << " h45=" << std::fixed << std::setprecision(3) << overlaps.h45.score;
+      }
+      debug_msg << " v02=" << std::fixed << std::setprecision(3) << overlaps.v02.score;
+      debug_msg << " v13=" << std::fixed << std::setprecision(3) << overlaps.v13.score;
+      if (num_img_ == 6) {
+        debug_msg << " v24=" << std::fixed << std::setprecision(3) << overlaps.v24.score;
+        debug_msg << " v35=" << std::fixed << std::setprecision(3) << overlaps.v35.score;
+      }
       Logger::GetInstance().Log(debug_msg.str());
     }
     
@@ -700,16 +896,20 @@ void App::BootStrapOptimalLayout() {
   
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream summary_msg;
-    summary_msg << "[App] [MULTI-FRAME ROI 2x2] Detection completed: "
+    summary_msg << "[App] [MULTI-FRAME ROI " << (num_img_ == 6 ? "2x3" : "2x2") << "] Detection completed: "
                 << "total_frames=" << detection_results.size()
                 << " best_frame=" << best_result.frame_index
                 << " best_confidence=" << std::fixed << std::setprecision(4) << max_confidence;
     Logger::GetInstance().Log(summary_msg.str());
   }
-  
+
   int dummy_panorama_width = 0;
   int dummy_panorama_height = 0;
-  BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+  if (num_img_ == 6) {
+    BuildStitchLayout2x3(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+  } else {
+    BuildStitchLayout2x2(rois, tuning, &dummy_panorama_width, &dummy_panorama_height);
+  }
   total_cols_ = dummy_panorama_width;
   height_ = dummy_panorama_height;
 
@@ -765,22 +965,29 @@ void App::InitFromConfig() {
   for (size_t i = 0; i < num_img_; ++i) {
     bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
   }
-  cached_overlaps_ = MatrixOverlapToCached(EstimateOverlaps2x2(bootstrap_bgr));
+  cached_overlaps_ = MatrixOverlapToCached(
+      (num_img_ == 6) ? EstimateOverlaps2x3(bootstrap_bgr) : EstimateOverlaps2x2(bootstrap_bgr));
 
-  const vector<CameraRoi> rois = BuildCameraRois2x2(image_vector_, CachedToMatrixOverlap(cached_overlaps_), tuning);
+  const MatrixOverlap overlaps = CachedToMatrixOverlap(cached_overlaps_);
+  const vector<CameraRoi> rois = (num_img_ == 6)
+      ? BuildCameraRois2x3(image_vector_, overlaps, tuning)
+      : BuildCameraRois2x2(image_vector_, overlaps, tuning);
   int w = 0, h = 0;
-  const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &w, &h);
+  const vector<StitchTask> layout = (num_img_ == 6)
+      ? BuildStitchLayout2x3(rois, tuning, &w, &h)
+      : BuildStitchLayout2x2(rois, tuning, &w, &h);
 
   total_cols_ = w;
   height_ = h;
-  
+
   int blend_width = NormalizeEvenFloor(std::max(20, g_config.feather_width));
   image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
 
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream msg;
-    msg << "[App] [CONFIG INIT] Panorama size: " << total_cols_ << "x" << height_;
+    msg << "[App] [CONFIG INIT " << (num_img_ == 6 ? "2x3" : "2x2") << "] Panorama size: "
+        << total_cols_ << "x" << height_;
     Logger::GetInstance().Log(msg.str());
   }
 }
@@ -788,11 +995,14 @@ void App::InitFromConfig() {
 void App::RebuildLayout() {
   const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
 
-  const vector<CameraRoi> rois = BuildCameraRois2x2(
-      frames_locked_ ? saved_frames_ : image_vector_,
-      CachedToMatrixOverlap(cached_overlaps_), tuning);
+  const MatrixOverlap overlaps = CachedToMatrixOverlap(cached_overlaps_);
+  const vector<CameraRoi> rois = (num_img_ == 6)
+      ? BuildCameraRois2x3(frames_locked_ ? saved_frames_ : image_vector_, overlaps, tuning)
+      : BuildCameraRois2x2(frames_locked_ ? saved_frames_ : image_vector_, overlaps, tuning);
   int new_w = 0, new_h = 0;
-  const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
+  const vector<StitchTask> layout = (num_img_ == 6)
+      ? BuildStitchLayout2x3(rois, tuning, &new_w, &new_h)
+      : BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
 
   if (new_w != total_cols_ || new_h != height_) {
     Logger::GetInstance().Log("[App] [REBUILD] Panorama size changed, reallocating DRM buffer");
@@ -876,9 +1086,15 @@ void App::ReleaseSavedFrames() {
 
 void App::RestitchSavedFrames() {
   const vector<CameraTuning> tuning = BuildDefaultTuning(num_img_);
-  const vector<CameraRoi> rois = BuildCameraRois2x2(saved_frames_, CachedToMatrixOverlap(cached_overlaps_), tuning);
+
+  const MatrixOverlap overlaps = CachedToMatrixOverlap(cached_overlaps_);
+  const vector<CameraRoi> rois = (num_img_ == 6)
+      ? BuildCameraRois2x3(saved_frames_, overlaps, tuning)
+      : BuildCameraRois2x2(saved_frames_, overlaps, tuning);
   int new_w = 0, new_h = 0;
-  const vector<StitchTask> layout = BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
+  const vector<StitchTask> layout = (num_img_ == 6)
+      ? BuildStitchLayout2x3(rois, tuning, &new_w, &new_h)
+      : BuildStitchLayout2x2(rois, tuning, &new_w, &new_h);
   
   image_stitcher_.SetLayout(layout);
   
@@ -898,12 +1114,28 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   Logger::GetInstance().Log("[App] Application starting...");
   Logger::GetInstance().Log(string("[App] Visual tuning: ") + (visual_mode_ ? "ENABLED" : "DISABLED (set ENABLE_VISUAL_TUNING=1 to enable)"));
 
+  // v2.3 阶段 1: 初始化 status writer (CameraPage 后端用, 独立线程 + 模拟数据)
+  stitch_status::init();
+
   sensorDataInterface_.InitVideoCapture(num_img_);
   image_vector_.resize(num_img_);
 
   bool config_loaded = false;
   if (g_use_roi_config) {
     config_loaded = RoiConfig::LoadFromFile("../params/roi_tuning.yaml", g_config);
+  }
+
+  if (g_skip_bootstrap) {
+    // 固定支架场景 (车载 GC4683 等): 期望用 YAML 启动, 但 YAML 缺失时仍跑一次
+    // bootstrap 作为兜底, 而不是直接报错退出. 这是 2026-06 与用户确认的语义.
+    if (config_loaded) {
+      Logger::GetInstance().Log(
+          "[App] SKIP_BOOTSTRAP=1 + YAML OK, using params/roi_tuning.yaml (no bootstrap)");
+    } else {
+      Logger::GetInstance().Log(
+          "[App] SKIP_BOOTSTRAP=1 but YAML missing/invalid, falling back to bootstrap "
+          "(下次启动前请确认 params/roi_tuning.yaml)");
+    }
   }
 
   if (config_loaded) {
@@ -951,6 +1183,7 @@ App::~App() {
   ReleaseSavedFrames();
   if (visual_mode_) RoiVisualizer::Shutdown();
   drm_free(output_drm_buf_);
+  stitch_status::shutdown();  // v2.3 阶段 1: 清理 status 文件
 }
 
 [[noreturn]] void App::run_stitching() {
@@ -1049,10 +1282,45 @@ App::~App() {
     }
 
     if (!debug_mode_) ++frame_idx;
+
+    // v2.3 阶段 1: 写 status 给 CameraPage 后端读
+    // 每 kWriteEveryNFrames 帧写一次, 内部已 debounce
+    {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      stitch_status::GlobalStatus stitch_gstatus;
+      memset(&stitch_gstatus, 0, sizeof(stitch_gstatus));
+      stitch_gstatus.num_cameras = static_cast<int>(num_img_);
+      const char* env_mode = getenv("INPUT_SOURCE_MODE");
+      stitch_gstatus.mode = (env_mode && strcmp(env_mode, "camera") == 0) ? 1 : 0;
+      stitch_gstatus.panorama_w = total_cols_;
+      stitch_gstatus.panorama_h = height_;
+      stitch_gstatus.current_fps = fps;
+      stitch_gstatus.frame_idx = static_cast<int64_t>(frame_idx);
+      stitch_gstatus.timestamp_us = static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+      stitch_gstatus.blend_ms = 0;  // TODO: 实测
+      stitch_gstatus.warp_ms = 0;   // TODO: 实测
+      const vector<double> decode_fps_vec = sensorDataInterface_.GetDecodeFpsSnapshot();
+      for (size_t i = 0; i < num_img_ && i < 6; ++i) {
+        stitch_status::CameraStatus& c = stitch_gstatus.cams[i];
+        c.online = (image_vector_[i].width > 0) ? 1 : 0;
+        c.fps = (i < decode_fps_vec.size()) ? static_cast<int>(decode_fps_vec[i]) : 0;
+        c.width = image_vector_[i].width;
+        c.height = image_vector_[i].height;
+        // v1 测试: 用 cam0/cam1 占位, 后续通过 public getter 拿 CameraSourceList 的 uri
+        snprintf(c.name, sizeof(c.name), "cam%zu", i);
+        snprintf(c.uri, sizeof(c.uri), "../datasets/2k-test/cam%zu.mp4", i);
+      }
+      stitch_status::update(stitch_gstatus);
+    }
   }
 }
 
 int main() {
+  // v2.3 阶段 1.5: status writer 线程 (独立, 模拟数据)
+  // 必须在最开头: 即使 App 构造卡死 (vpu/kmpp 问题), worker 仍能写
+  stitch_status::init();
+
   const char* env_visual = getenv("ENABLE_VISUAL_TUNING");
   g_enable_visual_tuning = (env_visual == nullptr || atoi(env_visual) != 0);
 
@@ -1061,6 +1329,24 @@ int main() {
 
   const char* env_config = getenv("USE_ROI_CONFIG");
   g_use_roi_config = (env_config == nullptr || atoi(env_config) != 0);
+
+  const char* env_skip = getenv("SKIP_BOOTSTRAP");
+  g_skip_bootstrap = (env_skip != nullptr && atoi(env_skip) != 0);
+
+  // v2.3: CameraPage HTTP 后端 (嵌入式, 单进程)
+  // 默认开, 设 STITCH_HTTP=0 关闭 (调试时方便)
+  const char* env_http = getenv("STITCH_HTTP");
+  bool enable_http = (env_http == nullptr) || (atoi(env_http) != 0);
+  if (enable_http) {
+    http_server::Config hcfg;
+    hcfg.port = 8080;
+    const char* env_port = getenv("STITCH_HTTP_PORT");
+    if (env_port) hcfg.port = atoi(env_port);
+    hcfg.camera_page_dir = "../CameraPage";  // 相对 CWD
+    http_server::start(hcfg);
+  } else {
+    Logger::GetInstance().Log("[main] HTTP server disabled (STITCH_HTTP=0)");
+  }
 
   App app;
   app.run_stitching();

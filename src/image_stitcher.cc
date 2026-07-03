@@ -298,9 +298,9 @@ void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& o
         return mem;
     };
     
-    std::vector<cl_mem> cl_in(4, nullptr);
-    for(int i=0; i<4; ++i) {
-        if (i >= static_cast<int>(blend_input.size())) continue;
+    std::vector<cl_mem> cl_in(tasks_.size(), nullptr);
+    for(size_t i = 0; i < tasks_.size(); ++i) {
+        if (i >= blend_input.size()) continue;
         if(blend_input[i].empty() || !tasks_[i].enabled) continue;
         int w = blend_input[i].stride_w > 0 ? blend_input[i].stride_w : blend_input[i].width;
         int h = blend_input[i].stride_h > 0 ? blend_input[i].stride_h : blend_input[i].height;
@@ -375,17 +375,34 @@ void ImageStitcher::BlendSeams(const std::vector<NV12Frame>& input, NV12Frame& o
         clEnqueueNDRangeKernel(cl_queue_, cl_kern_blend_v_, 2, nullptr, global_work_size, nullptr, 0, nullptr, nullptr);
     };
 
-    // 执行纵向 0+1 与 2+3
-    int v_h1 = RotatedHeight(tasks_[0]);
-    int v_h2 = RotatedHeight(tasks_[2]);
-    dispatch_seam(0, 1, tasks_[1].dst_x, tasks_[0].dst_y, blend_width_, v_h1, 1);
-    dispatch_seam(2, 3, tasks_[3].dst_x, tasks_[2].dst_y, blend_width_, v_h2, 1);
-    
-    // 执行横向 0+2 与 1+3 (会覆盖中心十字交叉区)
-    int h_w1 = RotatedWidth(tasks_[0]);
-    int h_w2 = RotatedWidth(tasks_[1]);
-    dispatch_seam(0, 2, tasks_[0].dst_x, tasks_[2].dst_y, h_w1, blend_width_, 0);
-    dispatch_seam(1, 3, tasks_[1].dst_x, tasks_[3].dst_y, h_w2, blend_width_, 0);
+    // v2.3: 邻接接缝 dispatch, 兼容 2x2 (4 路) 和 2x3 (6 路) 布局.
+    // 2x3 邻接对 (7 个): 水平 (0,1), (2,3), (4,5); 垂直 (0,2), (1,3), (2,4), (3,5).
+    // 2x2 邻接对 (4 个): 水平 (0,1), (2,3); 垂直 (0,2), (1,3).
+    // 兼容策略: 按 task 数自动选 4 对或 7 对.
+    const size_t n = tasks_.size();
+    if (n == 6) {
+      // 2x3: 3 水平 + 4 垂直
+      // 水平 (左右 cam 拼接)
+      dispatch_seam(0, 1, tasks_[1].dst_x, tasks_[0].dst_y, blend_width_, RotatedHeight(tasks_[0]), 1);
+      dispatch_seam(2, 3, tasks_[3].dst_x, tasks_[2].dst_y, blend_width_, RotatedHeight(tasks_[2]), 1);
+      dispatch_seam(4, 5, tasks_[5].dst_x, tasks_[4].dst_y, blend_width_, RotatedHeight(tasks_[4]), 1);
+      // 垂直 (上下 cam 拼接)
+      dispatch_seam(0, 2, tasks_[0].dst_x, tasks_[2].dst_y, RotatedWidth(tasks_[0]), blend_width_, 0);
+      dispatch_seam(1, 3, tasks_[1].dst_x, tasks_[3].dst_y, RotatedWidth(tasks_[1]), blend_width_, 0);
+      dispatch_seam(2, 4, tasks_[2].dst_x, tasks_[4].dst_y, RotatedWidth(tasks_[2]), blend_width_, 0);
+      dispatch_seam(3, 5, tasks_[3].dst_x, tasks_[5].dst_y, RotatedWidth(tasks_[3]), blend_width_, 0);
+    } else {
+      // 2x2: 2 水平 + 2 垂直 (原版逻辑)
+      int v_h1 = RotatedHeight(tasks_[0]);
+      int v_h2 = RotatedHeight(tasks_[2]);
+      dispatch_seam(0, 1, tasks_[1].dst_x, tasks_[0].dst_y, blend_width_, v_h1, 1);
+      dispatch_seam(2, 3, tasks_[3].dst_x, tasks_[2].dst_y, blend_width_, v_h2, 1);
+
+      int h_w1 = RotatedWidth(tasks_[0]);
+      int h_w2 = RotatedWidth(tasks_[1]);
+      dispatch_seam(0, 2, tasks_[0].dst_x, tasks_[2].dst_y, h_w1, blend_width_, 0);
+      dispatch_seam(1, 3, tasks_[1].dst_x, tasks_[3].dst_y, h_w2, blend_width_, 0);
+    }
 
     clFinish(cl_queue_);
 }

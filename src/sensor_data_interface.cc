@@ -8,6 +8,14 @@
  * @brief 传感器数据接口实现
  * 负责多路视频流的获取、FFmpeg硬件解码和帧队列管理
  * 支持RK硬件解码(rkmpp)和DRM_PRIME缓冲区输出
+ *
+ * ⚠️ 架构硬约束 (2026-07-02 锁定):
+ *   - 6 路 4K 拼接要求 30 FPS 端到端, 软件解码 (mpeg4 sw) 性能远不够
+ *   - 整条管线必须是 硬件解码 (rkmpp) + DMA-BUF 零拷贝
+ *   - 收到 sw 帧 (AV_PIX_FMT_YUV420P) 必须直接 reject + 报错, 不能 fallback
+ *   - 当前 sw fallback 已被业务侧明确拒绝 (见 CLAUDE.md 架构硬约束节)
+ *   - 任何"暂时 sw 解码跑一下看效果"的提案都不应合入
+ */
 
 AvErrorToString() - FFmpeg错误代码转换为可读字符串
 IsHardwarePixelFormat() - 判断像素格式是否为硬件加速格式
@@ -334,7 +342,8 @@ SensorDataInterface::~SensorDataInterface() {
 void SensorDataInterface::InitExampleImages() {}
 
 // v2: 输入源描述 (阶段 2 引入, 由 InitVideoCapture 填充).
-// 加载自 params/camera_sources.yaml, 不存在则 fallback 到原 t50..t53.mp4 列表.
+// 加载自 params/camera_sources.yaml, 不存在则 fallback 到原 t50..t53.mp4 列表 (4 路).
+// 阶段 4 改 6 路时, yaml 加 cam4/cam5 块 + LoadDefaultDatasetSources 加 t54/t55.mp4.
 // 阶段 3 才会用 kMipi 实际跑 V4L2 采集线程; 当前 kMipi 也 fallback 到 file
 // (仅日志告警, 不破坏数据集调试).
 static CameraSourceList g_camera_source_list;
@@ -343,59 +352,84 @@ const CameraSourceList& GetCameraSourceList() { return g_camera_source_list; }
 // 解析 params/camera_sources.yaml, 用 OpenCV FileStorage (项目已依赖).
 // 失败时 (文件不存在 / 解析错) 返回 false, 保持 g_camera_source_list 为空,
 // 触发 InitVideoCapture 的 fallback 逻辑 (与 v1 行为一致).
+// OpenCV 4.5.4 的 YAML 解析器在格式上比 libyaml 严, 任何 cv::Exception 都
+// 一律吞掉返回 false — 主流程 (InitVideoCapture) 只看返回值, 不应该被
+// yaml 格式问题 crash. 这与本函数注释"加载失败时 fallback"的契约一致.
 static bool LoadCameraSourceList(const std::string& path) {
-  cv::FileStorage fs(path, cv::FileStorage::READ);
-  if (!fs.isOpened()) {
-    return false;
-  }
-  cv::FileNode root = fs.root();
-  if (root.empty() || !root.isMap()) {
-    return false;
-  }
-  cv::FileNode cameras = root["cameras"];
-  if (cameras.empty() || !cameras.isSeq()) {
-    return false;
-  }
-  g_camera_source_list.cameras.clear();
-  for (cv::FileNodeIterator it = cameras.begin(); it != cameras.end(); ++it) {
-    cv::FileNode cam = *it;
-    CameraSource src;
-    std::string type_str;
-    cam["type"] >> type_str;
-    if (type_str == "mipi") {
-      src.type = CameraSource::Type::kMipi;
-    } else {
-      src.type = CameraSource::Type::kFile;
-    }
-    cam["uri"] >> src.uri;
-    cam["width"] >> src.width;
-    cam["height"] >> src.height;
-    cam["fps"] >> src.fps;
-    cam["pixel_format"] >> src.pixel_format;
-    if (src.uri.empty()) {
+  try {
+    cv::FileStorage fs(path, cv::FileStorage::READ);
+    if (!fs.isOpened()) {
       Logger::GetInstance().LogError(
-          "[sensor_data_interface] camera_sources.yaml: empty uri, skipped");
-      continue;
+          "[sensor_data_interface] camera_sources.yaml: cannot open '" + path +
+          "', fallback to default dataset");
+      return false;
     }
-    g_camera_source_list.cameras.push_back(src);
+    cv::FileNode root = fs.root();
+    if (root.empty() || !root.isMap()) {
+      Logger::GetInstance().LogError(
+          "[sensor_data_interface] camera_sources.yaml: empty root or not a map, fallback");
+      return false;
+    }
+    cv::FileNode cameras = root["cameras"];
+    if (cameras.empty() || !cameras.isSeq()) {
+      Logger::GetInstance().LogError(
+          "[sensor_data_interface] camera_sources.yaml: 'cameras' missing or not a seq, fallback");
+      return false;
+    }
+    g_camera_source_list.cameras.clear();
+    for (cv::FileNodeIterator it = cameras.begin(); it != cameras.end(); ++it) {
+      cv::FileNode cam = *it;
+      CameraSource src;
+      std::string type_str;
+      cam["type"] >> type_str;
+      if (type_str == "mipi") {
+        src.type = CameraSource::Type::kMipi;
+      } else {
+        src.type = CameraSource::Type::kFile;
+      }
+      cam["uri"] >> src.uri;
+      cam["width"] >> src.width;
+      cam["height"] >> src.height;
+      cam["fps"] >> src.fps;
+      cam["pixel_format"] >> src.pixel_format;
+      if (src.uri.empty()) {
+        Logger::GetInstance().LogError(
+            "[sensor_data_interface] camera_sources.yaml: empty uri, skipped");
+        continue;
+      }
+      g_camera_source_list.cameras.push_back(src);
+    }
+    if (root["sync_window_ms"].isInt()) {
+      root["sync_window_ms"] >> g_camera_source_list.sync_window_ms;
+    }
+    if (root["auto_calibrate"].isInt()) {
+      int v = 0;
+      root["auto_calibrate"] >> v;
+      g_camera_source_list.auto_calibrate = (v != 0);
+    }
+    return !g_camera_source_list.cameras.empty();
+  } catch (const cv::Exception& e) {
+    Logger::GetInstance().LogError(
+        "[sensor_data_interface] camera_sources.yaml: cv::Exception '" +
+        std::string(e.what()) + "', fallback to default dataset");
+    return false;
+  } catch (const std::exception& e) {
+    Logger::GetInstance().LogError(
+        "[sensor_data_interface] camera_sources.yaml: std::exception '" +
+        std::string(e.what()) + "', fallback to default dataset");
+    return false;
   }
-  if (root["sync_window_ms"].isInt()) {
-    root["sync_window_ms"] >> g_camera_source_list.sync_window_ms;
-  }
-  if (root["auto_calibrate"].isInt()) {
-    int v = 0;
-    root["auto_calibrate"] >> v;
-    g_camera_source_list.auto_calibrate = (v != 0);
-  }
-  return !g_camera_source_list.cameras.empty();
 }
 
-// 默认 4 路数据集 t50..t53.mp4 (v1 时代命名遗留, 实际是 2K 2560x1440).
-// 目录名 "4k-test" 不改以避免破坏路径书签; 实际内容是 2K.
+// 默认 6 路数据集 (v2.3 阶段: 2K 2560x1440, 2x3 布局).
+// 目录: datasets/2k-test/. 4K 源在 datasets/4k-test/, 用 tools/downscale_4k_to_2k.py 降下来.
+// 注: t40/t41 是临时占位 (我们没有真正的 6-camera-rig 视频), 后续用真实 6 路替换.
+// ⚠️ 真实项目应该用 6 个同一相机组的视频 (例如全 t50 编号); 阶段 6 真机跑通前需替换.
 static std::vector<CameraSource> LoadDefaultDatasetSources() {
-  const std::string video_dir = "../datasets/4k-test/";
+  const std::string video_dir = "../datasets/2k-test/";
   const std::vector<std::string> default_files = {
-      "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4"};
+      "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4",
+      "t40.mp4", "t41.mp4"};
   std::vector<CameraSource> sources;
   sources.reserve(default_files.size());
   for (const auto& f : default_files) {

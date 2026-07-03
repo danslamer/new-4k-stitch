@@ -7,9 +7,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(ENABLE_RK_HARDWARE_DECODING "Enable FFmpeg Rockchip hardware decoding" ON)
 option(ENABLE_RGA_DMA_STITCHING "Enable the in-progress DMA-BUF/RGA stitch backend" ON)
 
-set(FFMPEG_ROOT "$ENV{HOME}/dev/ffmpeg60")
-set(ENV{PKG_CONFIG_PATH} "${FFMPEG_ROOT}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
-set(ENV{LD_LIBRARY_PATH} "${FFMPEG_ROOT}/lib:$ENV{LD_LIBRARY_PATH}")
+# FFmpeg 路径 (ffmpeg-rockchip 安装位置).
+# 默认是 Debian/Ubuntu 多架构布局 (--prefix=/usr 安装后的位置).
+# 若 ffmpeg 装到非标准路径, 用 -DFFMPEG_LIB_DIR=/path/to/lib 覆盖.
+# 例: ffmpeg-rockchip-master 用 --prefix=/usr 装完后, .so 在 /usr/lib/aarch64-linux-gnu/ 下.
+set(FFMPEG_LIB_DIR "/usr/lib/aarch64-linux-gnu" CACHE PATH
+    "FFmpeg library directory (multiarch layout from ffmpeg-rockchip --prefix=/usr)")
+set(ENV{PKG_CONFIG_PATH} "${FFMPEG_LIB_DIR}/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+set(ENV{LD_LIBRARY_PATH} "${FFMPEG_LIB_DIR}:$ENV{LD_LIBRARY_PATH}")
 
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs videoio features2d stitching)
 find_package(Threads REQUIRED)
@@ -17,6 +22,25 @@ find_package(PkgConfig REQUIRED)
 # 增加 OpenCL 查找
 find_package(OpenCL REQUIRED)
 pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+
+# v2.3 阶段 2: cpp-httplib HTTP server (vendor 进 third_party, header-only)
+# 准备: 板端跑 curl 拉取 (网络不通 GitHub, 用 gh-proxy 镜像)
+#   mkdir -p third_party/cpp-httplib
+#   curl -L 'https://gh-proxy.com/https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h' -o third_party/cpp-httplib/httplib.h
+# 注: cpp-httplib 自 v0.x 起就 header-only, 不需要 .cpp 文件
+set(CPPHTTPLIB_DIR ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib)
+if(EXISTS ${CPPHTTPLIB_DIR}/httplib.h)
+    message(STATUS "[cmake] Using vendored cpp-httplib at ${CPPHTTPLIB_DIR}/httplib.h (header-only)")
+    add_library(httplib INTERFACE)
+    target_include_directories(httplib INTERFACE ${CPPHTTPLIB_DIR})
+    target_compile_definitions(httplib INTERFACE CPPHTTPLIB_THREAD_POOL=1)
+    add_library(httplib::httplib ALIAS httplib)
+else()
+    message(WARNING "[cmake] cpp-httplib not found at ${CPPHTTPLIB_DIR}, HTTP server will be disabled")
+    add_library(httplib_dummy INTERFACE)
+    target_compile_definitions(httplib_dummy INTERFACE IMAGE_STITCHING_NO_HTTP=1)
+    add_library(httplib::httplib ALIAS httplib_dummy)
+endif()
 
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
@@ -49,6 +73,10 @@ add_executable(${PROJECT_NAME}
     include/roi_config.h
     src/roi_visualizer.cc
     include/roi_visualizer.h
+    src/status_writer.cc
+    include/status_writer.h
+    src/http_server.cc
+    include/http_server.h
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -70,6 +98,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GBM
     PkgConfig::SDL2
     OpenCL::OpenCL
+    httplib::httplib  # v2.3: HTTP server (如果 vendor 没拉下来, 用 dummy stub)
 )
 
 if(ENABLE_RK_HARDWARE_DECODING)

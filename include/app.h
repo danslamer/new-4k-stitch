@@ -25,12 +25,21 @@ struct CachedOverlap {
     int h23_overlap = 0;
     int h23_shift_y = 0;
     double h23_score = 0.0;
+    int h45_overlap = 0;
+    int h45_shift_y = 0;
+    double h45_score = 0.0;
     int v02_overlap = 0;
     int v02_shift_y = 0;
     double v02_score = 0.0;
     int v13_overlap = 0;
     int v13_shift_y = 0;
     double v13_score = 0.0;
+    int v24_overlap = 0;
+    int v24_shift_y = 0;
+    double v24_score = 0.0;
+    int v35_overlap = 0;
+    int v35_shift_y = 0;
+    double v35_score = 0.0;
     double confidence = 0.0;
 };
 

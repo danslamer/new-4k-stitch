@@ -11,15 +11,15 @@ struct RoiOffset {
 };
 
 struct StitchGlobalConfig {
-    RoiOffset roi_offsets[4];
-    
+    RoiOffset roi_offsets[6];
+
     int feather_width = 120;
     double feather_strength = 2.0;
     bool feather_enabled = true;
-    
+
     bool save_enabled = false;
     int save_interval = 30;
-    
+
     int step_size = 1;
     std::string mode = "dataset";
     int selected_cam = 1;

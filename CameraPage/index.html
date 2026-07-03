@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>江苏攸洋智控管理平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+      <div class="sidebar-logo">
+        <div class="logo-icon" aria-label="平台图标"></div>
+        <span class="logo-text">江苏攸洋智控管理平台</span>
+      </div>
+      <nav class="sidebar-nav">
+        <div class="nav-item active" data-page="home">
+          <span class="nav-icon">📹</span>
+          <span>图像输出</span>
+        </div>
+        <div class="nav-item" data-page="network">
+          <span class="nav-icon">🌐</span>
+          <span>网络配置</span>
+        </div>
+        <div class="nav-item" data-page="algorithm">
+          <span class="nav-icon">🧠</span>
+          <span>算法管理</span>
+        </div>
+        <div class="nav-item" data-page="devices">
+          <span class="nav-icon">📡</span>
+          <span>设备管理</span>
+        </div>
+      </nav>
+      <div class="sidebar-footer">V1.0.0 · 攸洋智控</div>
+    </aside>
+
+    <!-- 主区域 -->
+    <div class="main-area">
+      <header class="top-header">
+        <div class="breadcrumb">
+          <span>攸洋智控</span>
+          <span class="sep">/</span>
+          <span class="current" id="breadcrumb-current">图像输出</span>
+        </div>
+        <div class="header-actions">
+          <div class="header-status">
+            <span class="status-dot"></span>
+            <span id="header-device-name">入口枪机-本机 · 192.168.1.10</span>
+          </div>
+          <div class="user-info">
+            <div class="user-avatar">A</div>
+            <span>admin</span>
+          </div>
+        </div>
+      </header>
+
+      <div class="content-wrapper">
+
+        <!-- ========== 1. 首页 - 图像输出 ========== -->
+        <div class="page-panel active" id="page-home">
+          <div class="home-layout">
+            <div class="home-main">
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <div class="card-header-left">
+                    <span class="card-title">实时预览</span>
+                    <span class="preview-device-tag" id="preview-device-name">入口枪机-本机</span>
+                    <button class="btn btn-default btn-sm preview-back-local hidden" id="btn-back-local" type="button">返回本机</button>
+                  </div>
+                  <div class="btn-group">
+                    <button class="btn btn-default btn-sm" id="btn-snapshot">抓图</button>
+                    <button class="btn btn-default btn-sm" id="btn-fullscreen">全屏</button>
+                  </div>
+                </div>
+                <div class="card-body preview-body">
+                  <div class="video-preview-area" id="video-preview">
+                    <div class="preview-bg"></div>
+                    <div class="preview-placeholder">
+                      <div class="preview-icon">▶</div>
+                      <span>主码流预览 · 1920×1080 @ 25fps</span>
+                    </div>
+                    <div class="video-overlay-info" id="overlay-time">2026-07-01 00:00:00</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 算法文字结果输出（最多 6 路） -->
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title">上传算法</span>
+                  <div class="header-meta">
+                    <span class="badge-live"><span class="badge-dot"></span>实时</span>
+                    <span class="text-muted" id="algo-output-count">已加载 0/6</span>
+                    <button class="btn btn-primary btn-sm" id="btn-goto-algo">管理算法</button>
+                  </div>
+                </div>
+                <div class="card-body algo-output-body">
+                  <table class="data-table algo-result-table">
+                    <thead>
+                      <tr>
+                        <th style="width:22%">算法</th>
+                        <th style="width:39%">识别结果</th>
+                        <th style="width:39%">定位结果</th>
+                      </tr>
+                    </thead>
+                    <tbody id="home-algo-result-body">
+                      <!-- JS 渲染 -->
+                    </tbody>
+                  </table>
+                  <div class="algo-output-empty" id="home-algo-empty">
+                    <span class="empty-icon">📋</span>
+                    <p>暂无已启用的算法，请前往「算法管理」启用（最多 6 个）</p>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title">码流配置</span>
+                </div>
+                <div class="card-body">
+                  <div class="stream-tabs">
+                    <div class="stream-tab active" data-stream="main">主码流</div>
+                    <div class="stream-tab" data-stream="sub">子码流</div>
+                    <div class="stream-tab" data-stream="third">第三码流</div>
+                  </div>
+                  <div class="form-grid" id="stream-config-form">
+                    <div class="form-item">
+                      <label class="form-label required">视频编码</label>
+                      <select class="form-control" id="cfg-encoding">
+                        <option value="H.265">H.265</option>
+                        <option value="H.264">H.264</option>
+                        <option value="MJPEG">MJPEG</option>
+                      </select>
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">分辨率</label>
+                      <select class="form-control" id="cfg-resolution">
+                        <option value="3840x2160">3840×2160 (4K)</option>
+                        <option value="2560x1440">2560×1440 (2K)</option>
+                        <option value="1920x1080" selected>1920×1080 (1080P)</option>
+                        <option value="1280x720">1280×720 (720P)</option>
+                        <option value="704x576">704×576 (D1)</option>
+                      </select>
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">帧率 (fps)</label>
+                      <select class="form-control" id="cfg-fps">
+                        <option value="30">30</option>
+                        <option value="25" selected>25</option>
+                        <option value="20">20</option>
+                        <option value="15">15</option>
+                        <option value="10">10</option>
+                        <option value="1">1</option>
+                      </select>
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">码率类型</label>
+                      <select class="form-control" id="cfg-bitrate-type">
+                        <option value="CBR">定码率 (CBR)</option>
+                        <option value="VBR">变码率 (VBR)</option>
+                      </select>
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">码率上限 (Kbps)</label>
+                      <input type="number" class="form-control" id="cfg-bitrate" value="4096" min="256" max="16384" step="256">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">I帧间隔</label>
+                      <input type="number" class="form-control" id="cfg-iframe" value="50" min="1" max="400">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">图像质量</label>
+                      <select class="form-control" id="cfg-quality">
+                        <option value="high">高</option>
+                        <option value="medium" selected>中</option>
+                        <option value="low">低</option>
+                      </select>
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">Smart264/265</label>
+                      <label class="switch">
+                        <input type="checkbox" id="cfg-smart" checked>
+                        <span class="switch-slider"></span>
+                      </label>
+                    </div>
+                  </div>
+                  <div class="form-actions">
+                    <button class="btn btn-primary" id="btn-save-stream">保存配置</button>
+                    <button class="btn btn-default" id="btn-reset-stream">恢复默认</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右侧实时参数 -->
+            <div class="home-sidebar">
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title">实时输出参数</span>
+                </div>
+                <div class="card-body">
+                  <div class="param-list compact" id="live-params">
+                    <div class="param-row">
+                      <span class="param-name">当前码流</span>
+                      <span class="param-value highlight" id="live-stream-type">主码流</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">分辨率</span>
+                      <span class="param-value" id="live-resolution">1920×1080</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">帧率</span>
+                      <span class="param-value" id="live-fps">25 fps</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">实时码率</span>
+                      <span class="param-value highlight" id="live-bitrate">3842 Kbps</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">编码格式</span>
+                      <span class="param-value" id="live-encoding">H.265</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">码率类型</span>
+                      <span class="param-value" id="live-bitrate-type">CBR</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">I帧间隔</span>
+                      <span class="param-value" id="live-iframe">50</span>
+                    </div>
+                    <div class="param-row">
+                      <span class="param-name">丢帧率</span>
+                      <span class="param-value" id="live-drop">0.0%</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title" id="rtsp-panel-title">本机 RTSP 输出</span>
+                </div>
+                <div class="card-body">
+                  <div class="rtsp-panel">
+                    <div class="rtsp-panel-item">
+                      <div class="rtsp-panel-label" id="rtsp-main-label">主码流</div>
+                      <div class="rtsp-url-block">
+                        <code id="preview-rtsp-main">rtsp://192.168.1.10:554/Streaming/Channels/101</code>
+                        <button class="copy-btn" data-copy="preview-rtsp-main">复制</button>
+                      </div>
+                    </div>
+                    <div class="rtsp-panel-item" id="rtsp-sub-row">
+                      <div class="rtsp-panel-label">子码流</div>
+                      <div class="rtsp-url-block">
+                        <code id="preview-rtsp-sub">rtsp://192.168.1.10:554/Streaming/Channels/102</code>
+                        <button class="copy-btn" data-copy="preview-rtsp-sub">复制</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ========== 2. 网络配置 ========== -->
+        <div class="page-panel" id="page-network">
+          <div class="network-layout">
+            <div class="network-left">
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title">TCP/IP 配置</span>
+                </div>
+                <div class="card-body">
+                  <div class="form-item dhcp-row">
+                    <label class="form-label">自动获取 IP</label>
+                    <label class="switch">
+                      <input type="checkbox" id="net-dhcp">
+                      <span class="switch-slider"></span>
+                    </label>
+                    <span class="form-hint inline-hint">开启后通过 DHCP 自动分配网络参数</span>
+                  </div>
+
+                  <div class="form-grid" id="network-form">
+                    <div class="form-item">
+                      <label class="form-label required">设备名称</label>
+                      <input type="text" class="form-control" id="net-device-name" value="入口枪机-本机">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">设备 IP 地址</label>
+                      <input type="text" class="form-control" id="net-ip" value="192.168.1.10">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">子网掩码</label>
+                      <input type="text" class="form-control" id="net-mask" value="255.255.255.0">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">默认网关</label>
+                      <input type="text" class="form-control" id="net-gateway" value="192.168.1.1">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">MAC 地址</label>
+                      <input type="text" class="form-control" id="net-mac" value="AC:CB:51:12:34:56" disabled>
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label required">首选 DNS</label>
+                      <input type="text" class="form-control" id="net-dns1" value="114.114.114.114">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">备用 DNS</label>
+                      <input type="text" class="form-control" id="net-dns2" value="8.8.8.8">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">MTU</label>
+                      <input type="number" class="form-control" id="net-mtu" value="1500" min="576" max="1500">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">HTTP 端口</label>
+                      <input type="number" class="form-control" id="net-http-port" value="80">
+                    </div>
+                    <div class="form-item">
+                      <label class="form-label">RTSP 端口</label>
+                      <input type="number" class="form-control" id="net-rtsp-port" value="554">
+                    </div>
+                  </div>
+
+                  <div class="form-actions form-actions-right">
+                    <button class="btn btn-primary" id="btn-save-network">保存</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title">网络诊断</span>
+                </div>
+                <div class="card-body">
+                  <div class="form-grid cols-1">
+                    <div class="form-item">
+                      <label class="form-label">Ping 目标</label>
+                      <input type="text" class="form-control" id="ping-target" value="192.168.1.1" placeholder="输入 IP 地址">
+                      <button class="btn btn-primary btn-sm" id="btn-ping">开始诊断</button>
+                    </div>
+                  </div>
+                  <div class="ping-result-box" id="ping-result">
+                    点击「开始诊断」测试网络连通性...
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 网络输出面板 -->
+            <div class="network-right">
+              <div class="card card-elevated">
+                <div class="card-header">
+                  <span class="card-title">网络输出</span>
+                  <span class="badge-live"><span class="badge-dot"></span>监测中</span>
+                </div>
+                <div class="card-body">
+                  <div class="bandwidth-gauges">
+                    <div class="gauge-item">
+                      <div class="gauge-ring upload">
+                        <svg viewBox="0 0 100 100">
+                          <circle class="gauge-bg" cx="50" cy="50" r="42"/>
+                          <circle class="gauge-fill" id="gauge-upload" cx="50" cy="50" r="42"/>
+                        </svg>
+                        <div class="gauge-center">
+                          <span class="gauge-value" id="net-upload">3.8</span>
+                          <span class="gauge-unit">Mbps ↑</span>
+                        </div>
+                      </div>
+                      <span class="gauge-label">上行带宽</span>
+                    </div>
+                    <div class="gauge-item">
+                      <div class="gauge-ring download">
+                        <svg viewBox="0 0 100 100">
+                          <circle class="gauge-bg" cx="50" cy="50" r="42"/>
+                          <circle class="gauge-fill" id="gauge-download" cx="50" cy="50" r="42"/>
+                        </svg>
+                        <div class="gauge-center">
+                          <span class="gauge-value" id="net-download">12.6</span>
+                          <span class="gauge-unit">Mbps ↓</span>
+                        </div>
+                      </div>
+                      <span class="gauge-label">下行带宽</span>
+                    </div>
+                  </div>
+
+                  <div class="net-stats-grid">
+                    <div class="net-stat-item">
+                      <span class="net-stat-label">视频码流占用</span>
+                      <span class="net-stat-value highlight" id="net-stream-bw">4.1 Mbps</span>
+                    </div>
+                    <div class="net-stat-item">
+                      <span class="net-stat-label">网络延迟</span>
+                      <span class="net-stat-value" id="net-latency">2 ms</span>
+                    </div>
+                    <div class="net-stat-item">
+                      <span class="net-stat-label">丢包率</span>
+                      <span class="net-stat-value success" id="net-loss">0.0%</span>
+                    </div>
+                    <div class="net-stat-item">
+                      <span class="net-stat-label">链路状态</span>
+                      <span class="net-stat-value success" id="net-link">通畅</span>
+                    </div>
+                    <div class="net-stat-item">
+                      <span class="net-stat-label">带宽利用率</span>
+                      <span class="net-stat-value" id="net-util">38%</span>
+                    </div>
+                    <div class="net-stat-item">
+                      <span class="net-stat-label">累计流量</span>
+                      <span class="net-stat-value" id="net-total-traffic">2.4 GB</span>
+                    </div>
+                  </div>
+
+                  <div class="chart-section">
+                    <div class="chart-header">
+                      <span>带宽趋势 (近 60 秒)</span>
+                    </div>
+                    <canvas id="bandwidth-chart" height="120"></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ========== 3. 算法管理 ========== -->
+        <div class="page-panel" id="page-algorithm">
+          <div class="stat-cards">
+            <div class="stat-card">
+              <div class="stat-icon blue">🧠</div>
+              <div class="stat-info">
+                <div class="stat-label">已启用算法</div>
+                <div class="stat-num" id="algo-enabled-count">3/6</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon green">✓</div>
+              <div class="stat-info">
+                <div class="stat-label">运行中</div>
+                <div class="stat-num" id="algo-running-count">2</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon orange">⚡</div>
+              <div class="stat-info">
+                <div class="stat-label">NPU 占用率</div>
+                <div class="stat-num" id="algo-npu">45%</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon red">📊</div>
+              <div class="stat-info">
+                <div class="stat-label">今日识别次数</div>
+                <div class="stat-num" id="algo-today">1,286</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card card-elevated">
+            <div class="card-header">
+              <span class="card-title">算法列表</span>
+              <div class="header-meta">
+                <span class="text-muted" id="algo-list-count">已添加 6/6 个</span>
+                <span class="text-muted">最多同时启用 6 个 · 点击查看图像效果</span>
+                <button class="btn btn-primary btn-sm" id="btn-add-algo">添加算法</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="algo-grid" id="algo-grid">
+                <!-- 由 JS 渲染 -->
+              </div>
+              <div class="algo-output-empty" id="algo-list-empty">
+                <span class="empty-icon">🧠</span>
+                <p>暂无算法，点击「添加算法」上传（最多 6 个）</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ========== 4. 设备管理 ========== -->
+        <div class="page-panel" id="page-devices">
+          <div class="stat-cards">
+            <div class="stat-card">
+              <div class="stat-icon blue">📡</div>
+              <div class="stat-info">
+                <div class="stat-label">接入设备总数</div>
+                <div class="stat-num" id="dev-total">5</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon green">●</div>
+              <div class="stat-info">
+                <div class="stat-label">在线设备</div>
+                <div class="stat-num" id="dev-online">4</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon orange">📹</div>
+              <div class="stat-info">
+                <div class="stat-label">视频流输出</div>
+                <div class="stat-num" id="dev-streams">4</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon red">○</div>
+              <div class="stat-info">
+                <div class="stat-label">离线设备</div>
+                <div class="stat-num" id="dev-offline">1</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">设备列表</span>
+              <div class="btn-group">
+                <button class="btn btn-primary btn-sm" id="btn-add-device">添加设备</button>
+                <button class="btn btn-default btn-sm" id="btn-discover-device">自动发现</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-toolbar">
+                <div class="table-search">
+                  <input type="text" class="form-control" id="dev-search" placeholder="搜索设备名称或 IP">
+                  <select class="form-control" id="dev-filter-type" style="width: 140px;">
+                    <option value="">全部类型</option>
+                    <option value="camera">网络摄像机</option>
+                    <option value="nvr">NVR</option>
+                    <option value="ipc">IPC</option>
+                    <option value="other">其他</option>
+                  </select>
+                </div>
+              </div>
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th><input type="checkbox" id="dev-check-all"></th>
+                    <th>设备名称</th>
+                    <th>设备类型</th>
+                    <th>IP 地址</th>
+                    <th>协议</th>
+                    <th>RTSP 视频流地址</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="device-table-body">
+                  <!-- 由 JS 渲染 -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- 添加设备弹窗 -->
+  <div class="modal-overlay" id="modal-add-device">
+    <div class="modal">
+      <div class="modal-header">
+        <span>添加外部设备</span>
+        <button class="modal-close" data-close="modal-add-device">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid cols-1">
+          <div class="form-item">
+            <label class="form-label required">设备名称</label>
+            <input type="text" class="form-control" id="add-dev-name" placeholder="如：会议室相机-01">
+          </div>
+          <div class="form-item">
+            <label class="form-label required">设备类型</label>
+            <select class="form-control" id="add-dev-type">
+              <option value="camera">网络摄像机 (IPC)</option>
+              <option value="nvr">网络硬盘录像机 (NVR)</option>
+              <option value="other">其他视频源</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label class="form-label required">IP 地址</label>
+            <input type="text" class="form-control" id="add-dev-ip" placeholder="192.168.1.11">
+            <span class="form-hint">IP 范围：192.168.1.1 ~ 192.168.1.100</span>
+          </div>
+          <div class="form-item">
+            <label class="form-label">端口</label>
+            <input type="number" class="form-control" id="add-dev-port" value="554">
+          </div>
+          <div class="form-item">
+            <label class="form-label required">协议</label>
+            <select class="form-control" id="add-dev-protocol">
+              <option value="RTSP">RTSP</option>
+              <option value="ONVIF">ONVIF</option>
+              <option value="GB28181">GB28181</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label class="form-label">用户名</label>
+            <input type="text" class="form-control" id="add-dev-user" value="admin">
+          </div>
+          <div class="form-item">
+            <label class="form-label">密码</label>
+            <input type="password" class="form-control" id="add-dev-pass" placeholder="设备登录密码">
+          </div>
+          <div class="form-item full-width">
+            <label class="form-label">RTSP 地址</label>
+            <input type="text" class="form-control" id="add-dev-rtsp" placeholder="rtsp://192.168.1.100:554/Streaming/Channels/101" style="max-width: 100%;">
+            <p class="form-hint" style="margin-left: 132px;">留空将根据 IP 和协议自动生成 RTSP 地址</p>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-default" data-close="modal-add-device">取消</button>
+        <button class="btn btn-primary" id="btn-confirm-add-device">确定添加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 添加算法弹窗 -->
+  <div class="modal-overlay" id="modal-add-algo">
+    <div class="modal">
+      <div class="modal-header">
+        <span>上传算法</span>
+        <button class="modal-close" data-close="modal-add-algo">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid cols-1">
+          <div class="form-item">
+            <label class="form-label required">算法名称</label>
+            <input type="text" class="form-control" id="add-algo-name" placeholder="如：烟火检测">
+          </div>
+          <div class="form-item">
+            <label class="form-label">算法描述</label>
+            <input type="text" class="form-control" id="add-algo-desc" placeholder="简要描述算法用途">
+          </div>
+          <div class="form-item">
+            <label class="form-label">版本号</label>
+            <input type="text" class="form-control" id="add-algo-version" value="v1.0.0">
+          </div>
+          <div class="form-item full-width">
+            <label class="form-label">算法包</label>
+            <input type="file" class="form-control" id="add-algo-file" accept=".bin,.model,.zip,.tar,.gz" style="max-width:100%;padding:4px;">
+            <p class="form-hint" style="margin-left:132px;">支持 .bin / .model / .zip 等格式（演示模式可选）</p>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-default" data-close="modal-add-algo">取消</button>
+        <button class="btn btn-primary" id="btn-confirm-add-algo">确定添加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 算法效果预览弹窗 -->
+  <div class="modal-overlay" id="modal-algo-preview">
+    <div class="modal modal-lg modal-algo-preview-dialog">
+      <div class="modal-header">
+        <span id="modal-preview-title">算法效果预览</span>
+        <button class="modal-close" data-close="modal-algo-preview">&times;</button>
+      </div>
+      <div class="modal-body modal-preview-body">
+        <div class="modal-preview-left">
+          <div class="preview-scene video-preview-area modal-preview-video" id="algo-preview-scene">
+            <div class="preview-bg"></div>
+            <canvas id="algo-preview-canvas"></canvas>
+          </div>
+        </div>
+        <div class="preview-info-panel" id="algo-preview-info">
+          <!-- JS 动态渲染 -->
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-default" data-close="modal-algo-preview">关闭</button>
+        <button class="btn btn-primary" id="btn-preview-config">参数配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 算法配置弹窗 -->
+  <div class="modal-overlay" id="modal-algo-config">
+    <div class="modal">
+      <div class="modal-header">
+        <span id="modal-algo-title">算法配置</span>
+        <button class="modal-close" data-close="modal-algo-config">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-algo-body">
+        <!-- 动态内容 -->
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-default" data-close="modal-algo-config">取消</button>
+        <button class="btn btn-primary" id="btn-save-algo-config">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
