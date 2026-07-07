@@ -465,6 +465,30 @@ body {
   color: rgba(255, 255, 255, 0.65);
 }
 
+/* ===== 阶段 2: MJPEG panorama 实时预览 ===== */
+.video-preview-area .preview-stream {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  z-index: 2;
+  display: none;
+  background: transparent;
+}
+
+.video-preview-area.stream-active .preview-stream {
+  display: block;
+}
+
+.video-preview-area.stream-active .preview-placeholder {
+  display: none;
+}
+
+.video-preview-area.preview-offline .preview-stream {
+  display: none !important;
+}
+
 .card-body {
   padding: 22px;
 }

@@ -18,8 +18,11 @@
 
 #include "nv12_frame.h"
 
+#include "gst_mpp_decoder.h"
+
 extern "C" {
 struct AVFrame;
+struct _GstSample;
 }
 
 enum class QueuedFrameStorage {
@@ -58,7 +61,13 @@ struct CameraSourceList {
 
 struct QueuedFrame {
     QueuedFrameStorage storage = QueuedFrameStorage::kEmpty;
+    // 旧路径: FFmpeg AVFrame (DRM_PRIME 包装). 当前 dataset 路径已不再用, 保留给
+    // 极端 fallback. v2.4 (2026-07-06) 后默认走 gstreamer-rockchip path.
     std::shared_ptr<AVFrame> hardware_frame;
+    // 新路径: gstreamer GstSample (DMA-BUF backed buffer, 零拷贝). 一帧解码完
+    // 由 gst_mpp_decoder 持有, sample 析构时 gstreamer 自动还 buffer. dma_buf_fd
+    // 是 sample 中 GstBuffer 第一个 DMA-BUF 内存的 fd, 给 stitcher 直接 RGA 用.
+    std::shared_ptr<_GstSample> gst_sample;
     int width = 0;
     int height = 0;
     int stride_w = 0;
@@ -69,7 +78,7 @@ struct QueuedFrame {
 
     bool empty() const {
         if (storage == QueuedFrameStorage::kDrmPrime) {
-            return hardware_frame == nullptr;
+            return hardware_frame == nullptr && gst_sample == nullptr;
         }
         return true;
     }

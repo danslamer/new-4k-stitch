@@ -74,8 +74,13 @@
                   </div>
                 </div>
                 <div class="card-body preview-body">
-                  <div class="video-preview-area" id="video-preview">
+                  <div class="video-preview-area stream-active" id="video-preview">
                     <div class="preview-bg"></div>
+                    <img class="preview-stream" id="mjpeg-stream"
+                         src="/api/stream"
+                         alt="实时拼接全景"
+                         onload="onStreamLoad(this)"
+                         onerror="onStreamError(this)" />
                     <div class="preview-placeholder">
                       <div class="preview-icon">▶</div>
                       <span>主码流预览 · 1920×1080 @ 25fps</span>

@@ -247,6 +247,41 @@ setInterval(updateClock, 1000);
 updateClock();
 setInterval(updateLiveParams, 3000);
 
+// ========== 阶段 2: MJPEG panorama 实时预览接管 ==========
+// 浏览器原生 <img src="/api/stream"> 加载 multipart/x-mixed-replace.
+// 流建立 -> onload -> 加 .stream-active -> 隐藏 placeholder + 显示图.
+// 流断开 -> onerror -> 移除 .stream-active + 加 .preview-offline -> 回退到 placeholder.
+function onStreamLoad(img) {
+  if (!img) return;
+  const wrap = img.parentElement;
+  if (!wrap) return;
+  wrap.classList.add('stream-active');
+  wrap.classList.remove('preview-offline');
+}
+
+function onStreamError(img) {
+  if (!img) return;
+  const wrap = img.parentElement;
+  if (!wrap) return;
+  wrap.classList.remove('stream-active');
+  wrap.classList.add('preview-offline');
+}
+
+// 启动时主动连 (部分浏览器延迟到 layout 后才请求 src, 显式 kick 一下)
+const mjpegImg = document.getElementById('mjpeg-stream');
+if (mjpegImg && !mjpegImg.src) {
+  mjpegImg.src = '/api/stream';
+}
+
+// 切码流 / 切 RTSP 设备时, 重新触发 onload/onerror (避免 img cache 旧流).
+function reloadMjpegStream() {
+  const img = document.getElementById('mjpeg-stream');
+  if (!img) return;
+  const current = img.src;
+  img.src = '';
+  setTimeout(() => { img.src = current || '/api/stream'; }, 80);
+}
+
 // ========== 算法数据（最多 6 个） ==========
 
 const MAX_ALGORITHMS = 6;

@@ -1,6 +1,7 @@
 #include "app.h"
 #include "status_writer.h"
 #include "http_server.h"
+#include "mjpeg_streamer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -108,7 +109,44 @@ inline void CopyNv12DataToMat(const uint8_t* y_src, const uint8_t* uv_src, int w
 }
 
 cv::Mat ExportHardwareFrameToBgr(const NV12Frame& frame) {
-  if (frame.empty() || !frame.owner) {
+  if (frame.empty()) {
+    return cv::Mat();
+  }
+
+  // v2.4 (2026-07-06): gstreamer-rockchip 路径 (vendor 推荐), 走 RGA 把
+  // DMA-BUF NV12 直接转 BGR 落到 cv::Mat. 老的 FFmpeg rkmpp AVFrame 路径
+  // 保留作 fallback (理论上 2026-07 后不会再走到).
+  if (frame.owner_gst_sample != nullptr && frame.fd >= 0) {
+    const int w = frame.width;
+    const int h = frame.height;
+    if (w <= 0 || h <= 0) {
+      return cv::Mat();
+    }
+    cv::Mat bgr(h, w, CV_8UC3);
+
+    rga_info_t src_info;
+    memset(&src_info, 0, sizeof(src_info));
+    src_info.fd = frame.fd;
+    src_info.mmuFlag = 1;
+    const int src_stride = frame.stride_w > 0 ? frame.stride_w : w;
+    rga_set_rect(&src_info.rect, 0, 0, w, h, src_stride, h, RK_FORMAT_YCbCr_420_SP);
+
+    rga_info_t dst_info;
+    memset(&dst_info, 0, sizeof(dst_info));
+    dst_info.virAddr = bgr.data;
+    dst_info.mmuFlag = 1;
+    rga_set_rect(&dst_info.rect, 0, 0, w, h, w, h, RK_FORMAT_BGR_888);
+
+    if (c_RkRgaBlit(&src_info, &dst_info, nullptr) != 0) {
+      Logger::GetInstance().LogError(
+          "[ExportHardwareFrameToBgr] RGA NV12->BGR blit failed (gst path)");
+      return cv::Mat();
+    }
+    return bgr;
+  }
+
+  // 老 FFmpeg rkmpp AVFrame 路径, 保留作 fallback.
+  if (!frame.owner) {
     return cv::Mat();
   }
 
@@ -1114,8 +1152,26 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   Logger::GetInstance().Log("[App] Application starting...");
   Logger::GetInstance().Log(string("[App] Visual tuning: ") + (visual_mode_ ? "ENABLED" : "DISABLED (set ENABLE_VISUAL_TUNING=1 to enable)"));
 
+  // 阶段 2: MJPEG 推流参数 (CameraPage "实时预览" 用). MJPEG_INTERVAL=1 全速 30 FPS,
+  // MJPEG_INTERVAL=2 默认 15 FPS, MJPEG_INTERVAL=3 10 FPS (低功耗).
+  {
+    const char* env_int = getenv("MJPEG_INTERVAL");
+    if (env_int && atoi(env_int) > 0) mjpeg_interval_ = std::max(1, atoi(env_int));
+    const char* env_w = getenv("MJPEG_DOWNSCALE_W");
+    if (env_w && atoi(env_w) >= 64) mjpeg_width_ = NormalizeEvenFloor(atoi(env_w));
+    const char* env_h = getenv("MJPEG_DOWNSCALE_H");
+    if (env_h && atoi(env_h) >= 64) mjpeg_height_ = NormalizeEvenFloor(atoi(env_h));
+    const char* env_q = getenv("MJPEG_QUALITY");
+    if (env_q) {
+      int q = atoi(env_q);
+      mjpeg_quality_ = q < 10 ? 10 : (q > 95 ? 95 : q);
+    }
+  }
+
   // v2.3 阶段 1: 初始化 status writer (CameraPage 后端用, 独立线程 + 模拟数据)
   stitch_status::init();
+  // 阶段 2: 初始化 MJPEG producer/consumer 全局缓冲 (condvar + 1 slot 覆盖)
+  mjpeg_streamer::init();
 
   sensorDataInterface_.InitVideoCapture(num_img_);
   image_vector_.resize(num_img_);
@@ -1166,6 +1222,16 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   image_concat_.stride_w = static_cast<int>(output_drm_buf_.pitch);
   image_concat_.stride_h = height_;
 
+  // 阶段 2: 分配 MJPEG 降采样目标 DMA-BUF (小, 一次性, 全程复用).
+  if (drm_alloc_nv12(mjpeg_width_, mjpeg_height_, mjpeg_drm_buf_) != 0) {
+    Logger::GetInstance().LogError("[App] mjpeg_drm_buf_ alloc failed, MJPEG stream disabled");
+  } else {
+    Logger::GetInstance().Log(string("[App] MJPEG stream enabled: ") +
+        std::to_string(mjpeg_width_) + "x" + std::to_string(mjpeg_height_) +
+        " interval=" + std::to_string(mjpeg_interval_) +
+        " quality=" + std::to_string(mjpeg_quality_));
+  }
+
   if (visual_mode_) {
     Logger::GetInstance().Log("[App] Initializing visualizer with panorama size: " + 
                               std::to_string(total_cols_) + "x" + std::to_string(height_));
@@ -1182,6 +1248,8 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
 App::~App() {
   ReleaseSavedFrames();
   if (visual_mode_) RoiVisualizer::Shutdown();
+  mjpeg_streamer::shutdown();   // 阶段 2: 唤醒 wait 的 consumer, 清缓冲
+  drm_free(mjpeg_drm_buf_);     // 阶段 2
   drm_free(output_drm_buf_);
   stitch_status::shutdown();  // v2.3 阶段 1: 清理 status 文件
 }
@@ -1210,7 +1278,66 @@ App::~App() {
     if (g_config.feather_enabled) {
       image_stitcher_.BlendSeams(stitch_input, image_concat_);
     }
-    
+
+    // 阶段 2: CameraPage "实时预览" MJPEG 推流.
+    // gate: 每 mjpeg_interval_ 帧做一次降采样 + JPEG 编码, 推到 mjpeg_streamer 全局缓冲.
+    // 主线程做 imencode (~5-15ms @ 960x816 on RK3576 ARM). interval_=2 (15 FPS 默认)
+    // 留 ~16ms 给其他帧做 stitch, 不挤占 30 FPS 主预算.
+    // 注: 走 RGA NV12→NV12 降采样 (mmuFlag=1, 与现有 stitch RGA 同一 channel),
+    // 然后 drm_map + cv::cvtColor(NV12→BGR) + cv::imencode(".jpg").
+    if (!debug_mode_ &&
+        mjpeg_drm_buf_.fd >= 0 &&
+        (frame_idx % static_cast<size_t>(mjpeg_interval_)) == 0) {
+      rga_info_t src_info;
+      memset(&src_info, 0, sizeof(src_info));
+      src_info.fd = output_drm_buf_.fd;
+      src_info.mmuFlag = 1;
+      // 源 rect 用 panorama 实际尺寸 (运行时动态拿, 不硬编码 4800x4080)
+      const int src_w = output_drm_buf_.width;
+      const int src_h = output_drm_buf_.height;
+      const int src_stride_w = static_cast<int>(output_drm_buf_.pitch);
+      const int src_stride_h = src_h;
+      rga_set_rect(&src_info.rect, 0, 0, src_w, src_h, src_stride_w, src_stride_h,
+                   RK_FORMAT_YCbCr_420_SP);
+
+      rga_info_t dst_info;
+      memset(&dst_info, 0, sizeof(dst_info));
+      dst_info.fd = mjpeg_drm_buf_.fd;
+      dst_info.mmuFlag = 1;
+      // 目标 rect 用 mjpeg_width_/height_ (运行时动态, 默认 960x816)
+      const int dst_stride_w = static_cast<int>(mjpeg_drm_buf_.pitch);
+      const int dst_stride_h = mjpeg_height_;
+      rga_set_rect(&dst_info.rect, 0, 0, mjpeg_width_, mjpeg_height_,
+                   dst_stride_w, dst_stride_h, RK_FORMAT_YCbCr_420_SP);
+
+      // RGA 自动 stretch (源 4800x4080 -> 目标 960x816), 在 mmuFlag=1 下 DMA-BUF 间硬跳.
+      if (c_RkRgaBlit(&src_info, &dst_info, nullptr) == 0) {
+        void* mapped = drm_map(mjpeg_drm_buf_);
+        if (mapped != MAP_FAILED) {
+          const int y_rows = mjpeg_height_ * 3 / 2;
+          cv::Mat nv12_host(y_rows, mjpeg_width_, CV_8UC1);
+          const uint8_t* src_y = static_cast<const uint8_t*>(mapped);
+          const uint8_t* src_uv = src_y + static_cast<size_t>(dst_stride_w) * mjpeg_height_;
+          CopyNv12DataToMat(
+              src_y, src_uv,
+              mjpeg_width_, mjpeg_height_,
+              dst_stride_w, dst_stride_w,
+              nv12_host);
+
+          cv::Mat bgr_host;
+          cv::cvtColor(nv12_host, bgr_host, cv::COLOR_YUV2BGR_NV12);
+
+          std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, mjpeg_quality_};
+          std::vector<unsigned char> jpg_buf;
+          // drop frame 后 pjpeg bytestream 才 push, 避免 imencode 走完整 timeline
+          if (cv::imencode(".jpg", bgr_host, jpg_buf, params) && !jpg_buf.empty()) {
+            mjpeg_streamer::update(jpg_buf);
+          }
+          drm_unmap(mjpeg_drm_buf_, mapped);
+        }
+      }
+    }
+
     const double t2 = cv::getTickCount();
     double fps = 1.0 / ((t2 - t0) / cv::getTickFrequency());
 

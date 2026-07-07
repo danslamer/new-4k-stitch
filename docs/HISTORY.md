@@ -170,6 +170,13 @@ htop
 
 ### 6. SSH 连接
 
+> **rocktech 镜像网络模型 (2026-07-06 实测)**：
+> - **没有 `networking.service`**，ifupdown 包未装，`ifup` / `ifdown` 命令不存在
+> - **NetworkManager 是唯一的网络管家**（`active running`）
+> - `/etc/network/interfaces` **不被读**（无 service 调用 ifupdown），改它对网络无影响
+> - 反过来，改 `/etc/network/interfaces` 还会触发 NM ifupdown plugin 把那个接口标 `unmanaged`，导致 `nmcli con up` 报 "No suitable device found"
+> - **结论**：任何网络配置（改 IP、换网卡口）都走 `nmcli`，**不要**动 `/etc/network/interfaces` 和 `systemctl restart networking`
+
 两条路径，根据场景选其一：
 
 - **6.1 以太网 + ICS 共享**：工业现场稳定性最佳，不依赖 WiFi 信号
@@ -179,25 +186,40 @@ htop
 
 前提：PC 与板子用网线直连，PC 端以太网适配器开启 "Internet 连接共享 (ICS)"，共享后 PC 这端 IP 自动变为 `192.168.137.1`。
 
+**步骤**：在板子上用 `nmcli` 配 eth1 静态 IP（板端网络接口名按实际替换，当前板是 eth1）
+
 ```bash
-# === 在板子上配置静态 IP (网卡名按实际情况替换, Rockchip 板常见 end1/eth0) ===
-sudo vim /etc/network/interfaces
-# 按 i 进入插入模式，追加 (假设 PC ICS 端 IP 是 192.168.137.1)：
-auto eth0
-iface eth0 inet static
-    address 192.168.137.100
-    netmask 255.255.255.0
-    gateway 192.168.137.1
-    dns-nameservers 8.8.8.8 114.114.114.114
-# Esc -> :wq 保存退出
+# 1. 备份并清空 /etc/network/interfaces（避免 NM ifupdown plugin 误判）
+sudo cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%Y%m%d)
+sudo tee /etc/network/interfaces > /dev/null <<EOF
+# Managed by NetworkManager (this file is not read on this image)
+EOF
 
-# 重启网络（或直接 reboot）
-sudo systemctl restart networking
+# 2. 用 nmcli 配静态 IP
+sudo nmcli con add type ethernet ifname eth1 con-name "netplan-eth1" \
+    ipv4.method manual \
+    ipv4.addresses 192.168.137.100/24 \
+    ipv4.gateway 192.168.137.1 \
+    ipv4.dns "8.8.8.8 114.114.114.114" \
+    autoconnect yes
 
-# 验证链路
-ping 192.168.137.1        # PC 端
-ssh rocktech@192.168.137.100  # 从 PC 连入板子 (默认用户)
-# 如需 root 权限: sudo -i
+# 3. 重启 NM 让 ifupdown plugin 重新评估（关键：不重启接口仍 unmanaged）
+sudo systemctl restart NetworkManager
+sleep 3
+
+# 4. up connection
+sudo nmcli con up "netplan-eth1"
+
+# 5. 验证
+nmcli con show --active
+ip -4 addr show eth1 | grep inet
+ping 192.168.137.1   # PC 端
+```
+
+从 PC 连入：
+
+```bash
+ssh rocktech@192.168.137.100   # 默认用户, sudo -i 进 root
 ```
 
 #### 6.2 WiFi 连接（新开发板支持，推荐桌面开发）

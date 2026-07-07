@@ -1,10 +1,10 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## 入口说明 (重要)
 
-本文件是项目 Agent/Claude 入口，集中所有开发规范、迁移清单、调试开关和操作手册。**详细设计文档**在:
+本文件是项目 Agent/Codex 入口，集中所有开发规范、迁移清单、调试开关和操作手册。**详细设计文档**在:
 
 - [README.md](README.md) — 项目目标、Quick start、架构总览、环境变量
 - [docs/HISTORY.md](docs/HISTORY.md) — 完整设计迭代时间线、踩过的坑、v1/v2 决策依据、FFmpeg/EGL/SSH/性能调优操作手册
@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **Pipeline**: gstreamer1.0-rockchip1 mppvideodec (H.264/HEVC) → DMA-BUF 零拷贝 → RGA 裁剪/旋转 (+ 可选 GLES warp) → OpenCL 接缝羽化 → DRM 输出
 - **主开发板**: **rocktech RK3588** (Ubuntu 22.04.5 LTS, kernel 5.10.226, 内置 GC4683 驱动, 厂商规格 6 路物理 MIPI 直连)
-- **CameraPage 适配** (v2.4): C++ 嵌入式 cpp-httplib HTTP server (端口 8080), 浏览器查看状态/配置; 阶段 1 完成, **阶段 2 MJPEG /api/stream 实时预览跑通 (2026-07-07)**. 实测 stitch 26.68 FPS, 6 路 DMA-BUF zero-copy 保持.
+- **CameraPage 适配** (v2.4): C++ 嵌入式 cpp-httplib HTTP server (端口 8080), 浏览器查看状态/配置; 阶段 1 完成, 阶段 2 视频流暂停 (等 vpu 固件)
 - **当前输入**: 2K (2560×1440) @ 30fps
 - **当前布局**: 2×2 (4 路) → **迁移中** → 2×3 (6 路, 2 列 × 3 行)
 
@@ -91,8 +91,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 6. 2×3 真机跑通与收尾 | ⏳ 等 3-5 | 物理 sensor 接入后端到端跑 |
 
 **🟢 2026-07-07 阶段性胜利**: 板上 `image-stitching` 跑 6 路 H.264 dataset, decoder 全部 100+ fps/路 (DMA-BUF 100% zero-copy), 2×3 布局初始化 (panorama 4800×4080), bootstrap → stitch loop 跑通, EOS 后自动 loop 文件. 等物理 sensor 接入即可阶段 6 真机收尾.
-
-**🟢 2026-07-07 CameraPage 阶段 2 完成**: 新增 `mjpeg_streamer.{h,cc}` (mutex+condvar+atomic seq) + `src/app.cc` RGA 降采样 4800×4080→960×816 + cv::imencode(JPEG q=75) + `src/http_server.cc` 加 `/api/stream` (multipart/x-mixed-replace) + `/api/snapshot` (单帧 JPEG) + CameraPage 前端 `<img id="mjpeg-stream">` + `.stream-active` 状态切换. **实测**: `/api/snapshot` 200 image/jpeg 159974 bytes (960×816), `/api/stream` 200 multipart 1.8 MB / 4s 真 panorama 数据, stitch FPS 26.68 (30→27, 11% imencode 代价, MJPEG_INTERVAL=2 默认 15 FPS 流). 6 路 drm_prime_frames == frames (架构硬约束保持). 用 `MJPEG_INTERVAL=N` `MJPEG_DOWNSCALE_W/H` `MJPEG_QUALITY` 调速. 配套脚本: `sync_mjpeg_stage2.sh` (scp 同步) + `run_mjpeg_stage2.sh` (启动 + 3 路 curl 验证).
 
 **📋 拿到开发板后的具体操作**: 立刻看 [DEVELOPMENT_PLAN.md §1 板子与驱动可用性测试](docs/DEVELOPMENT_PLAN.md#1-板子与驱动可用性测试-1-2-天-) (★ SSH → 驱动 probe → 6 路 MIPI 拓扑验证)
 

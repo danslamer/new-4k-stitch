@@ -45,6 +45,16 @@ endif()
 pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
 pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
 pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
+# v2.4 (2026-07-06): vendor 确认 ffmpeg rkmpp 不维护, kmpp 解码器未完成.
+# 改走 gstreamer1.0-rockchip1 (libgstrockchipmpp.so + mppvideodec) + mpp_service 老接口.
+# 板端 dpkg: gstreamer1.0-rockchip1 1.14-4, librockchip-mpp 1.5.0.
+# gst_dmabuf 是 1.20+ 内建 API, 板端 1.20.3 已带.
+pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET gstreamer-1.0)
+pkg_check_modules(GSTAPP REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+pkg_check_modules(GSTVIDEO REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
+# gstreamer 1.20 allocators: 提供 gst_dmabuf_memory_get_fd / gst_is_dmabuf_memory.
+# 板端 gst 1.20.3 已带 (gst-plugins-base 包).
+pkg_check_modules(GSTALLOC REQUIRED IMPORTED_TARGET gstreamer-allocators-1.0)
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
 pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
 pkg_check_modules(GBM REQUIRED IMPORTED_TARGET gbm)
@@ -58,6 +68,8 @@ add_executable(${PROJECT_NAME}
     include/app.h
     src/sensor_data_interface.cc
     include/sensor_data_interface.h
+    src/gst_mpp_decoder.cc
+    include/gst_mpp_decoder.h
     src/stitching_param_generater.cc
     include/stitching_param_generater.h
     src/drm_allocator.cc
@@ -77,6 +89,9 @@ add_executable(${PROJECT_NAME}
     include/status_writer.h
     src/http_server.cc
     include/http_server.h
+    # 阶段 2: MJPEG panorama 推流给 CameraPage /api/stream 预览
+    src/mjpeg_streamer.cc
+    include/mjpeg_streamer.h
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -93,6 +108,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::AVFORMAT
     PkgConfig::AVCODEC
     PkgConfig::AVUTIL
+    # v2.4: gstreamer-rockchip 解码路径 (替代 ffmpeg rkmpp).
+    PkgConfig::GSTREAMER
+    PkgConfig::GSTAPP
+    PkgConfig::GSTVIDEO
+    PkgConfig::GSTALLOC
     PkgConfig::EGL
     PkgConfig::GLESV2
     PkgConfig::GBM

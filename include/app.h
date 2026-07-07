@@ -80,6 +80,15 @@ class App {
     vector<DrmBuffer> saved_drm_bufs_;
     bool frames_locked_;
     size_t locked_frame_idx_;
+
+    // 阶段 2: MJPEG panorama 推流 (CameraPage "实时预览" 用).
+    // panorama NV12 -> RGA downscale -> small NV12 -> cvtColor -> cv::imencode -> mjpeg_streamer::update().
+    // gate: 每 mjpeg_interval_ 帧做一次 (默认 2 = 15 FPS, 避免吃掉 stitch loop 30 FPS 预算).
+    DrmBuffer     mjpeg_drm_buf_;            // RGA 降采样目标: 960x816 NV12 DMA-BUF
+    int           mjpeg_width_   = 960;      // 降采样后宽
+    int           mjpeg_height_  = 816;      // 降采样后高
+    int           mjpeg_interval_ = 2;       // 每 N 帧编码一次
+    int           mjpeg_quality_ = 75;       // cv::imencode jpeg quality
 };
 
 #endif

@@ -17,6 +17,7 @@
 //   - 网络信息用 popen("ip ...") 拉, 不要重新发明轮子
 #include "http_server.h"
 #include "status_writer.h"  // 复用 status 文件路径常量
+#include "mjpeg_streamer.h" // 阶段 2: panorama MJPEG 推流缓冲
 
 #include <atomic>
 #include <chrono>
@@ -38,6 +39,12 @@
 namespace http_server {
 
 namespace {
+
+// 每个连接到 /api/stream 的 client 独有的 last_seq (C++11 没有 init-capture,
+// 用 shared_ptr<T> 持有, lambda 拷贝到 httplib 内, 各自独立).
+struct mjpeg_client_state_t {
+    uint64_t last_seq = 0;
+};
 
 std::atomic<bool> g_running{false};
 std::thread       g_thread;
@@ -358,6 +365,52 @@ void run_server(const Config& cfg) {
             return;
         }
         res.set_content(handle_roi_post(body), "application/json");
+    });
+
+    // 阶段 2: GET /api/snapshot — 单帧 JPEG (玩家 / 快照工具用).
+    // 返回 503 (JSON) if 未就绪 — curl 可解析; 浏览器 <img> 走 /api/stream 兜底.
+    svr.Get("/api/snapshot", [](const httplib::Request&, httplib::Response& res) {
+        std::vector<unsigned char> frame;
+        if (!mjpeg_streamer::get_latest_snapshot(frame) || frame.empty()) {
+            res.status = 503;
+            res.set_content("{\"ok\": false, \"error\": \"no frame yet, image-stitching may not be running\"}\n",
+                            "application/json");
+            return;
+        }
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        std::string body(reinterpret_cast<const char*>(frame.data()), frame.size());
+        res.set_content(std::move(body), "image/jpeg");
+    });
+
+    // 阶段 2: GET /api/stream — MJPEG multipart/x-mixed-replace 实时推流.
+    // chunked provider, 每次被 cpp-httplib 回调 = 写一帧 boundary + JPEG.
+    // 不 503: 即使没帧也立即返回一个空 placeholder, 让浏览器 <img> 不触发 onerror.
+    svr.Get("/api/stream", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        // C++11 没有 init-capture, 用 shared_ptr 持有每 client 独有的 last_seq 状态.
+        // 每个 svr.Get callback 都新建一份 lambda, 各自 state, 多 client 互不干扰.
+        auto state = std::make_shared<mjpeg_client_state_t>();
+        res.set_chunked_content_provider(
+            "multipart/x-mixed-replace; boundary=frame",
+            [state](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                std::vector<unsigned char> frame;
+                // 33ms 超时: 就算 stitch loop 没出帧也定期唤醒, sink 才能感知断连.
+                if (!mjpeg_streamer::wait_for_new_frame(&state->last_seq, frame, /*timeout_ms=*/2000)) {
+                    return true;  // 暂时没帧, 等下一轮 provider 回调 (cpp-httplib 不会断)
+                }
+                if (frame.empty()) return true;
+                char hdr[160];
+                int n = std::snprintf(hdr, sizeof(hdr),
+                    "\r\n--frame\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    "Content-Length: %zu\r\n\r\n",
+                    frame.size());
+                if (n <= 0 || !sink.write(hdr, static_cast<size_t>(n))) return false;
+                if (!sink.write(reinterpret_cast<const char*>(frame.data()),
+                                frame.size())) return false;
+                return true;
+            });
     });
 
     // 静态文件: CameraPage
