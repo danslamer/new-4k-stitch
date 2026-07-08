@@ -1,4 +1,4 @@
-//
+﻿//
 // Created by s1nh.org on 11/11/20.
 // v2.4 (2026-07-06): FFmpeg rkmpp 路径已废弃 (vendor 不维护, 0 帧).
 // 改走 gstreamer1.0-rockchip1 mppvideodec (vendor SDK 标准组件).
@@ -36,6 +36,7 @@
 
 #include "gst_mpp_decoder.h"
 #include "logger.h"
+#include "status_writer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -118,8 +119,29 @@ const CameraSourceList& GetCameraSourceList() { return g_camera_source_list; }
 // 注: 不用 std::filesystem 因为本项目 CMakeLists 锁在 C++11, std::filesystem 是 C++17.
 // 用 POSIX realpath() 实现.
 //
-static std::string CanonicalizeUri(const std::string& uri) {
+// v3.0 (2026-07-08): scheme-aware canonicalizer.
+//   - `rtsp://...` / `http(s)://...` / `file://...`: 原样返回, 不走 realpath
+//   - 本地路径: 走 POSIX realpath() 把 ../ 形式解析成 CWD+uri 绝对路径
+//     (板上 gstreamer filesrc 不接受 .. 形式相对路径, 会报 No such file 直接 abort)
+//   - 显式 type 参数让 caller 告诉本路是 file/rtsp; 没 type 时按 uri scheme 检测.
+// v2.5 (2026-07-08) 已加 realpath() 基础版, 但 rtsp:// 误走 realpath 会 NULL 丢路径, 此处分流.
+// 注: 项目锁 C++11, 不能用 std::filesystem (C++17).
+static std::string CanonicalizeUri(const std::string& uri, CameraSource::Type type) {
   if (uri.empty()) return uri;
+  // 先按 scheme 前缀快速判定 (覆盖把 rtsp 当 file 配的场景)
+  auto starts_with = [&](const std::string& prefix) {
+    return uri.rfind(prefix, 0) == 0;
+  };
+  if (starts_with("rtsp://") || starts_with("rtsp:")
+      || starts_with("http://") || starts_with("https://")
+      || starts_with("file://")) {
+    return uri;
+  }
+  // type 显式是 rtsp 也走原样
+  if (type == CameraSource::Type::kRtsp) {
+    return uri;
+  }
+  // file: realpath
   bool trailing_slash = !uri.empty() && uri.back() == '/';
   char resolved[PATH_MAX];
   if (realpath(uri.c_str(), resolved) != nullptr) {
@@ -128,7 +150,7 @@ static std::string CanonicalizeUri(const std::string& uri) {
     return r;
   }
   Logger::GetInstance().LogError(
-      std::string("[sensor_data_interface] CanonicalizeUri: realpath failed, keep as-is: ") + uri);
+      "[sensor_data_interface] CanonicalizeUri: realpath failed, keep as-is: " + uri);
   return uri;
 }
 static bool LoadCameraSourceList(const std::string& path) {
@@ -156,18 +178,48 @@ static bool LoadCameraSourceList(const std::string& path) {
     for (cv::FileNodeIterator it = cameras.begin(); it != cameras.end(); ++it) {
       cv::FileNode cam = *it;
       CameraSource src;
+
+      // v3.0 (2026-07-08): 解析 type: file | rtsp | mipi (deprecated).
       std::string type_str;
       cam["type"] >> type_str;
-      if (type_str == "mipi") {
+      if (type_str == "rtsp") {
+        src.type = CameraSource::Type::kRtsp;
+      } else if (type_str == "mipi") {
         src.type = CameraSource::Type::kMipi;
       } else {
-        src.type = CameraSource::Type::kFile;
+        src.type = CameraSource::Type::kFile;  // 默认 + dev/test fallback
       }
-            { std::string raw_uri; cam["uri"] >> raw_uri; src.uri = CanonicalizeUri(raw_uri); }
-      cam["width"] >> src.width;
+
+      // v3.0: 拿 raw_uri, 先按 type 分流 canonicalize. rtsp URL 不走 realpath.
+      { std::string raw_uri; cam["uri"] >> raw_uri; src.uri = CanonicalizeUri(raw_uri, src.type); }
+      cam["width"]  >> src.width;
       cam["height"] >> src.height;
-      cam["fps"] >> src.fps;
+      cam["fps"]    >> src.fps;
       cam["pixel_format"] >> src.pixel_format;
+
+      // v3.0: rtsp 字段 (空 type 时跳过, 让 default 生效)
+      if (src.is_rtsp()) {
+        cam["user_id"] >> src.user_id;
+        cam["user_pw"] >> src.user_pw;
+        if (cam["latency_ms"].isInt())             cam["latency_ms"]             >> src.latency_ms;
+        if (cam["connect_timeout_s"].isInt())      cam["connect_timeout_s"]      >> src.connect_timeout_s;
+        if (cam["retry_attempts"].isInt())         cam["retry_attempts"]         >> src.retry_attempts;
+        if (cam["reconnect_backoff_ms"].isInt())   cam["reconnect_backoff_ms"]   >> src.reconnect_backoff_ms;
+        if (cam["frame_drop_threshold"].isReal())  cam["frame_drop_threshold"]  >> src.frame_drop_threshold;
+        else if (cam["frame_drop_threshold"].isInt())
+                                                  cam["frame_drop_threshold"]  >> src.frame_drop_threshold;
+        // bool 缺省: YAML 缺字段时 OpenCV 读 false, 与默认 true 矛盾, 手动处理.
+        if (!cam["use_tcp"].empty()) {
+          int v = 0; cam["use_tcp"] >> v; src.use_tcp = (v != 0);
+        }
+        // 显式日志: 让运维一眼看见 rtsp 拉的是谁
+        Logger::GetInstance().Log(
+            "[sensor_data_interface] cam " + std::to_string(g_camera_source_list.cameras.size()) +
+            " rtsp: " + src.uri + " (uid='" + src.user_id + "' latency=" +
+            std::to_string(src.latency_ms) + "ms use_tcp=" +
+            (src.use_tcp ? "tcp" : "udp") + ")");
+      }
+
       if (src.uri.empty()) {
         Logger::GetInstance().LogError(
             "[sensor_data_interface] camera_sources.yaml: empty uri, skipped");
@@ -205,7 +257,7 @@ static bool LoadCameraSourceList(const std::string& path) {
 // 4K 源在 datasets/4k-test/, 用 tools/downscale_4k_to_2k.py 降下来.
 // 注: t40/t41 是临时占位, 后续用真实 6 路替换. 阶段 6 真机跑通前需替换.
 static std::vector<CameraSource> LoadDefaultDatasetSources() {
-  const std::string video_dir = CanonicalizeUri("../datasets/2k-test-h264/");
+  const std::string video_dir = CanonicalizeUri("../datasets/2k-test-h264/", CameraSource::Type::kFile);
   const std::vector<std::string> default_files = {
       "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4",
       "t40.mp4", "t41.mp4"};
@@ -328,9 +380,22 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   decoder_finished_vector_ = std::vector<bool>(num_img_, false);
   drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
 
+  // v3.0: 同时填 video_file_paths_ (旧 thread log 兼容) + video_sources_ (新 thread 路由).
   for (size_t i = 0; i < num_img_; ++i) {
     video_file_paths_.push_back(file_sources[i].uri);
+    video_sources_.push_back(file_sources[i]);
   }
+
+  // v3.0: 打印实际路由结果, 让运维一眼看出 6 路是 file 还是 rtsp.
+  std::ostringstream route_ss;
+  route_ss << "[sensor_data_interface] InitVideoCapture routes " << num_img_
+           << " cam(s):";
+  for (size_t i = 0; i < num_img_; ++i) {
+    route_ss << " cam" << i << "="
+             << (video_sources_[i].is_rtsp() ? "rtsp" :
+                 video_sources_[i].is_mipi() ? "mipi(deprecated)" : "file");
+  }
+  Logger::GetInstance().Log(route_ss.str());
 
   StartDecodeThreads();
 }
@@ -348,35 +413,67 @@ void SensorDataInterface::StartDecodeThreads() {
   for (size_t i = 0; i < num_img_; ++i) {
     decode_threads_.emplace_back([this, i]() {
       const std::string& file_name = video_file_paths_[i];
+      const CameraSource& src = video_sources_[i];
       DecoderPerfStats perf_stats;
 
       Logger::GetInstance().Log(
           "[decoder " + std::to_string(i) +
-          "] gstreamer-rockchip mppvideodec path (vendor SDK mpp 1.5.0): " +
-          file_name);
+          "] gstreamer-rockchip mppvideodec path (" +
+          (src.is_rtsp() ? "rtsp" : src.is_mipi() ? "mipi" : "file") +
+          ", vendor SDK mpp 1.5.0): " + file_name);
 
-      // v2.4 (2026-07-06): 走 GstMppDecoder. 之前 FFmpeg rkmpp 路径全部废弃
-      // (vendor 不维护 + 跟板子 vendor SDK mpp 1.5.0 ABI 不兼容 → 0 帧).
-      // GstMppDecoder 内部 gst_parse_launch + mppvideodec dma-feature=true →
-      // appsink 拿 NV12/DMABuf → dma_buf_fd → stitcher 零拷贝.
+      // v3.0 (2026-07-08) decoder dispatch:
+      //   - file: GstMppDecoder::Start(uri) → filesrc + qtdemux + h264parse + mppvideodec
+      //   - rtsp: GstMppDecoder::StartRtsp(uri, uid, pw, opts) → rtspsrc + rtph264depay +
+      //     h264parse + mppvideodec + 内置 watchdog 重连
+      //   - mipi: 已退役, 不应再到这里 (Sanity log + 标 finished)
       image_stitching::GstMppDecoder decoder;
-      if (!decoder.Start(file_name, /*expected_w*/ 2560, /*expected_h*/ 1440)) {
+      bool started = false;
+      if (src.is_rtsp()) {
+        image_stitching::RtspOptions opts;
+        opts.latency_ms         = src.latency_ms;
+        opts.use_tcp            = src.use_tcp;
+        opts.connect_timeout_s  = src.connect_timeout_s;
+        opts.retry_attempts     = src.retry_attempts;
+        opts.reconnect_backoff_ms = src.reconnect_backoff_ms;
+        started = decoder.StartRtsp(
+            src.uri, src.user_id, src.user_pw, opts,
+            /*expected_w*/ 2560, /*expected_h*/ 1440);
+      } else {
+        // kFile (也兼容 kMipi deprecated)
+        started = decoder.Start(file_name, /*expected_w*/ 2560, /*expected_h*/ 1440);
+      }
+
+      if (!started) {
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
             "] failed to start gstreamer pipeline: " + file_name);
+        stitch_status::set_online(static_cast<int>(i), 0);
         std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
         decoder_finished_vector_[i] = true;
         return;
       }
+      // v3.0: pipeline 已起, 标记 online. watchdog 后续异常时会切回 0.
+      stitch_status::set_online(static_cast<int>(i), 1);
 
-      // gstreamer pull 循环: 每帧 appsink pull sample → 提取 dma_buf_fd → push queue
-      // EOS 走 Stop + Start 重启 (跟原 av_seek_frame 等价), 持续到 stop_requested_
+      // gstreamer pull 循环. file EOS 走 Stop + Start 重启循环;
+      // rtsp EOS 由 decoder 内部 watchdog 重连, 本线程只 sleep+continue (避免与 watchdog 双重启竞态).
       while (!stop_requested_) {
         image_stitching::GstMppFrame frame;
         const bool got_frame = decoder.PullFrame(frame);
 
         if (frame.is_eos || !got_frame) {
-          // EOS: 重启 pipeline 走循环 (跟原 FFmpeg av_seek_frame 等价).
+          if (src.is_rtsp()) {
+            // v3.0: rtsp 走 internal watchdog. 这里只需 sleep 让它先 Stop+Start,
+            // 然后 pull 自动出帧 (新 pipeline 已 PLAYING).
+            Logger::GetInstance().Log(
+                "[decoder " + std::to_string(i) +
+                "] rtsp EOS / pull fail — waiting for watchdog reconnect (uri=" +
+                src.uri + ")");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+          }
+          // file: 重启 pipeline 走循环 (跟原 FFmpeg av_seek_frame 等价).
           Logger::GetInstance().Log(
               "[decoder " + std::to_string(i) + "] reached EOS, looping: " +
               file_name);

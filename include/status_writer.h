@@ -1,7 +1,6 @@
-// status_writer.h - 把拼接状态写到 /tmp/stitch_status.json 给 HTTP 后端读
-// v2.3 阶段 1: C++ 写文件 + cpp-httplib HTTP server
-// v2.3 阶段 1.5: 独立线程 + 模拟数据 (板上 vpu/kmpp/ffmpeg 三方不兼容时)
-// 后续 v2 阶段换成 POSIX shm (status_bridge) + 真 stitch 数据
+﻿// status_writer.h - 写 /tmp/stitch_status.json 给 CameraPage / HTTP 后端读
+// v3.0 (2026-07-08): 加 set_online() 让 SensorDataInterface 上报单路 online 状态
+//   (rtsp 重连 / 拔网线会反映成 online=0). YAML 是真实 URI 来源.
 #ifndef STATUS_WRITER_H
 #define STATUS_WRITER_H
 
@@ -17,11 +16,13 @@ struct CameraStatus {
     int     height;
     char    name[64];
     char    uri[128];
+    // v3.0 新增: 让 CameraPage 区分 file / rtsp 输入源 (保留旧字段兼容)
+    // 注: is_rtsp 不进 CameraStatus 结构, 见 .cc worker_thread 序列化时从 yaml 同步取
 };
 
 struct GlobalStatus {
     int         num_cameras;
-    int         mode;           // 0=dataset, 1=mipi
+    int         mode;           // 0=dataset (legacy), 1=camera (yaml, 含 rtsp/file), 2=mipi(deprecated)
     int         panorama_w;
     int         panorama_h;
     double      current_fps;
@@ -33,12 +34,10 @@ struct GlobalStatus {
 };
 
 // 启动独立线程, 每 500ms 写一次 /tmp/stitch_status.json
-// 默认用模拟数据 (FPS 随机波动 + cams 都 online=true).
-// 如果 stitch loop 跑通 (frame_idx 持续递增), 用真数据覆盖.
-// 板上 vpu/kmpp/ffmpeg 三方不兼容时, stitch loop 卡住, 模拟数据保证 CameraPage 看到活状态.
-void init();                    // 启动线程
-void update(const GlobalStatus& s);  // 真 stitch 数据覆盖 (可被线程读走)
-void shutdown();                // 停线程
+void init();
+void update(const GlobalStatus& s);            // 真 stitch 数据覆盖 (被 mutex 保护)
+void set_online(int cam_index, int online);    // v3.0: 单路 online 状态上报 (0/1)
+void shutdown();
 
 }  // namespace stitch_status
 

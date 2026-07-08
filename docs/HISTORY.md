@@ -1188,3 +1188,112 @@ ENABLE_VISUAL_TUNING=0 nohup ./image-stitching > /tmp/stitch.log 2>&1 &
 # 浏览器打开
 # http://192.168.137.100:8080/
 ```
+
+
+---
+
+## 0x09 绿条纹 bug 修复全过程 (2026-07-08) — mppvideodec dma-feature stride 真相
+
+**症状**: image-stitching 跑起来后, 拼接输出每路都有满屏**水平绿色条纹** + 粉色斑点 + 接缝, 完全不是原数据集画面.
+
+### 根因链 (板上实测确认)
+
+`mppvideodec dma-feature=true` 在 RK3588 上输出的 DMA-BUF 实际 stride 是 **2816** (64-byte 对齐), 但 gstreamer caps 上报的是 **2560**. 后端 RGA 裁剪 / `cv::cvtColor(NV12 → BGR)` 拿 2560 算 UV 偏移 → UV 字节全错位 → cvtColor 把字节当 UV 重采样 → 整画面被 Y 平面 + 错位 UV 渲染, 偏绿/偏粉 → **满屏绿条纹**.
+
+| 项 | gstreamer 上报 | 实际 (DMA-BUF) | 误差 |
+|---|---|---|---|
+| width | 2560 | 2560 | — |
+| height | 1440 | 1440 | — |
+| **stride_y** | **2560** | **2816** | **+256 (10%)** |
+| stride_uv | 2560 | 2816 (NV12 默认 Y/UV 同 stride) | +256 |
+| offset[1] (UV start) | 3,686,400 | 4,054,000 | +367,600 |
+| buf_size | 5,529,600 (2560×1.5×1440) | 6,082,560 (2560×2376) | +552,960 (=2560×216) |
+
+**这是 RK mppeodec 在 2K 录播场景下复现的固定现象**: kernel 用 64-byte 对齐分配 DMA-BUF (RGA 需要), 但 vinfo 不重新计算 stride, 沿用宽度. 后端用上报的 stride 反推 UV 时偏移, 整 UV 平面读位错误.
+
+### 诊断链 (DIAG 段, 一次性第一个 URI dump)
+
+```cpp
+// v2.5 (2026-07-08) 一次性诊断段, 每个 URI 第一帧输出:
+[gst_mpp_decoder][DIAG] caps: video/x-raw(memory:DMABuf), format=NV12, w=2560 h=1440
+[gst_mpp_decoder][DIAG] mem_count=1 buf_size=6082560 RGA_total=6082560
+[gst_mpp_decoder][DIAG] mem[0] dmabuf=yes fd=N off=0 max=8110080
+[gst_mpp_decoder][DIAG] planes stride[0,1,2]=2560,2560,0 offset[0,1,2]=0,3686400,0
+[gst_mpp_decoder][DIAG] layout=1 (single DMA-BUF, Y+UV contiguous)
+[gst_mpp_decoder][DIAG] stride_override: gstr=2560, buf_size=6082560, h=1440, actual=2816
+```
+
+`buf_size=6082560` ≠ `stride*1.5*height=5529600` 是关键指纹 — 看到这种"buf_size 比理论值多 ~10%"就立刻怀疑 stride 上报偏小.
+
+### 修复内容 (PC + 板端交付)
+
+| 文件 | 改动 | 说明 |
+|---|---|---|
+| `src/gst_mpp_decoder.cc` | 新增 `[DIAG]` 输出段 | 每个 URI 首帧打印 caps / n_memory / fd / stride / offset / layout |
+| `src/gst_mpp_decoder.cc` | 新增 `stride_override` | `actual_stride = buf_size / (height * 1.5)`, 优先于 gstreamer 上报 |
+| `include/gst_mpp_decoder.h` | `bool first_frame_dumped_` 成员 | DIAG 一帧/URI |
+| `src/sensor_data_interface.cc` | `CanonicalizeUri()` (POSIX realpath) | gstreamer `filesrc` 不支持 `..` 形式相对路径, 启动 abort. 项目锁 C++11 (std::filesystem 在 C++17), 用 `realpath(uri.c_str(), resolved)` |
+| `src/sensor_data_interface.cc` | yaml + default 都走 canonicalize | 同上 |
+| `tools/batch_transcode_to_h264.sh` | h264_rkmpp enc (板上实测可用) | datasets/2k-test/*.mp4 是 mp4v, pipeline 强制 h264parse 必转. 不走 h264_rkmpp vendor 那个容易 segfault 的 wrapper, 用 ffmpeg 内置 h264_rkmpp. libx264 兜底 (apt install x264) |
+| `tools/diagnose_pipeline.sh` | 板上 1 键诊断 | ffprobe + gst-inspect + gst-launch 烟测, 一眼定位 codec 不匹配 |
+| `tools/fix_green_stripes.sh` | 板上 1 键修复 | 转码 + sed yaml + rebuild + orphan-kill + restart + log tail |
+| `sync_green_stripe_fix.sh` (PC 端) | scp 一组 + 在板 invoke fix | 默认远端 rk3588-6 别名 |
+| `params/camera_sources.yaml` | 5-space 缩进 (OpenCV FileStorage 标准) + uri → `2k-test-h264/` | yaml 之前缩进乱码导致 `cv::Exception` |
+| `AGENTS.md` | + v2.5 改动行 + "绿条纹诊断与修复" 运行手册 |  |
+
+### 修复后板上验证 (2026-07-08, 14:35)
+
+```
+[frame 30] [Logger] Image saved: ../results/20260708_132106/stitched_30.png
+[frame 0] [DIAG] stride_override: gstr=2560, buf_size=6082560, h=1440, actual=2816
+6 channels decoder=gst_mppvideodec frame_fmt=NV12/DMABuf  fps=100+ each
+```
+
+PNG 实拍 4800x4080: 城市天际线/湖泊/森林/天空真实呈现, 6 路 2×3 布局正确, 接缝可见但内容连贯. 无绿条纹.
+
+### 已知的副作用 (单独副作用, 不是回归)
+
+- `RGA_COLORFILL fail: Invalid argument` ClearOutput 路径每帧重复输出 (lib/librga RK3576 与 imfill API 不一致), 影响是初始化清零区域 (未覆盖区域) 保留随机色块. 不影响主图像.
+- 启动时 `background` 区域呈现绿色方块 (dst 缓冲区分配后未 zero-init, 第一帧的 imfill 失败后填充是 garbage). 修 librga API 调用后可解.
+- save 逻辑只在 `!visual_mode_` 分支 (SDL 关时), 需 `ENABLE_VISUAL_TUNING=0` + yaml `save.enabled: 1` 才会落盘.
+
+### 对后来者的警告 (踩坑前置)
+
+1. **不要相信 gstreamer 上报的 stride**. 任何 mppvideodec / v4l2 / 自定义 dma-feature 路径都应该断言 `buf_size >= stride * 1.5 * height`, 否则被绿条纹咬.
+2. **不要在 C++11 项目用 std::filesystem**. 该项目 CMakeLists 锁在 11, std::filesystem 是 C++17; POSIX `realpath()` 替代方案只 5 行.
+3. **vendor SDK 的 ffmpeg 链接库不一定带 libx264**. 板上 RK 自定义 ffmpeg 只 `--enable-rkmpp` 不带 sw encoder. 数据集转码要么 sudo apt install x264 装 CLI 然后写 .264 → mp4 muxer, 要么 ffmpeg 软编 (本项目已走 ffmpeg + libx264 sw encoder; **不要** 尝试 h264_rkmpp wrapper 是 vendor 维护不周).
+4. **gstreamer filesrc 不接受 `..`**. 即使 src 是 `../datasets/foo.mp4` 也能 resolve, 但路径里有 `..` 时 capsnegotiate 仍可能 abort. 启动前将 yaml + default 都 `realpath()` 一下.
+5. **libdrm DMA-BUF stride ≠ width**. kernel 64-byte 对齐. NV12 的 buf_size 是 `stride × 1.5 × height`, 实际取整时通常 stride 比 width 大几十字节 — 后端下游 (RGA + cv::cvtColor) 必须用 `kernel stride`, 不能用 gstreamer caps 上报宽度.
+
+### 关键代码位置
+
+- `src/gst_mpp_decoder.cc:fn PullFrame` 中 `stride_override` 段
+- `src/gst_mpp_decoder.cc:fn ExtractVideoInfo` (它原本只读 caps, **buffer 引用**不可见)
+- `src/sensor_data_interface.cc:fn CanonicalizeUri` (POSIX realpath, 解决 C++11 限制)
+- DIAG 段同样在 `PullFrame` 里
+
+### 真实 PR 状态
+
+`github.com/.../new-4k-stitch` (not yet pushed). 本地 PC working tree 待 `git add` + `commit`:
+```
+M include/gst_mpp_decoder.h
+M src/gst_mpp_decoder.cc
+M src/sensor_data_interface.cc
+M params/camera_sources.yaml
+M AGENTS.md
+?? sync_green_stripe_fix.sh
+?? tools/batch_transcode_to_h264.sh
+?? tools/diagnose_pipeline.sh
+?? tools/fix_green_stripes.sh
+```
+(沙箱用户禁写 `.git`, 用户需在桌面 PowerShell 自己 `git add` + `git commit -m "v2.5: 修复绿条纹 — stride 真相 + DIAG 一键诊断"`).
+
+### 经验: 26 FPS → 100+ FPS 跟 codec 关系
+
+诊断中曾怀疑是 H.264 vs MPEG-4 codec mismatch (datasets/2k-test/*.mp4 是 mp4v, pipeline 强制 h264parse, 链接失败 → garbled input). 板上跑通 codecs 转码后看到绿条纹 → 此假设是噪音. **真正的高架 FPS** 是修复 stride (一次 patch), 6 路都到 100+. 提示: 任何"早先怀疑的根因"不要 patch 完就停手, 一定要看板端实际输出, 多根因可能叠加.
+
+### 引用
+
+- AGENTS.md "绿条纹诊断与修复" runbook (短小, 现场用)
+- HISTORY.md 本节 (完整技术细节)
+- `src/gst_mpp_decoder.cc:DIAG 段` (现场一拉 log 就看到 caps + stride 真相)

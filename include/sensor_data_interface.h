@@ -1,5 +1,6 @@
-//
+﻿//
 // Created by s1nh.org on 2020/11/11.
+// v3.0 (2026-07-08): 加 Type::kRtsp + 7 个 rtsp 字段. dataset/mipi 退役.
 //
 
 #ifndef IMAGE_STITCHING_SENSOR_DATA_INTERFACE_H
@@ -31,33 +32,50 @@ enum class QueuedFrameStorage {
     kDrmPrime = 2,
 };
 
-// v2: 输入源描述 (替代 4-cam 硬编码 t50..t53.mp4 列表).
-// 加载自 params/camera_sources.yaml, 暂未启用 mipi 采集线程 (阶段 3 待写),
-// 当前 InitVideoCapture 按 type 路由: file 走 FFmpeg 线程, mipi 暂 fallback 到 file.
+// v3.0 (2026-07-08) 输入源描述. 加载自 params/camera_sources.yaml.
+// kFile: 本地 H.264 mp4 (dev/test/devops 用)
+// kMipi: 占位 (阶段 3 MIPI 计划已退役, 不再开新功能; 保留 enum 防 yaml 兼容)
+// kRtsp: ★ 网络摄像头 RTSP 拉流 (生产)
 struct CameraSource {
     enum class Type {
-        kFile,    // 本地视频文件 (走 FFmpeg avformat_open_input)
-        kMipi,    // V4L2 节点 (阶段 3 实现, 当前 fallback 到 file)
+        kFile,    // 本地视频文件 (走 gstreamer filesrc → qtdemux → h264parse → mppvideodec)
+        kMipi,    // V4L2 节点 (deprecated, 占位)
+        kRtsp,    // ★ 网络摄像头 RTSP 拉流 (走 rtspsrc → rtph264depay → h264parse → mppvideodec)
     };
 
     Type type = Type::kFile;
-    std::string uri;       // 文件路径 或 /dev/videoN
+    std::string uri;              // file: 路径 / rtsp: rtsp://... / mipi: /dev/videoN
     int width = 0;
     int height = 0;
     int fps = 30;
-    std::string pixel_format;  // "NV12" (期望, 仅日志用)
+    std::string pixel_format;     // "NV12" (期望, 仅日志用)
+
+    // ★ v3.0 RTSP 字段. 仅 is_rtsp() 时生效.
+    std::string user_id;          // 空 = 无认证
+    std::string user_pw;
+    int latency_ms = 100;         // gstreamer rtspsrc latency (jitter buffer 预算)
+    bool use_tcp = true;          // rtspsrc protocols: 0x4=tcp+tcp+http (true) 或 0x7=udp (false)
+    int connect_timeout_s = 10;   // rtspsrc 信令 + TCP connect 超时 (秒)
+    int retry_attempts = 5;       // rtspsrc RTC 重试, 0 = 无限
+    int reconnect_backoff_ms = 2000;  // 断线重连退避
+    double frame_drop_threshold = 0.8;  // fps / 期望 fps 低于此值告警
 
     bool is_mipi() const { return type == Type::kMipi; }
     bool is_file() const { return type == Type::kFile; }
+    bool is_rtsp() const { return type == Type::kRtsp; }
 };
 
-// 全局输入源列表 (启动时由 SensorDataInterface 填充, 供 app.cc 路由).
-// 默认空 (fallback 到原 t50..t53.mp4 数据集路径).
+// 全局输入源列表 (启动时由 SensorDataInterface 填充, 供 app.cc / status_writer 路由).
+// 默认空 (fallback 到原 t50..t53.mp4 数据集路径, 仅 INPUT_SOURCE_MODE=dataset).
 struct CameraSourceList {
     std::vector<CameraSource> cameras;
-    int sync_window_ms = 16;  // 阶段 4 时间戳同步窗口, 默认 1 帧 60fps 预算
-    bool auto_calibrate = false;  // 阶段 3 启动期自标定, 默认 off
+    int sync_window_ms = 16;       // v3.0: 6 路 PTS 拉齐窗, 1 帧@60fps. 0 = 不要求同步.
+    bool auto_calibrate = false;   // Sprint 2 自标定开关 (默认 off)
 };
+
+// ★ v3.0 (2026-07-08) 全局入口: status_writer.cc / http_server.cc 等需要看 yaml 解析结果时用
+//   旧 API 直接读 file 但 yaml 解析在 sensor_data_interface.cc 一次性, 这里暴露只读引用.
+const CameraSourceList& GetCameraSourceList();
 
 struct QueuedFrame {
     QueuedFrameStorage storage = QueuedFrameStorage::kEmpty;
@@ -111,7 +129,10 @@ class SensorDataInterface {
     std::vector<std::queue<QueuedFrame>> image_queue_vector_;
     std::vector<std::mutex> image_queue_mutex_vector_;
     std::vector<cv::VideoCapture> video_capture_vector_;
+    // v3.0: 用 vector<CameraSource> 替代 vector<string>. 保留 video_file_paths_ 作为
+    // 旧 thread log 兼容 (新 code 走 video_sources_).
     std::vector<std::string> video_file_paths_;
+    std::vector<CameraSource> video_sources_;   // ★ v3.0: 与 decode_threads_ 一一对应
     std::vector<std::thread> decode_threads_;
     std::vector<double> decode_fps_vector_;
     std::vector<size_t> decoded_frames_since_report_;

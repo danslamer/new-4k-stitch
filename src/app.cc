@@ -1,4 +1,4 @@
-#include "app.h"
+﻿#include "app.h"
 #include "status_writer.h"
 #include "http_server.h"
 #include "mjpeg_streamer.h"
@@ -1206,9 +1206,17 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
     for (size_t i = 0; i < num_img_; ++i) {
       bootstrap_bgr[i] = ExportHardwareFrameToBgr(image_vector_[i]);
     }
-    cached_overlaps_ = MatrixOverlapToCached(EstimateOverlaps2x2(bootstrap_bgr));
+    // v3.0 (2026-07-08) BUG FIX: was hardcoded 2x2 → 6-cam 触发越界; 用 num_img_ 路由
+    cached_overlaps_ = MatrixOverlapToCached(
+        (num_img_ == 6) ? EstimateOverlaps2x3(bootstrap_bgr) : EstimateOverlaps2x2(bootstrap_bgr));
 
-    RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);
+    try {
+      RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);
+    } catch (const cv::Exception& e) {
+      Logger::GetInstance().LogError(std::string("[App] SaveToFile cv::Exception (bootstrap) tolerated: ") + e.what());
+    } catch (const std::exception& e) {
+      Logger::GetInstance().LogError(std::string("[App] SaveToFile std::exception (bootstrap) tolerated: ") + e.what());
+    }
     Logger::GetInstance().Log("[App] ROI config saved to ../params/roi_tuning.yaml");
   }
 
@@ -1374,7 +1382,13 @@ App::~App() {
         }
         
         if (action == kVisSaveConfig) {
-          RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);
+          try {
+      RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);
+    } catch (const cv::Exception& e) {
+      Logger::GetInstance().LogError(std::string("[App] SaveToFile cv::Exception (bootstrap) tolerated: ") + e.what());
+    } catch (const std::exception& e) {
+      Logger::GetInstance().LogError(std::string("[App] SaveToFile std::exception (bootstrap) tolerated: ") + e.what());
+    }
           Logger::GetInstance().Log("[App] [DEBUG] ROI config saved to ../params/roi_tuning.yaml");
         }
         

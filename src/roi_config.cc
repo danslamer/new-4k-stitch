@@ -1,4 +1,4 @@
-#include "roi_config.h"
+﻿#include "roi_config.h"
 
 #include <opencv2/opencv.hpp>
 #include <algorithm>
@@ -10,6 +10,9 @@ int NormalizeEvenFloor(int value) {
 }
 
 bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config) {
+    // ★ v3.0.1 防护: 之前 cv::FileStorage 解析错抛 cv::Exception 直接未捕获到 terminate().
+    // 镜像 LoadCameraSourceList 的 try/catch 逻辑 (sensor_data_interface.cc).
+    try {
     cv::FileStorage fs(path, cv::FileStorage::READ);
     if (!fs.isOpened()) return false;
 
@@ -48,8 +51,10 @@ bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config
         }
     }
 
-    static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3"};
-    for (int i = 0; i < 4; ++i) {
+    // v3.0 (2026-07-08): 6 路 ROI 占位 (cam0..cam5). Sprint 0 接受 offset 全 (0,0);
+    //   Sprint 2 标定结果从 camchain_*.yaml 覆盖.
+    static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3", "cam4", "cam5"};
+    for (int i = 0; i < 6; ++i) {
         cv::FileNode cam_node = fs[cam_names[i]];
         if (!cam_node.empty()) {
             config.roi_offsets[i].offset_x = static_cast<int>(cam_node["offset_x"]);
@@ -59,10 +64,25 @@ bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config
 
     fs.release();
     return true;
+    } catch (const cv::Exception& e) {
+        return false;
+    } catch (const std::exception& e) {
+        return false;
+    }
 }
 
 bool RoiConfig::SaveToFile(const std::string& path, const StitchGlobalConfig& config) {
-    cv::FileStorage fs(path, cv::FileStorage::WRITE);
+    // ★ v3.0.1 防护: WRITE path 不可写 (perm/perm-path) 时 cv::FileStorage 构造函数抛 cv::Exception.
+    // App 主循环在 setup_stitch_state 末尾调本函数, 没 try/catch 会 terminate() 全进程.
+    // 像 LoadFromFile 一样, write-failure 当 false 返回, 让 bundle_video 流程继续.
+    cv::FileStorage fs;
+    try {
+        fs.open(path, cv::FileStorage::WRITE);
+    } catch (const cv::Exception& ) {
+        return false;
+    } catch (const std::exception& ) {
+        return false;
+    }
     if (!fs.isOpened()) return false;
 
     fs << "mode" << config.mode;
@@ -80,8 +100,9 @@ bool RoiConfig::SaveToFile(const std::string& path, const StitchGlobalConfig& co
     fs << "interval" << config.save_interval;
     fs << "}";
 
-    static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3"};
-    for (int i = 0; i < 4; ++i) {
+    // v3.0: 同步 cam0..cam5 (与 LoadFromFile 对称)
+    static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3", "cam4", "cam5"};
+    for (int i = 0; i < 6; ++i) {
         fs << cam_names[i] << "{";
         fs << "offset_x" << config.roi_offsets[i].offset_x;
         fs << "offset_y" << config.roi_offsets[i].offset_y;

@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
@@ -13,6 +13,16 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 - [docs/CAMERA_PAGE_INTEGRATION.md](docs/CAMERA_PAGE_INTEGRATION.md) — CameraPage 浏览器管理平台接入方案 (v2.4, 当前阶段 1 完成)
 - [docs/CAMERAPAGE_TEST_DEPLOY.md](docs/CAMERAPAGE_TEST_DEPLOY.md) — CameraPage 测试版部署指南 (v2.4 阶段 1, 板端已跑通 PID 84321)
 
+- [docs/NETWORK_CAMERA_PLAN.md](docs/NETWORK_CAMERA_PLAN.md) — **6 路网络摄像头接入改造方案 v3.0** (2026-07-08, 取代 dataset/mipi; Sprint 0/1/2 三段贯通, 镜头 2.8mm 102.5°, PoE 交换机 8+2 端口)
+
+
+- [tools/sprint0_smoke.sh](tools/sprint0_smoke.sh) — **Sprint 0 骨架贯通一键验收**: 6 路 yaml + TCP/554 + gst-launch 烟测 + 编译 + 30s 端到端 (PASS/FAIL/WARN, v3.0 新增)
+- [tools/rtsp_url_probe.sh](tools/rtsp_url_probe.sh) — **独立 RTSP URL 探测** (不依赖 image-stitching): 验证 yaml URL / 凭据 / DMA-Buf caps 是否可拉流 30 帧 (v3.0 新增)
+- [tools/sprint0_apply.sh](tools/sprint0_apply.sh) — **yaml 装填助手**: 用真实 IP/凭据 (env 或 -u/-w) 替换 params/camera_sources.yaml 中 192.168.10.x 占位 (v3.0 新增)
+- [tools/stitch_geometry_validator.py](tools/stitch_geometry_validator.py) — **几何验证** (纯 Python, 无依赖): 验证 K 矩阵 / overlap / 6 cam dst / DRAM 预算, 板上板下都能跑 (v3.0 新增)
+- [tools/sprint0_quickcheck.sh](tools/sprint0_quickcheck.sh) — **快速预检** (5 秒, 无编译): yaml 字段 + TCP/554 + gst elements + 单路烟测 (v3.0 新增)
+
+
 ## 仓库定位
 
 实时多摄像头视频拼接器，Rockchip ARM64 板端运行：
@@ -20,8 +30,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 - **Pipeline**: gstreamer1.0-rockchip1 mppvideodec (H.264/HEVC) → DMA-BUF 零拷贝 → RGA 裁剪/旋转 (+ 可选 GLES warp) → OpenCL 接缝羽化 → DRM 输出
 - **主开发板**: **rocktech RK3588** (Ubuntu 22.04.5 LTS, kernel 5.10.226, 内置 GC4683 驱动, 厂商规格 6 路物理 MIPI 直连)
 - **CameraPage 适配** (v2.4): C++ 嵌入式 cpp-httplib HTTP server (端口 8080), 浏览器查看状态/配置; 阶段 1 完成, 阶段 2 视频流暂停 (等 vpu 固件)
-- **当前输入**: 2K (2560×1440) @ 30fps
-- **当前布局**: 2×2 (4 路) → **迁移中** → 2×3 (6 路, 2 列 × 3 行)
+- **当前输入**: 2K (2560×1440) @ 30fps via **6 路 IP camera RTSP** (PoE 8+2 交换机, rtspsrc → mppvideodec DMA-BUF, v3.0 2026-07-08; 详 [docs/NETWORK_CAMERA_PLAN.md](docs/NETWORK_CAMERA_PLAN.md))
+- **当前布局**: 2×3 (6 路, 2 列 × 3 行). Sprint 0 接受 rough 输出 (offset=0, ROI 占位), Sprint 2 标定覆盖
 
 ## 当前 DTS 适配状态 (2026-07-01 实测)
 
@@ -312,8 +322,17 @@ sudo cat /sys/class/devfreq/27800000.gpu/load                      # GPU 负载
 
 **症状**: image-stitching 跑起来后, 拼接输出每路都有大量绿色条纹, 不是原数据集画面.
 
-**根因 (板上实测确认)**: `datasets/2k-test/*.mp4` 是 MPEG-4 Visual (mp4v), 但 `src/gst_mpp_decoder.cc` 的 pipeline 强制 `qtdemux → h264parse → mppvideodec`. qtdemux 按 stsd `mp4v` 输出 `video/mpeg`, 与 h264parse 的 `video/x-h264` caps 不匹配, gstreamer 在 link 失败时会用 identity bypass 部分数据, mppvideodec 拿到错位 NAL → 解码出绿色条纹.
+**根因 (板上 2026-07-08 实测确认) — 双层**:
 
+1. **第一层 (codec mismatch)**: `datasets/2k-test/*.mp4` 是 MPEG-4 Visual (mp4v), 但 pipeline 强制 `qtdemux → h264parse → mppvideodec`. caps 不匹配时 gstreamer 用 identity bypass 部分数据, 链路碎裂. 这条应修, 但修完后仍有绿条纹 → 不是主因.
+2. **第二层 (主因, stride 上报偏小)**: `mppvideodec dma-feature=true` 输出的 DMA-BUF 实际 stride = **2816** (kernel 64-byte 对齐), gstreamer caps 上报 = **2560**. 后端 RGA 裁剪 + `cv::cvtColor(NV12 → BGR)` 拿 2560 算 UV 偏移, UV 整段错位 → cvtColor 把字节当 UV 重采样 → 满屏绿条纹. 这是 RK3588 2K 固定现象, 任何 `mppvideodec + dma-feature` 都可能踩到.
+
+**修复**:
+
+- `src/gst_mpp_decoder.cc:DIAG 段`: 一次性打印 caps / n_memory / fd / stride / offset / layout. 看 `stride[]` 与 `buf_size/(1.5*height)` 是否相等就能立刻判定 stride 是否偏小.
+- `src/gst_mpp_decoder.cc:stride_override`: `actual_stride = buf_size / (height * 1.5)`, 优先于 gstreamer 上报.
+- `src/sensor_data_interface.cc:CanonicalizeUri()`: POSIX realpath (项目锁 C++11, std::filesystem 是 C++17), 解决 gstreamer filesrc 不接受 `..` 路径 → 启动直接 `No such file` abort.
+- `src/gst_mpp_decoder.cc:fn PullFrame`: DIAG 一帧/URI, 看 stride 与 layout 即可.
 **修复方案 (板上自动)**:
 
 ```bash

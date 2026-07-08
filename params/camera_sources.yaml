@@ -1,58 +1,131 @@
-%YAML:1.0
 ---
 # ============================================================
-# v2 阶段输入源描述 (阶段 2 引入). InitVideoCapture 优先读本文件, 加载失败时 fallback 到默认.
-# v2.5 (2026-07-08): datasets/2k-test/*.mp4 是 MPEG-4 Visual (mp4v), gst_mpp_decoder pipeline
-# 走 qtdemux+h264parse+mppvideodec, mp4v 与 video/x-h264 caps 不匹配 → 绿条纹.
-# 修复路径: 板上跑 batch_transcode_to_h264.sh 把 2k-test/*.mp4 转 2k-test-h264/*.mp4 (H.264).
-# 本 yaml 的 uri 已固定指 ../datasets/2k-test-h264/, 直接 sed 替换即可.
+# v3.0 (2026-07-08): 6 路网络摄像头 (PoE 交换机接入开发板)
 #
-# 字段:
-#   type:        file (mipi 待阶段 3 启用 V4L2)
-#   uri:         ../datasets/2k-test-h264/tXX.mp4
-#   width/height: 期望分辨率, 启动时校验
-#   fps:         目标帧率 30
-#   pixel_format: NV12 (rkisp_mainpath 输出)
+# 用法:
+#   1. 把下面 6 路的 `uri` / `user_id` / `user_pw` 填实
+#      (摄像机 web 后台确认 RTSP URL, 海康/大华/雄迈格式不同)
+#   2. 板端: export INPUT_SOURCE_MODE=camera
+#   3. 跑: bash tools/sprint0_smoke.sh
+#
+# 字段说明:
+#   type             : file | rtsp (file 仅 dev/test 用)
+#   uri              : file → ../datasets/2k-test-h264/tXX.mp4
+#                      rtsp → rtsp://user:pass@host:port/path
+#   width / height   : 2560 × 1440 (2K)
+#   fps              : 30
+#   pixel_format     : NV12 (mppvideodec 唯一支持格式)
+#   user_id / user_pw: rtsp 专用, 空字符串 = 无认证
+#   latency_ms       : rtspsrc jitter buffer (80-200)
+#   use_tcp          : true (TCP 抗丢) / false (UDP 低延迟)
+#   connect_timeout_s: rtspsrc 信令 + TCP connect 超时
+#   retry_attempts   : 单路 RTC 失败重试 (默认 5)
+#   reconnect_backoff_ms: 断线重连退避
+#   frame_drop_threshold: fps / 期望fps 低于此值告警
+#
 # 顶层:
-#   sync_window_ms:  阶段 4 时间戳同步窗口, 默认 16ms
-#   auto_calibrate:  阶段 3 启动期自标定, 默认 0
+#   sync_window_ms   : 6 路 PTS 拉齐窗, 默认 16ms (1 帧 @60fps)
+#   auto_calibrate   : Sprint 2 启动期自标定, 默认 false
+#
+# 占位 IP: 192.168.10.21 ~ 26, 板子: 192.168.10.100
 # ============================================================
+
 sync_window_ms: 16
 auto_calibrate: 0
+
 cameras:
-   - type: file
-     uri: ../datasets/2k-test-h264/t50.mp4
-     width: 2560
-     height: 1440
-     fps: 30
-     pixel_format: NV12
-   - type: file
-     uri: ../datasets/2k-test-h264/t51.mp4
-     width: 2560
-     height: 1440
-     fps: 30
-     pixel_format: NV12
-   - type: file
-     uri: ../datasets/2k-test-h264/t52.mp4
-     width: 2560
-     height: 1440
-     fps: 30
-     pixel_format: NV12
-   - type: file
-     uri: ../datasets/2k-test-h264/t53.mp4
-     width: 2560
-     height: 1440
-     fps: 30
-     pixel_format: NV12
-   - type: file
-     uri: ../datasets/2k-test-h264/t40.mp4
-     width: 2560
-     height: 1440
-     fps: 30
-     pixel_format: NV12
-   - type: file
-     uri: ../datasets/2k-test-h264/t41.mp4
-     width: 2560
-     height: 1440
-     fps: 30
-     pixel_format: NV12
+  # ----- cam0: 2×3 网格左上 -----
+  - type: rtsp
+    uri: rtsp://admin:CHANGE_ME@192.168.10.21:554/Streaming/Channels/101
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: CHANGE_ME
+    latency_ms: 120
+    use_tcp: true
+    connect_timeout_s: 10
+    retry_attempts: 5
+    reconnect_backoff_ms: 2000
+    frame_drop_threshold: 0.8
+
+  # ----- cam1: 2×3 网格右上 -----
+  - type: rtsp
+    uri: rtsp://admin:CHANGE_ME@192.168.10.22:554/Streaming/Channels/101
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: CHANGE_ME
+    latency_ms: 120
+    use_tcp: true
+    connect_timeout_s: 10
+    retry_attempts: 5
+    reconnect_backoff_ms: 2000
+    frame_drop_threshold: 0.8
+
+  # ----- cam2: 2×3 网格左中 -----
+  - type: rtsp
+    uri: rtsp://admin:CHANGE_ME@192.168.10.23:554/Streaming/Channels/101
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: CHANGE_ME
+    latency_ms: 120
+    use_tcp: true
+    connect_timeout_s: 10
+    retry_attempts: 5
+    reconnect_backoff_ms: 2000
+    frame_drop_threshold: 0.8
+
+  # ----- cam3: 2×3 网格右中 -----
+  - type: rtsp
+    uri: rtsp://admin:CHANGE_ME@192.168.10.24:554/Streaming/Channels/101
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: CHANGE_ME
+    latency_ms: 120
+    use_tcp: true
+    connect_timeout_s: 10
+    retry_attempts: 5
+    reconnect_backoff_ms: 2000
+    frame_drop_threshold: 0.8
+
+  # ----- cam4: 2×3 网格左下 -----
+  - type: rtsp
+    uri: rtsp://admin:CHANGE_ME@192.168.10.25:554/Streaming/Channels/101
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: CHANGE_ME
+    latency_ms: 120
+    use_tcp: true
+    connect_timeout_s: 10
+    retry_attempts: 5
+    reconnect_backoff_ms: 2000
+    frame_drop_threshold: 0.8
+
+  # ----- cam5: 2×3 网格右下 -----
+  - type: rtsp
+    uri: rtsp://admin:CHANGE_ME@192.168.10.26:554/Streaming/Channels/101
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: CHANGE_ME
+    latency_ms: 120
+    use_tcp: true
+    connect_timeout_s: 10
+    retry_attempts: 5
+    reconnect_backoff_ms: 2000
+    frame_drop_threshold: 0.8

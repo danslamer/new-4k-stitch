@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+﻿cmake_minimum_required(VERSION 3.10)
 project(image-stitching LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 11)
@@ -83,6 +83,7 @@ add_executable(${PROJECT_NAME}
     include/logger.h
     src/roi_config.cc
     include/roi_config.h
+    include/camera_intrinsics.h  # v3.0: K 矩阵占位 (fx=1027 fy=1378 cx=1280 cy=720)
     src/roi_visualizer.cc
     include/roi_visualizer.h
     src/status_writer.cc

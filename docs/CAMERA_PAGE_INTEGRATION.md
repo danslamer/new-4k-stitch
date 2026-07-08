@@ -1,4 +1,4 @@
-# CameraPage × image-stitching 接入方案 (v2.4, 2026-07-03)
+﻿# CameraPage × image-stitching 接入方案 (v2.4, 2026-07-03)
 
 > **状态**: 阶段 1 完成 (HTTP + 模拟 status), 阶段 2-5 待做
 > **更新**: 2026-07-03
@@ -374,3 +374,41 @@ svr.set_ws_handler("/ws/preview", [](auto& conn) {
 - 配置文件 Web 编辑
 - 录像回放
 - 算法扩展 (ONNX/RKNN 6 路推理)
+## v3.0 增补 (2026-07-08): 网络摄像头字段扩展
+
+CameraPage 通过 `/tmp/stitch_status.json` 读到的每个 cam 字段, 现在多出 `is_rtsp`:
+
+```json
+{
+  "num_cameras": 6,
+  "mode": 1,          // 1=camera (yaml), 0=dataset (legacy), 2=mipi(deprecated)
+  "panorama_w": 4613,
+  "panorama_h": 3888,
+  "current_fps": 30.0,
+  "frame_idx": 12345,
+  "cams": [
+    {"online": 1, "fps": 30, "is_rtsp": 1, "width": 2560, "height": 1440,
+     "name": "cam0", "uri": "rtsp://admin:Abcd1234@192.168.10.21:554/Streaming/Channels/101"},
+    ...
+  ],
+  "simulated": false
+}
+```
+
+**新字段语义**:
+
+| 字段 | 取值 | 备注 |
+|---|---|---|
+| `online` | 0/1, 由 `stitch_status::set_online(cam_idx, x)` 控制 | rtsp 拔线 / watchdog 重连中 → 0 |
+| `fps` | 期望 fps (online=0 时也写 0) | 真实 decode fps 见 `decoder_perf` 日志 |
+| `is_rtsp` | 0/1, 从 yaml `type: rtsp` 推断 | 让 CameraPage 把 rtsp 来源标出来 |
+| `uri` | 真实 rtsp URL (从 yaml 来) | 不再是 `../datasets/2k-test/camX.mp4` 占位 |
+| `mode` | 1=camera, 0=dataset | CameraPage 用这个区分服务是不是走网络摄像头 |
+
+**CameraPage 后续迭代建议 (Sprint 1+)**:
+1. **重连次数** `[gst_mpp_decoder][watchdog] reconnect #N` 写 status JSON, 让 CameraPage 显形拔线恢复
+2. **延迟指标** `rtsp latency_ms` 量化相机到板子延迟, 便于运维调延时
+3. **丢包率** rtspsrc 内部 GstMessage 可以 log, 加 status 字段
+4. **温度 / CPU 占用** 板子 sysinfo (`/sys/class/thermal/thermal_zone*/temp`)
+
+详细状态字段 schema 见 `/tmp/stitch_status.json` (实际产物, 由 status_writer.cc 输出).
