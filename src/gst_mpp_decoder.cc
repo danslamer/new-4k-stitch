@@ -66,6 +66,7 @@ bool ExtractVideoInfo(GstCaps* caps,
   *out_h = GST_VIDEO_INFO_HEIGHT(&vinfo);
   // NV12: plane 0 = Y (stride = width), plane 1 = UV (stride = width).
   // gst_video_info 里 stride 通过 stride[i] 拿.
+  // v2.5 (2026-07-08) stride override happens in PullFrame (buffer visible). here we keep gstreamer-reported stride.
   *out_stride_y = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
   *out_stride_uv = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 1);
   return (*out_w > 0 && *out_h > 0);
@@ -94,6 +95,7 @@ bool GstMppDecoder::Start(const std::string& uri, int expected_w, int expected_h
   expected_w_ = expected_w;
   expected_h_ = expected_h;
   is_eos_ = false;
+  first_frame_dumped_ = false;
 
   // pipeline 描述:
   // filesrc → qtdemux → h264parse → mppvideodec(dma-feature=true, format=NV12)
@@ -195,6 +197,79 @@ bool GstMppDecoder::PullFrame(GstMppFrame& out_frame) {
   GstBuffer* buffer = gst_sample_get_buffer(sample);
   GstCaps* caps = gst_sample_get_caps(sample);
 
+  // v2.5 (2026-07-08) 一次性诊断 (每个 URI 第一帧). 打印 caps / n_memory / 每块 GstMemory / 每平面 offset stride,
+  // 旨在一秒看出三个绿条纹根因: (a) qtdemux 输出 mp4v 但 pipeline 强制 h264parse;
+  // (b) mppvideodec 输出多块 DMA-BUF (Y fd + UV fd) 而当前只取第一个 fd, UV 平面丢失;
+  // (c) NV12 stride 与 mpp 硬件实际分配 stride 不一致. 日志前缀 [gst_mpp_decoder][DIAG].
+  if (!first_frame_dumped_) {
+    first_frame_dumped_ = true;
+    if (caps != nullptr) {
+      gchar* caps_str = gst_caps_to_string(caps);
+      if (caps_str != nullptr) {
+        Logger::GetInstance().Log(std::string("[gst_mpp_decoder][DIAG] caps: ") + caps_str);
+        g_free(caps_str);
+      }
+    } else {
+      Logger::GetInstance().LogError("[gst_mpp_decoder][DIAG] caps == nullptr");
+    }
+    if (buffer != nullptr) {
+      guint mc = gst_buffer_n_memory(buffer);
+      std::ostringstream ss_mem;
+      ss_mem << "[gst_mpp_decoder][DIAG] mem_count=" << mc
+             << " buf_size=" << (long long)gst_buffer_get_size(buffer)
+             << " RGA_total=" << (long long)gst_buffer_get_size(buffer);
+      Logger::GetInstance().Log(ss_mem.str());
+      for (guint i = 0; i < mc; ++i) {
+        GstMemory* mem = gst_buffer_peek_memory(buffer, i);
+        if (mem == nullptr) continue;
+        gint fd = -1;
+        gboolean is_dmabuf = gst_is_dmabuf_memory(mem);
+        if (is_dmabuf) fd = gst_dmabuf_memory_get_fd(mem);
+        gsize off = 0, maxsz = 0;
+        gst_memory_get_sizes(mem, &off, &maxsz);
+        std::ostringstream ss;
+        ss << "[gst_mpp_decoder][DIAG] mem[" << i << "] dmabuf=" << (is_dmabuf ? "yes" : "no")
+           << " fd=" << fd << " off=" << (unsigned long long)off
+           << " max=" << (unsigned long long)maxsz;
+        Logger::GetInstance().Log(ss.str());
+      }
+      if (caps != nullptr) {
+        GstVideoInfo vinfo;
+        if (gst_video_info_from_caps(&vinfo, caps)) {
+          std::ostringstream ss;
+          ss << "[gst_mpp_decoder][DIAG] planes w=" << GST_VIDEO_INFO_WIDTH(&vinfo)
+             << " h=" << GST_VIDEO_INFO_HEIGHT(&vinfo)
+             << " size=" << GST_VIDEO_INFO_SIZE(&vinfo)
+             << " stride[0,1,2]=" << GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0)
+             << "," << GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 1)
+             << "," << GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 2)
+             << " offset[0,1,2]=" << GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 0)
+             << "," << GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 1)
+             << "," << GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 2)
+             << " fmt=" << (int)GST_VIDEO_INFO_FORMAT(&vinfo);
+          Logger::GetInstance().Log(ss.str());
+        }
+      }
+      // 给出最可能的根因结论 (便于一眼定位绿条纹原因).
+      if (mc == 1) {
+        Logger::GetInstance().Log("[gst_mpp_decoder][DIAG] layout=1 (single DMA-BUF, Y+UV contiguous) -> ok, no extra fix for NV12.");
+      } else if (mc >= 2) {
+        std::ostringstream ss;
+        ss << "[gst_mpp_decoder][DIAG] layout=" << mc << " (multi DMA-BUF) fds=[";
+        for (guint i = 0; i < mc && i < 8; ++i) {
+          GstMemory* mem = gst_buffer_peek_memory(buffer, i);
+          int d = -1;
+          if (mem != nullptr && gst_is_dmabuf_memory(mem)) d = gst_dmabuf_memory_get_fd(mem);
+          if (i > 0) ss << ",";
+          ss << d;
+        }
+        ss << "] -> likely Y-fd + UV-fd separate, our PullFrame returns only the first fd;";
+        Logger::GetInstance().Log(ss.str());
+        Logger::GetInstance().LogError("[gst_mpp_decoder][DIAG] POTENTIAL ROOT CAUSE: UV plane missing -> green stripes. Fix: extend GstMppFrame to carry per-plane fds+offsets or fetch UV fd separately via GstVideoMeta.");
+      }
+    }
+  }
+
   out_frame.dma_buf_fd = ExtractDmaBufFd(buffer);
   if (out_frame.dma_buf_fd < 0) {
     Logger::GetInstance().LogError(
@@ -214,6 +289,21 @@ bool GstMppDecoder::PullFrame(GstMppFrame& out_frame) {
     out_frame.is_eos = true;
     is_eos_ = true;
     return false;
+  }
+  // v2.5 (2026-07-08) stride true-derive: gstreamer 上报 stride 经常小于实际 (mppvideodec dma-feature 64-byte 对齐, 例 width=2560 上 2560 实 2816). 后端 RGA/cvtColor 拿上 报 stride 算 UV 偏移 -> 绿条纹. 这里用 buf_size / (1.5 * height) 反推.
+  if (out_frame.height > 0 && stride_y > 0) {
+    gsize bsize = gst_buffer_get_size(buffer);
+    if (bsize > 0) {
+      int actual_stride = static_cast<int>(bsize / (static_cast<gsize>(out_frame.height) * 3 / 2));
+      if (actual_stride > stride_y && actual_stride > out_frame.width) {
+        Logger::GetInstance().Log(std::string("[gst_mpp_decoder][DIAG] stride_override: gstr=") +
+                                 std::to_string(stride_y) + ", buf_size=" + std::to_string(static_cast<long long>(bsize)) +
+                                 ", h=" + std::to_string(out_frame.height) +
+                                 ", actual=" + std::to_string(actual_stride));
+        stride_y = actual_stride;
+        stride_uv = actual_stride;
+      }
+    }
   }
   out_frame.stride_y = stride_y;
   out_frame.stride_uv = stride_uv;

@@ -81,6 +81,8 @@ class GstMppDecoder {
   int expected_w_ = 0;
   int expected_h_ = 0;
   bool is_eos_ = false;
+  // v2.5 (2026-07-08) 一次性诊断位: 每个 pipeline (URI) 第一帧输出详细 caps/内存/平面布局, 帮助定位 NV12 绿条纹.
+  bool first_frame_dumped_ = false;
 };
 
 }  // namespace image_stitching

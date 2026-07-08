@@ -1,65 +1,58 @@
 %YAML:1.0
 ---
-# v2 输入源描述 (阶段 2 引入).
-# InitVideoCapture 优先读本文件, 加载失败时 fallback 到 t50..t53.mp4 数据集路径.
-# 阶段 3 之前: type: mipi 会被跳过 (走告警, 不进 FFmpeg 线程).
-# 阶段 3 之后: type: mipi 会启动 V4L2 采集线程, type: file 走原 FFmpeg 线程.
+# ============================================================
+# v2 阶段输入源描述 (阶段 2 引入). InitVideoCapture 优先读本文件, 加载失败时 fallback 到默认.
+# v2.5 (2026-07-08): datasets/2k-test/*.mp4 是 MPEG-4 Visual (mp4v), gst_mpp_decoder pipeline
+# 走 qtdemux+h264parse+mppvideodec, mp4v 与 video/x-h264 caps 不匹配 → 绿条纹.
+# 修复路径: 板上跑 batch_transcode_to_h264.sh 把 2k-test/*.mp4 转 2k-test-h264/*.mp4 (H.264).
+# 本 yaml 的 uri 已固定指 ../datasets/2k-test-h264/, 直接 sed 替换即可.
 #
 # 字段:
-#   type:        mipi | file
-#   uri:         /dev/videoN (mipi) 或 ../datasets/2k-test/tXX.mp4 (file)
+#   type:        file (mipi 待阶段 3 启用 V4L2)
+#   uri:         ../datasets/2k-test-h264/tXX.mp4
 #   width/height: 期望分辨率, 启动时校验
-#   fps:         目标帧率, 阶段 5 写死 30
-#   pixel_format: NV12 (从 rkisp_mainpath 出来的格式, 阶段 1 验证后填入)
-#
+#   fps:         目标帧率 30
+#   pixel_format: NV12 (rkisp_mainpath 输出)
 # 顶层:
-#   sync_window_ms:  阶段 4 时间戳同步窗口, 默认 16ms (60fps 一帧预算)
-#   auto_calibrate:  阶段 3 启动期自标定, 默认 0 (off)
-#
-# 当前默认: type: file, 走数据集调试 (与 v1 行为一致, 不依赖摄像头驱动).
-# 切换到摄像头: 把 type 改成 mipi, uri 改成 /dev/videoN. 4 路同改.
-#
-# 帧率决策 (2026-06-26): 工程起步 30fps, 留 50% 余量.
-# GC4683 sensor 物理能力 60fps, 厂商应按 60fps 配 init table + link freq + DTS.
-# 工程层只用 30fps, 即 sensor 能力的 50%, 拼接端 33.3ms 帧预算够用 (实测 ~20-30ms).
-# 远期真要切 60fps 真机跑: 改下面 4 个 cam 块的 fps: 60, sensor 重配, 不动 C++ 代码.
----
+#   sync_window_ms:  阶段 4 时间戳同步窗口, 默认 16ms
+#   auto_calibrate:  阶段 3 启动期自标定, 默认 0
+# ============================================================
 sync_window_ms: 16
 auto_calibrate: 0
 cameras:
    - type: file
-       uri: ../datasets/2k-test/t50.mp4
-       width: 2560
-       height: 1440
-       fps: 30
-       pixel_format: NV12
+     uri: ../datasets/2k-test-h264/t50.mp4
+     width: 2560
+     height: 1440
+     fps: 30
+     pixel_format: NV12
    - type: file
-       uri: ../datasets/2k-test/t51.mp4
-       width: 2560
-       height: 1440
-       fps: 30
-       pixel_format: NV12
+     uri: ../datasets/2k-test-h264/t51.mp4
+     width: 2560
+     height: 1440
+     fps: 30
+     pixel_format: NV12
    - type: file
-       uri: ../datasets/2k-test/t52.mp4
-       width: 2560
-       height: 1440
-       fps: 30
-       pixel_format: NV12
+     uri: ../datasets/2k-test-h264/t52.mp4
+     width: 2560
+     height: 1440
+     fps: 30
+     pixel_format: NV12
    - type: file
-       uri: ../datasets/2k-test/t53.mp4
-       width: 2560
-       height: 1440
-       fps: 30
-       pixel_format: NV12
+     uri: ../datasets/2k-test-h264/t53.mp4
+     width: 2560
+     height: 1440
+     fps: 30
+     pixel_format: NV12
    - type: file
-       uri: ../datasets/2k-test/t40.mp4
-       width: 2560
-       height: 1440
-       fps: 30
-       pixel_format: NV12
+     uri: ../datasets/2k-test-h264/t40.mp4
+     width: 2560
+     height: 1440
+     fps: 30
+     pixel_format: NV12
    - type: file
-       uri: ../datasets/2k-test/t41.mp4
-       width: 2560
-       height: 1440
-       fps: 30
-       pixel_format: NV12
+     uri: ../datasets/2k-test-h264/t41.mp4
+     width: 2560
+     height: 1440
+     fps: 30
+     pixel_format: NV12

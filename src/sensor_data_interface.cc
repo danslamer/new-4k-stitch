@@ -110,10 +110,27 @@ const CameraSourceList& GetCameraSourceList() { return g_camera_source_list; }
 
 // 解析 params/camera_sources.yaml, 用 OpenCV FileStorage (项目已依赖).
 // 失败时 (文件不存在 / 解析错) 返回 false, 保持 g_camera_source_list 为空,
-// 触发 InitVideoCapture 的 fallback 逻辑 (与 v1 行为一致).
-// OpenCV 4.5.4 的 YAML 解析器在格式上比 libyaml 严, 任何 cv::Exception 都
-// 一律吞掉返回 false — 主流程 (InitVideoCapture) 只看返回值, 不应该被
-// yaml 格式问题 crash. 这与本函数注释"加载失败时 fallback"的契约一致.
+
+//
+// v2.5 (2026-07-08) URI canonicalizer: 板端 gstreamer filesrc 不接受 .. 形式相对路径,
+// 启动阶段会报 "No such file" 直接 abort. 这里把 yaml uri 和 default
+// `../datasets/2k-test-h264/` 都规范成 CWD+uri 的绝对路径再喂 mpp decoder.
+// 注: 不用 std::filesystem 因为本项目 CMakeLists 锁在 C++11, std::filesystem 是 C++17.
+// 用 POSIX realpath() 实现.
+//
+static std::string CanonicalizeUri(const std::string& uri) {
+  if (uri.empty()) return uri;
+  bool trailing_slash = !uri.empty() && uri.back() == '/';
+  char resolved[PATH_MAX];
+  if (realpath(uri.c_str(), resolved) != nullptr) {
+    std::string r(resolved);
+    if (trailing_slash && !r.empty() && r.back() != '/') r.push_back('/');
+    return r;
+  }
+  Logger::GetInstance().LogError(
+      std::string("[sensor_data_interface] CanonicalizeUri: realpath failed, keep as-is: ") + uri);
+  return uri;
+}
 static bool LoadCameraSourceList(const std::string& path) {
   try {
     cv::FileStorage fs(path, cv::FileStorage::READ);
@@ -146,7 +163,7 @@ static bool LoadCameraSourceList(const std::string& path) {
       } else {
         src.type = CameraSource::Type::kFile;
       }
-      cam["uri"] >> src.uri;
+            { std::string raw_uri; cam["uri"] >> raw_uri; src.uri = CanonicalizeUri(raw_uri); }
       cam["width"] >> src.width;
       cam["height"] >> src.height;
       cam["fps"] >> src.fps;
@@ -188,7 +205,7 @@ static bool LoadCameraSourceList(const std::string& path) {
 // 4K 源在 datasets/4k-test/, 用 tools/downscale_4k_to_2k.py 降下来.
 // 注: t40/t41 是临时占位, 后续用真实 6 路替换. 阶段 6 真机跑通前需替换.
 static std::vector<CameraSource> LoadDefaultDatasetSources() {
-  const std::string video_dir = "../datasets/2k-test-h264/";
+  const std::string video_dir = CanonicalizeUri("../datasets/2k-test-h264/");
   const std::vector<std::string> default_files = {
       "t50.mp4", "t51.mp4", "t52.mp4", "t53.mp4",
       "t40.mp4", "t41.mp4"};
@@ -603,3 +620,4 @@ std::vector<double> SensorDataInterface::GetDecodeFpsSnapshot() {
   std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
   return decode_fps_vector_;
 }
+

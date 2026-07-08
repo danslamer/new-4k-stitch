@@ -114,6 +114,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | `src/roi_visualizer.cc:158` `SDL_SetHint(SDL_HINT_VIDEODRIVER, ...)` | 老 SDL 2.0.22+ 头文件已删, 编译失败 | `setenv("SDL_VIDEODRIVER", ...)` 跨版本兼容 |
 | **v2.4 (2026-07-06)**: 弃 FFmpeg rkmpp wrapper, 改 gstreamer mppvideodec | FFmpeg rkmpp 0 帧 (vendor 不维护 + ABI 不兼容) | gstreamer1.0-rockchip1 mppvideodec `dma-feature=true` → DMA-BUF, vendor 官方推荐路径 |
 
+| **v2.5 (2026-07-08)**: datasets/2k-test 实际是 MPEG-4 Visual (mp4v), 与 gst_mpp_decoder pipeline (qtdemux + h264parse + mppvideodec) caps 不匹配 → 绿条纹. 修复: 板上 batch_transcode_to_h264.sh (libx264 sw + faststart, 不用 h264_rkmpp) 把 2k-test/*.mp4 转 2k-test-h264/*.mp4, 然后改 yaml 路径 | datasets/2k-test/t50.mp4 等 6 路都是 mp4v, h264parse 收不到 video/x-h264, gstreamer 用 identity bypass 部分数据, mppvideodec 拿到错位 NAL → 解码出绿条纹 | 板上 tools/fix_green_stripes.sh 一键修复; pipeline 加 [gst_mpp_decoder][DIAG] 日志段 (每个 URI 第一帧打印 caps/n_memory/fd/stride), 验证 multi-fd-vs-single-fd 与 mppvideodec 输出是否符合预期. yaml 缩进 5-space (OpenCV FileStorage 标准), 路径统一指 ../datasets/2k-test-h264/. |
+
 **为什么 1920 magic number 改成 `common_w/2`**：2K 输入时自然 = 1280, 4K 输入时自然 = 1920, 不再硬编码, 对任何分辨率自适应；2×3 迁移时**不需要重新推导上限**。
 
 ## 开发板选型 (2026-06-29 决策)
@@ -306,6 +308,57 @@ sudo cat /sys/class/devfreq/27800000.gpu/load                      # GPU 负载
 7. **GLES warp 路线**: 尝试 `RkGlesWarper` 处理 RGA 搞不定的非仿射 warp, 走 EGLImageKHR + DMA-BUF 导入。初始化失败时静默回退到 ROI+RGA+OpenCL。**当前不作为主路径** — 布局由 ROI 驱动
 8. **当前默认**: ROI bootstrap (多帧, 取最高置信度) → 2×2 布局 → RGA 裁剪/拷贝 → OpenCL 羽化。GLES warp 是透明可选的零拷贝加速器, 不决定布局
 
+## 绿条纹诊断与修复 (2026-07-08 v2.5)
+
+**症状**: image-stitching 跑起来后, 拼接输出每路都有大量绿色条纹, 不是原数据集画面.
+
+**根因 (板上实测确认)**: `datasets/2k-test/*.mp4` 是 MPEG-4 Visual (mp4v), 但 `src/gst_mpp_decoder.cc` 的 pipeline 强制 `qtdemux → h264parse → mppvideodec`. qtdemux 按 stsd `mp4v` 输出 `video/mpeg`, 与 h264parse 的 `video/x-h264` caps 不匹配, gstreamer 在 link 失败时会用 identity bypass 部分数据, mppvideodec 拿到错位 NAL → 解码出绿色条纹.
+
+**修复方案 (板上自动)**:
+
+```bash
+# 一次性 (PC 端推文件, 板上跑一键修复):
+bash sync_green_stripe_fix.sh          # PC 端, 默认 remote=rockemb alias
+
+# 或者板端手工:
+ssh rocktech@192.168.137.100
+cd ~/Projects/new-4k-stitch
+bash tools/fix_green_stripes.sh        # 一键: transcode + sed yaml + rebuild + restart
+tail -f logs/image-stitching.log | grep DIAG    # 看 layout=1 (单 fd) 还是 layout>=2 (multi fd)
+```
+
+**转码器说明**: `tools/batch_transcode_to_h264.sh` 用 `ffmpeg -c:v libx264 -movflags +faststart`. **绝不** 用 `h264_rkmpp` (vendor 已确认会 segfault). libx264 sw 编码在 aarch64 板上 ~100x 实时, 6 路 2K 数据集 < 1 分钟转完.
+
+**诊断 [DIAG] 段输出含义** (`src/gst_mpp_decoder.cc` v2.5 新增):
+
+| `[DIAG]` 行 | 含义 |
+|---|---|
+| `caps: video/x-raw(memory:DMABuf),format=NV12,w=2560,h=1440` | mppvideodec 正确输出 DMA-BUF + NV12 |
+| `mem_count=1 ... dmabuf=yes fd=N` | 单个 DMA-BUF, Y+UV 连续, **OK** |
+| `mem_count=2 fds=[Y_fd,UV_fd]` | **POTENTIAL ROOT CAUSE**: 两块 DMA-BUF, Y/UV 分离, 当前只取首个 fd → UV 平面丢失 → 绿条纹 |
+| `stride[0,1,2]=2560,2560,0` | NV12 平面 stride 正常 (UV stride = Y stride, 最后一平面 padding 0) |
+| `offset[0,1,2]=0,Y*H,0` | UV offset = Y plane size, NV12 标准布局 |
+
+**如果 DIAG 段显示 `mem_count=2`**, 主因不是 codec 不匹配, 而是 mppvideodec 输出多 fd. 此时修复路径: 扩展 `struct GstMppFrame` 加 `int dma_buf_fd_uv; gsize offset_uv;`, 把两个 fd 都喂给 RGA / OpenCL.
+
+**手动诊断命令**:
+
+```bash
+# 板上:
+bash tools/diagnose_pipeline.sh               # 看 yaml + ffprobe + gst-inspect + gst-launch 烟测
+bash tools/diagnose_pipeline.sh --all         # yaml 里所有 6 路都跑
+```
+
+**相关 git 操作**:
+
+```bash
+git add src/gst_mpp_decoder.cc include/gst_mpp_decoder.h \
+        tools/batch_transcode_to_h264.sh tools/diagnose_pipeline.sh tools/fix_green_stripes.sh \
+        sync_green_stripe_fix.sh params/camera_sources.yaml AGENTS.md
+git commit -m "v2.5: 绿条纹 bug fix — 批量转码 mpeg4→h264 + 一次性诊断日志"
+```
+
 ## 引用论文
 
 > Du, Chengyao, et al. (2020). *GPU based parallel optimization for real time panoramic video stitching.* Pattern Recognition Letters, 133, 62-69.
+
