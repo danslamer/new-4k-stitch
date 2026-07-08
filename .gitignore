@@ -5,3 +5,4 @@ cmake-build*
 /results/*
 /build/*
 /.ssh/*
+/diag_pngs/*
