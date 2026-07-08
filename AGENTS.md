@@ -6,7 +6,10 @@ Codex / Claude Code / 其他 AI agent 入口。详细设计、踩坑记录、操
 - **`docs/NETWORK_CAMERA_PLAN.md`** — **当前阶段计划**（v3.0, 2026-07-08）：6 路 IP camera (PoE) → 2×3 拼接，Sprint 0/1/2 三段，被该文件引用的 `tools/sprint0_*.sh` 必须保留
 - **`docs/CAMERA_PAGE_INTEGRATION.md`** — 浏览器管理平台（C++ 内嵌 cpp-httplib, 端口 8080）接入方案 + 阶段 1 部署运维
 
----
+- **docs/RTSP_OUTPUT_PLAN.md** — **v3.1 输出侧计划**（拼接全景 RTSP 服务化, 端口 8554, `rtsp://<board>:8554/stitch` + `/stitch_sub`）
+
+
+- **`docs/QUICK_START_IP_ONLY.md`** — `改 IP 就能用` 5 步入门 (commit set_cam_ips.sh 后, 改完 IP + 一行启动, 自动走 RTSP camera 模式)---
 
 ## 仓库定位
 

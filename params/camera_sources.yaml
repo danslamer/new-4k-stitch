@@ -27,7 +27,7 @@
 #   sync_window_ms   : 6 路 PTS 拉齐窗, 默认 16ms (1 帧 @60fps)
 #   auto_calibrate   : Sprint 2 启动期自标定, 默认 false
 #
-# 占位 IP: 192.168.10.21 ~ 26, 板子: 192.168.10.100
+# 当前 IP: 6 路 192.168.1.11..16 摄像机, 板端: 192.168.1.10 (set_cam_ips.sh 可一键换)
 # ============================================================
 
 sync_window_ms: 16
@@ -36,13 +36,13 @@ auto_calibrate: 0
 cameras:
   # ----- cam0: 2×3 网格左上 -----
   - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.21:554/Streaming/Channels/101
+    uri: rtsp://admin:123456@192.168.1.11:554/video1
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
     user_id: admin
-    user_pw: CHANGE_ME
+    user_pw: 123456
     latency_ms: 120
     use_tcp: true
     connect_timeout_s: 10
@@ -52,13 +52,13 @@ cameras:
 
   # ----- cam1: 2×3 网格右上 -----
   - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.22:554/Streaming/Channels/101
+    uri: rtsp://admin:123456@192.168.1.12:554/video1
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
     user_id: admin
-    user_pw: CHANGE_ME
+    user_pw: 123456
     latency_ms: 120
     use_tcp: true
     connect_timeout_s: 10
@@ -68,13 +68,13 @@ cameras:
 
   # ----- cam2: 2×3 网格左中 -----
   - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.23:554/Streaming/Channels/101
+    uri: rtsp://admin:123456@192.168.1.13:554/video1
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
     user_id: admin
-    user_pw: CHANGE_ME
+    user_pw: 123456
     latency_ms: 120
     use_tcp: true
     connect_timeout_s: 10
@@ -84,13 +84,13 @@ cameras:
 
   # ----- cam3: 2×3 网格右中 -----
   - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.24:554/Streaming/Channels/101
+    uri: rtsp://admin:123456@192.168.1.14:554/video1
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
     user_id: admin
-    user_pw: CHANGE_ME
+    user_pw: 123456
     latency_ms: 120
     use_tcp: true
     connect_timeout_s: 10
@@ -100,13 +100,13 @@ cameras:
 
   # ----- cam4: 2×3 网格左下 -----
   - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.25:554/Streaming/Channels/101
+    uri: rtsp://admin:123456@192.168.1.15:554/video1
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
     user_id: admin
-    user_pw: CHANGE_ME
+    user_pw: 123456
     latency_ms: 120
     use_tcp: true
     connect_timeout_s: 10
@@ -116,13 +116,13 @@ cameras:
 
   # ----- cam5: 2×3 网格右下 -----
   - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.26:554/Streaming/Channels/101
+    uri: rtsp://admin:123456@192.168.1.16:554/video1
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
     user_id: admin
-    user_pw: CHANGE_ME
+    user_pw: 123456
     latency_ms: 120
     use_tcp: true
     connect_timeout_s: 10

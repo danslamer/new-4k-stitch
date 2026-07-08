@@ -369,6 +369,8 @@ Y 平面 + 交织 UV。`stride_w`/`stride_h` 可能 ≠ `width`/`height`（查 `
 - `AGENTS.md` — Agent 入口 / 编码规范 / 6 路硬编码位置速查 / 环境变量 / 可视化键盘映射
 - `docs/NETWORK_CAMERA_PLAN.md` — v3.0 当前活跃计划（6 路 IP camera, Sprint 0/1/2）
 - `docs/CAMERA_PAGE_INTEGRATION.md` — 浏览器管理平台（C++ http server, 端口 8080）方案 + 阶段 1 部署
+
+- docs/RTSP_OUTPUT_PLAN.md — v3.1 输出侧计划（拼接全景 RTSP 服务化, 端口 8554, `rtsp://<board>:8554/stitch`）
 - `src/gst_mpp_decoder.cc:DIAG 段` — 现场一拉 log 就看到 caps + stride 真相
 - `tools/post_flash_test.sh` — 烧录新镜像后一键 DTS 验证
 - `tools/sprint0_smoke.sh` — v3.0 Sprint 0 骨架贯通验收（PASS 才进 Sprint 1）

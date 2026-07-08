@@ -307,15 +307,33 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   // INPUT_SOURCE_MODE: dataset | camera, 默认 dataset (无 env 走历史数据集路径).
   //   dataset - 走默认 t50..t53.mp4 数据集, 忽略 yaml
   //   camera  - 走 params/camera_sources.yaml, 阶段 3 启用 V4L2 线程
+  // v3.1 (2026-07-08) "edit IP & run" UX:
+  //   用户只要改 IP, 不想 export INPUT_SOURCE_MODE=camera.
+  //   当 env 未设, 但 yaml 已加载且包含 rtsp 源时, 自动走 camera 模式.
+  //   显式 env 总是优先 (dataset / camera / 其它).
   const char* env_mode = std::getenv("INPUT_SOURCE_MODE");
-  std::string mode = env_mode ? env_mode : "dataset";
+  std::string mode;
+  if (env_mode != nullptr) {
+    mode = env_mode;
+  } else if (loaded) {
+    size_t n_rtsp = 0;
+    for (const auto& c : g_camera_source_list.cameras) {
+      if (c.is_rtsp()) ++n_rtsp;
+    }
+    if (n_rtsp >= 1) {
+      Logger::GetInstance().Log(
+          "[sensor_data_interface] INPUT_SOURCE_MODE 未设, yaml 含 " +
+          std::to_string(n_rtsp) + " 路 rtsp -> 自动选 camera 模式");
+      mode = "camera";
+    }
+  }
+  if (mode.empty()) mode = "dataset";
   if (mode != "dataset" && mode != "camera") {
     Logger::GetInstance().LogError(
         "[sensor_data_interface] INPUT_SOURCE_MODE='" + mode +
         "' invalid, expected dataset/camera, fallback to dataset");
     mode = "dataset";
   }
-
   if (mode == "camera") {
     if (!loaded) {
       Logger::GetInstance().LogError(
