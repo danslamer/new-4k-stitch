@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Downscale 4K (3840x2160) videos in datasets/4k-test to 2K (2560x1440),
 saving to datasets/2k-test, preserving filenames.
 
-Per CLAUDE.md v2 stage, the project runs at 2K (2560x1440) @ 30fps.
+Per AGENTS.md v3 stage, the project runs at 2K (2560x1440) @ 30fps.
 The source 4K videos are too large for end-to-end rkmpp pipeline tests
 at the v2 scale; downscaled copies let us run the same code paths.
 

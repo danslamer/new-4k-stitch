@@ -16,7 +16,7 @@
  *   - appsink 收到非 DMA-BUF 帧 (sw path) 必须直接 reject + 报错, 不能 fallback
  *   - 任何"暂时 sw 解码跑一下看效果"的提案都不应合入
  *   - 历史 FFmpeg rkmpp 路径: vendor 不维护 + 0 帧 (jellyfin-mpp 1.3.9 与板子 SDK 1.5.0 mpp_service ABI 不兼容), 已废弃
- *   - 详见 CLAUDE.md "架构硬约束" 节
+ *   - 详见 AGENTS.md "架构硬约束"
  */
 
 /**
@@ -717,4 +717,5 @@ std::vector<double> SensorDataInterface::GetDecodeFpsSnapshot() {
   std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
   return decode_fps_vector_;
 }
+
 

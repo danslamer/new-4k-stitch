@@ -1,11 +1,12 @@
-# new-4k-stitch
+﻿# new-4k-stitch
 
-Real-time multi-camera video stitcher for Rockchip ARM64 boards. Pipeline: FFmpeg rkmpp HW decode → DMA-BUF zero-copy → RGA crop/rotate (+ optional GLES warp) → OpenCL seam feathering → DRM output.
+实时多摄像头视频拼接器，Rockchip ARM64 开发板运行：6 路 IP camera → gstreamer1.0-rockchip1 mppvideodec → DMA-BUF 零拷贝 → RGA 裁剪/旋转 → OpenCL 接缝羽化 → DRM 输出。
 
 - **Primary target**: RK3588
-- **Verified on**: RK3576 (rocktech 主板, Ubuntu 22.04, kernel 6.1.75; RK3588 is expected to run unchanged, not yet validated)
-- **Target input**: **2K (2560×1440)**, 30 fps. v1 era 4K 输入已废弃 (搜索带宽 magic number 改为分辨率自适应, 见 `src/app.cc` 的注释)
-- **Target layout**: **2×3 (6 cameras, 2 cols × 3 rows)**. 当前代码仍跑 2×2 (4 cams), 按 [DEVELOPMENT_PLAN v2.3 §2](docs/DEVELOPMENT_PLAN.md) 直接改造为 6 路.
+- **Verified on**: RK3576 (rocktech 主板, Ubuntu 22.04, kernel 6.1.75)
+- **Target input**: **2K (2560×1440) @ 30 fps**, 6 路 RTSP
+- **Target layout**: **2×3 (6 cameras, 2 cols × 3 rows)**
+- **当前阶段**: v3.0 Sprint 0（IP camera 骨架贯通），详见 [`docs/NETWORK_CAMERA_PLAN.md`](docs/NETWORK_CAMERA_PLAN.md)
 
 ## Reference
 
@@ -16,74 +17,85 @@ Real-time multi-camera video stitcher for Rockchip ARM64 boards. Pipeline: FFmpe
 ```bash
 mkdir build && cd build
 cmake ..            # CMake 3.10+, C++11
-make
+make -j$(nproc)
 ./image-stitching
 ```
 
-- CMake options: `ENABLE_RK_HARDWARE_DECODING=ON`, `ENABLE_RGA_DMA_STITCHING=ON` (default ON; both required for the zero-copy pipeline)
-- FFmpeg root hardcoded to `$ENV{HOME}/dev/ffmpeg60` — must exist on target with `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH` set
-- Requires: OpenCV ≥ 4.5, FFmpeg (rkmpp), OpenCL, EGL, GLESv2, GBM, librga, libdrm, SDL2
-- **No tests, no linter, no CI.** Manual verification on Rockchip board only.
+- CMake options: `ENABLE_RK_HARDWARE_DECODING=ON`, `ENABLE_RGA_DMA_STITCHING=ON`（默认 ON, 零拷贝 pipeline 必需）
+- FFmpeg 链接：CMakeLists.txt 默认 `/usr/lib/aarch64-linux-gnu`, 可 `-DFFMPEG_LIB_DIR=...` 覆盖（多架构编译坑见 [`docs/HISTORY.md`](docs/HISTORY.md) §FFmpeg）
+- 依赖：OpenCV ≥ 4.5, gstreamer-1.0 + gstreamer1.0-rockchip1（mppvideodec）, OpenCL, EGL, GLESv2, GBM, librga, libdrm, SDL2
+- **无单元测试、无 linter、无 CI** — 仅 Rockchip 板端手动验证
+
+### 输入源切换
+
+```bash
+unset INPUT_SOURCE_MODE                       # 默认: dataset fallback（v3.0 占位用）
+export INPUT_SOURCE_MODE=camera               # 走 params/camera_sources.yaml（v3.0 = 6 路 RTSP）
+```
+
+### 性能 / Sprint 0 验收
+
+```bash
+SAVE_STITCH_FRAMES=0 SAVE_DIAGNOSTIC_FRAMES=0 ./image-stitching     # 纯 FPS
+bash tools/sprint0_smoke.sh                                          # v3.0 骨架贯通一键验收
+```
 
 ## Architecture
 
-Single executable `image-stitching`. Entrypoint: `src/app.cc:1049` `main()` → `App::run_stitching()` (noreturn loop).
+单可执行 `image-stitching`。入口 `src/app.cc` `main()` → `App::run_stitching()`（noreturn loop）。
 
-| Module | Role |
-|--------|------|
-| `src/app.cc` | Main loop, ROI bootstrap, layout |
-| `src/sensor_data_interface.cc` | One decode thread per camera, queued frame supply |
-| `src/image_stitcher.cc` | RGA/GLES warp, OpenCL seam blending, `dma_buf_cache_` |
-| `src/rk_gles_warper.cc` | EGL+GLES warp via DMA-BUF import (optional) |
-| `src/drm_allocator.cc` | DRM dumb buffer alloc/map/free |
-| `src/logger.cc` | Singleton logger, results dir |
-| `src/roi_config.cc` | ROI offset YAML read/write (`params/roi_tuning.yaml`) |
-| `src/roi_visualizer.cc` | SDL2-based interactive tuning |
-| `src/stitching_param_generater.cc` | Camera calibration + warp map (initialized but **not** in active path) |
+| 模块 | 职责 |
+|---|---|
+| `src/app.cc` | 主循环、ROI bootstrap、布局 |
+| `src/sensor_data_interface.cc` | 每路相机一个解码/采集线程，队列帧供应（v3.0: rtspsrc + watchdog）|
+| `src/gst_mpp_decoder.cc` | gstreamer pipeline（v2.4 起接管 mppvideodec；v3.0 加 RTSP/watchdog），输出 NV12 DMA-BUF fd + DIAG 诊断段 |
+| `src/image_stitcher.cc` | RGA/GLES warp, OpenCL 接缝, `dma_buf_cache_` |
+| `src/rk_gles_warper.cc` | EGL+GLES warp via DMA-BUF import（可选，初始化失败静默回退）|
+| `src/drm_allocator.cc` | DRM dumb buffer 分配 |
+| `src/roi_config.cc` + `src/roi_visualizer.cc` | ROI YAML 读写 + SDL2 可视化调参 |
+| `src/http_server.cc` + `src/status_writer.cc` | CameraPage HTTP server（cpp-httplib, 端口 8080）+ 状态 JSON 写入 |
+| `src/stitching_param_generater.cc` | 相机标定 + warp map（已初始化但**不在主 pipeline**, 不要"激活"它）|
 
-### Pipeline modes (defined in `src/app.cc`)
+### Pipeline modes（`src/app.cc` 定义）
 
-1. **ROI + RGA + OpenCL** (default): multi-frame ROI → 2×2 layout → RGA crop/copy → OpenCL feather
-2. **GLES Warp + RGA + OpenCL**: if warp data valid, GLES warp → RGA copy → OpenCL feather
-3. Mode 2 falls back to mode 1 automatically on GLES init failure
+1. **ROI + RGA + OpenCL**（默认）：多帧 ROI → 2×2/2×3 布局 → RGA 裁剪/拷贝 → OpenCL 羽化
+2. **GLES Warp + RGA + OpenCL**：GLES 非仿射 warp → RGA 拷贝 → OpenCL 羽化
+3. 模式 2 在 GLES 初始化失败时静默回退到模式 1
 
-## Current status: 4-cam → 6-cam (2×3) direct migration
+## Current status（v3.0）
 
-**Project target**: 6 路 GC4683 MIPI → 2×3 (6-cam, 2 cols × 3 rows) panoramic stitch. Current code is **2×2 (4-cam)**, and we are migrating **directly to 6-cam 2×3 without intermediate 4-cam validation** per [DEVELOPMENT_PLAN.md v2.3](docs/DEVELOPMENT_PLAN.md).
-
-**Phase status (2026-06-30)**:
-
-| # | Phase | Status |
+| 阶段 | 状态 | 备注 |
 |---|---|---|
-| 1 | 板子与驱动可用性测试 | ⏳ SSH ✅, 驱动 ✅, 6 路拓扑待确认 ([HISTORY §0x06](docs/HISTORY.md)) |
-| **2** | **6 路数据集输入适配** | **⏳ 下一步** (改 yaml + 默认文件 + roi_offsets → 6 路) |
-| 3 | 6 路 2×3 代码迁移 | ⏳ 等阶段 2 |
-| 4 | 6 路 V4L2 摄像头采集 | ⏳ 等镜头到位 |
-| 5 | 6 路相机标定 | ⏳ 与 3-4 并行 |
-| 6 | 6 路 2×3 真机跑通 | ⏳ 等 3-5 |
+| v2.x 6 路 2×3 layout（dataset fallback）| ✅ 板上实测 6 路全 100+ fps @ 100% DMA-BUF | 绿条纹修复后 (2026-07-08), 见 [`docs/HISTORY.md`](docs/HISTORY.md) § 绿条纹 |
+| v3.0 Sprint 0 骨架贯通 | ⏳ 立即 | yaml + TCP/554 + gst-launch 烟测 + 编译 + 30s 端到端（`tools/sprint0_smoke.sh` 必须 PASS）|
+| v3.0 Sprint 1 同步 + 稳定 | ⏳ 计划 | watchdog + NTP/PTP、L2 |
+| v3.0 Sprint 2 标定 + 美化 | ⏳ 计划 | 实际 K 矩阵覆盖 FOV 反推占位、标定板视频录入 |
 
-**Hardcoded 4-cam assumptions** (to be removed in phase 3): `BuildDefaultTuning`'s `i < 4`, `EstimateOverlaps2x2` / `BuildCameraRois2x2` / `BuildStitchLayout2x2`, `roi_config.h`'s `roi_offsets[4]`, `BlendSeams`' `cl_in(4)` + 4 dispatch_seam calls, `params/camera_sources.yaml`'s 4 cam entries, `params/roi_tuning.yaml`'s cam0..cam3 keys, the visualizer's 4-cam cycling. Full list at [CLAUDE.md §"2×3 迁移硬编码点速查"](CLAUDE.md). **Read `CLAUDE.md` and `DEVELOPMENT_PLAN.md` before touching this code.**
+**6 路硬编码改造列表**（迁移进度, 集中在 [`AGENTS.md`](AGENTS.md) "6 路硬编码位置速查"）：`roi_offsets[6]`、`i < 6`、`EstimateOverlaps2x3` / `BuildCameraRois2x3` / `BuildStitchLayout2x3` / `BlendSeams` 6 路、`roi_visualizer` Tab 6 路循环 — 全部已完成。
+
+**新代码动 `AGENTS.md` 前必读**：6 路硬编码位置速查（[`AGENTS.md`](AGENTS.md)）+ 当前活跃计划（[`docs/NETWORK_CAMERA_PLAN.md`](docs/NETWORK_CAMERA_PLAN.md)）+ 踩过的坑（[`docs/HISTORY.md`](docs/HISTORY.md) § 3）。
 
 ## Environment variables
 
-| Variable | Purpose |
-|----------|---------|
-| `SAVE_STITCH_FRAMES`, `SAVE_DIAGNOSTIC_FRAMES`, `SAVE_FRAME_INTERVAL`, `DIAGNOSTIC_FRAME_LIMIT` | Disk output control |
-| `INPUT_SOURCE_MODE` | `dataset` (default) or `camera` |
-| `STITCH_K_FOCAL_SCALE`, `STITCH_K_FX/FY_SCALE`, `STITCH_K_CX/CY_OFFSET` | Global K-matrix tuning |
-| `STITCH_K_FOCAL_SCALE_CAM_0..3` | Per-camera K tuning (extend to `_CAM_5` for 2×3) |
-| `STITCH_DEBUG_LEVEL`, `RK_GLES_WARPER_DEBUG_LEVEL` | Debug verbosity |
-| `ENABLE_VISUAL_TUNING` (default 1) | Show SDL2 window |
-| `SHOW_ROI_MARKERS` (default 1) | Draw ROI borders |
-| `USE_ROI_CONFIG` (default 1) | Load `params/roi_tuning.yaml` on startup; `0` = force re-detect and overwrite |
-| `SKIP_BOOTSTRAP` (default 0) | Fixed-rig mode (车载 GC4683 场景): YAML 存在 → 用 YAML; YAML 缺失 → 仍跑一次 bootstrap 兜底 (详 [HISTORY §6.5](docs/HISTORY.md)) |
+| 变量 | 用途 |
+|---|---|
+| `SAVE_STITCH_FRAMES`, `SAVE_DIAGNOSTIC_FRAMES`, `SAVE_FRAME_INTERVAL`, `DIAGNOSTIC_FRAME_LIMIT` | 落盘控制 |
+| `INPUT_SOURCE_MODE` | `dataset`（默认, fallback）或 `camera`（走 yaml）|
+| `STITCH_K_FOCAL_SCALE`, `STITCH_K_FX/FY_SCALE`, `STITCH_K_CX/CY_OFFSET` | 全局 K 矩阵调参 |
+| `STITCH_K_FOCAL_SCALE_CAM_0..5` | 单相机焦距缩放（v3.0: 6 路已扩）|
+| `STITCH_DEBUG_LEVEL`, `RK_GLES_WARPER_DEBUG_LEVEL` | 调试 verbosity |
+| `ENABLE_VISUAL_TUNING`（默认 1）| 显示 SDL2 窗口 |
+| `SHOW_ROI_MARKERS`（默认 1）| 画 ROI 边框 |
+| `USE_ROI_CONFIG`（默认 1）| 启动时读 `params/roi_tuning.yaml`；`0` = 强制重检并覆盖 |
+| `SKIP_BOOTSTRAP`（默认 0）| 固定支架场景（详 [`docs/HISTORY.md`](docs/HISTORY.md) § 2.7） |
 
 ## Further reading
 
-- `CLAUDE.md` — code conventions, 2×3 migration checklist, hardcoded 4-cam locations, visualizer keyboard map, code-style standards, **6 路 board 选型**
-- `docs/DEVELOPMENT_PLAN.md` — **完整开发方案 v2.3** (2026-06-30 重构, 6 阶段, 跳过 4 路过渡态)
-- `docs/HISTORY.md` — full design-iteration timeline, problems encountered (4K search-band bug, RGA bandwidth, MMU/IOMMU cost, AFBC incompatibility), 6 路 MIPI 验证清单 (§0x06), operational playbook (FFmpeg/EGL/SSH/性能调优)
+- **[`AGENTS.md`](AGENTS.md)** — Agent 入口 / 编码规范 / 6 路硬编码位置速查 / 命名规范 / 调试开关 / 环境变量 / 可视化键盘映射
+- **[`docs/NETWORK_CAMERA_PLAN.md`](docs/NETWORK_CAMERA_PLAN.md)** — **当前活跃计划** (v3.0, 2026-07-08, 6 路 IP camera RTSP, Sprint 0/1/2)
+- **[`docs/HISTORY.md`](docs/HISTORY.md)** — 设计演进时间线 + **操作手册**（构建 / SSH / EGL / GPU 监控）+ **踩过的坑**（绿条纹 / stride / IOMMU / GLES warp 限制 / FFmpeg 多架构坑）
+- **[`docs/CAMERA_PAGE_INTEGRATION.md`](docs/CAMERA_PAGE_INTEGRATION.md)** — 浏览器管理平台（C++ 内嵌 cpp-httplib, 端口 8080）方案 + 阶段 1 部署运维
 
 ## Acknowledgments
 
-Original paper: Du et al. 2020 (cited above). Hardware adaptation for Rockchip SoCs based on community references at <https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation>.
+Original paper: Du et al. 2020（cited above）. Hardware adaptation for Rockchip SoCs based on community references at <https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation>.
