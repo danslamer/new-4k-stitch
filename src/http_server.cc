@@ -221,6 +221,8 @@ std::string handle_network() {
 // body 形如: {"cam": 0, "x": 100, "y": 200, "width": 1920, "height": 1080}
 // v3.x (2026-07-09): 改成绝对 ROI. {x, y, width, height} 任意子集, 没传的字段保留 yaml 原值.
 //   旧字段 offset_x / offset_y 不再读; 用摄像机页面的旧 API 会直接返回 error.
+// v3.x.1 (2026-07-09): 新增 "affine": [a, b, c, d, tx, ty] 字段. 6 个 double (json 用整数也接受, 自动转).
+//   不传 → affine 保留原值. 与 x/y/width/height 独立, 可以只改 affine 不动 ROI.
 std::string handle_roi_post(const std::string& body) {
     // 极简 JSON 解析: 找 "cam": N, "x": N, "y": N, "width": N, "height": N
     auto find_int = [&](const std::string& key) -> int {
@@ -238,6 +240,25 @@ std::string handle_roi_post(const std::string& body) {
     const int new_y = find_int("y");
     const int new_w = find_int("width");
     const int new_h = find_int("height");
+
+    // v3.x.1: 解析 affine: [a, b, c, d, tx, ty] 数组. 找 "affine": [ ... ].
+    std::vector<double> new_affine;
+    {
+        std::regex re("\"affine\"\\s*:\\s*\\[([^\\]]+)\\]");
+        std::smatch m;
+        if (std::regex_search(body, m, re)) {
+            std::string inner = m[1].str();
+            std::regex num_re("-?\\d+(?:\\.\\d+)?(?:[eE][-+]?\\d+)?");
+            std::sregex_iterator it(inner.begin(), inner.end(), num_re);
+            std::sregex_iterator end;
+            for (; it != end && new_affine.size() < 6; ++it) {
+                new_affine.push_back(std::atof(it->str().c_str()));
+            }
+            if (new_affine.size() != 6) {
+                return "{\"ok\": false, \"error\": \"affine must be 6 numbers [a b c d tx ty]\"}\n";
+            }
+        }
+    }
 
     std::string yaml_path = g_project_root + "/params/roi_tuning.yaml";
     std::string content = read_file_str(yaml_path);
@@ -260,6 +281,37 @@ std::string handle_roi_post(const std::string& body) {
             std::string t = trim(lines[i]);
             if (in_target && t.rfind(field + ":", 0) == 0) {
                 lines[i] = "   " + field + ": " + std::to_string(value);
+                return true;
+            }
+        }
+        return false;
+    };
+    auto try_replace_affine = [&](const std::vector<double>& vals) -> bool {
+        if (vals.empty()) return false;
+        std::ostringstream oss;
+        oss << "   affine: [" << vals[0];
+        for (size_t i = 1; i < vals.size(); ++i) oss << ", " << vals[i];
+        oss << "]";
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::string t = trim(lines[i]);
+            if (in_target && t.rfind("affine:", 0) == 0) {
+                lines[i] = oss.str();
+                return true;
+            }
+        }
+        // 没有 affine 行 → 在 cam 块末尾插入一行 (放在 closing 之前不合适, 直接 append 到最后 cam 字段).
+        // 简化: 找 cam 块的最后一行 (下一个 cam 之前的空行/注释行) 插入.
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::string t = trim(lines[i]);
+            if (t == key) {
+                // 找从这个 cam 到下一个 cam 之间的范围, 插在最后一行非空后面
+                size_t insert_pos = i + 1;
+                while (insert_pos < lines.size()) {
+                    std::string nt = trim(lines[insert_pos]);
+                    if (nt.rfind("cam", 0) == 0 && nt.find(':') != std::string::npos) break;
+                    insert_pos++;
+                }
+                lines.insert(lines.begin() + insert_pos, oss.str());
                 return true;
             }
         }
@@ -290,10 +342,11 @@ std::string handle_roi_post(const std::string& body) {
         if (try_replace("y", new_y))      replaced_any = true;
         if (try_replace("width", new_w))  replaced_any = true;
         if (try_replace("height", new_h)) replaced_any = true;
+        if (try_replace_affine(new_affine)) replaced_any = true;
     }
     if (!replaced_any) {
         return "{\"ok\": false, \"error\": \"cam" + std::to_string(cam)
-            + " not found in yaml (need x/y/width/height at least one)\"}\n";
+            + " not found in yaml (need x/y/width/height/affine at least one)\"}\n";
     }
 
     // 写临时文件 + rename 原子替换

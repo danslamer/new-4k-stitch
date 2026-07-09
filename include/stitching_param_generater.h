@@ -23,16 +23,22 @@ struct StitchingWarpData {
     vector<WarpMapEntry> entries;
     cv::Size panorama_size;
 
+    // v3.x.1 (2026-07-09): 改成 "至少一个 entry 有效". 旧版本要求所有 entry 都 valid,
+    //   但 v3.x.1 引入 per-cam affine 后, cam 0 (参照帧) 是单位阵, 没有 xmap/ymap,
+    //   它的 entry 永远 invalid. 如果走老逻辑 → GLES warper 整体不启用,
+    //   所有 cam 都退化到 RGA, 仿射变换白做.
+    // 改后: 只要有一个 cam 有 warp, 就启用 GLES warper; 没 affine 的 cam
+    //   在 WarpImages 里 per-cam valid() 失败, 单独走 RGA blit (原行为).
     bool valid() const {
         if (panorama_size.width <= 0 || panorama_size.height <= 0 || entries.empty()) {
             return false;
         }
         for (size_t i = 0; i < entries.size(); ++i) {
-            if (!entries[i].valid()) {
-                return false;
+            if (entries[i].valid()) {
+                return true;
             }
         }
-        return true;
+        return false;
     }
 };
 

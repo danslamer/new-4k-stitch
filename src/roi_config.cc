@@ -51,7 +51,7 @@ bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config
         }
     }
 
-    // v3.x (2026-07-09): 直接读 cam{i}.{x, y, width, height}. valid 由 width/height>0 推导.
+    // v3.x (2026-07-09): 直接读 cam{i}.{x, y, width, height, affine}. valid 由 width/height>0 推导.
     //   老的 offset_x/offset_y 字段被忽略 — 旧 yaml 第一次加载会全部 valid=false,
     //   App::App() 看到 valid 全 false 就重跑 bootstrap, 把新格式写回.
     static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3", "cam4", "cam5"};
@@ -70,6 +70,16 @@ bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config
         if (!cam_node["width"].empty())   r.width  = static_cast<int>(cam_node["width"]);
         if (!cam_node["height"].empty())  r.height = static_cast<int>(cam_node["height"]);
         r.valid = (r.width > 0 && r.height > 0);
+
+        // v3.x.1 (2026-07-09): affine 2x3 矩阵 [a b c d tx ty]. 缺失 = 单位阵 (无 warp).
+        cv::FileNode affine_node = cam_node["affine"];
+        if (!affine_node.empty() && affine_node.size() == 6) {
+            int idx = 0;
+            for (cv::FileNodeIterator it = affine_node.begin();
+                 it != affine_node.end() && idx < 6; ++it, ++idx) {
+                r.affine[idx] = static_cast<double>(*it);
+            }
+        }
     }
 
     fs.release();
@@ -110,7 +120,8 @@ bool RoiConfig::SaveToFile(const std::string& path, const StitchGlobalConfig& co
     fs << "interval" << config.save_interval;
     fs << "}";
 
-    // v3.x (2026-07-09): 写 cam{i}.{x, y, width, height}. valid 不写, 由 w/h>0 推导.
+    // v3.x (2026-07-09): 写 cam{i}.{x, y, width, height, affine}. valid 不写, 由 w/h>0 推导.
+    // v3.x.1 (2026-07-09): 同步写 affine: 2x3 行主序 [a b c d tx ty] (cv::Mat 表示法).
     static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3", "cam4", "cam5"};
     for (int i = 0; i < 6; ++i) {
         fs << cam_names[i] << "{";
@@ -118,6 +129,12 @@ bool RoiConfig::SaveToFile(const std::string& path, const StitchGlobalConfig& co
         fs << "y"      << config.camera_rois[i].y;
         fs << "width"  << config.camera_rois[i].width;
         fs << "height" << config.camera_rois[i].height;
+        fs << "affine" << "[" << config.camera_rois[i].affine[0]
+                          << config.camera_rois[i].affine[1]
+                          << config.camera_rois[i].affine[2]
+                          << config.camera_rois[i].affine[3]
+                          << config.camera_rois[i].affine[4]
+                          << config.camera_rois[i].affine[5] << "]";
         fs << "}";
     }
 

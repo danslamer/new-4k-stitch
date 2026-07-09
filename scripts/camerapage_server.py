@@ -308,7 +308,9 @@ class Handler(BaseHTTPRequestHandler):
     def handle_roi_post(self):
         """POST /api/roi: body = {"cam": 0, "x": 100, "y": 200, "width": 1920, "height": 1080}
         v3.x (2026-07-09): 改成绝对 ROI. {x, y, width, height} 任意子集, 没传字段保留 yaml 原值.
-        旧的 offset_x/offset_y 不再读, 用旧 API 会直接返回 400.
+          旧的 offset_x/offset_y 不再读, 用旧 API 会直接返回 400.
+        v3.x.1 (2026-07-09): 新增 "affine": [a, b, c, d, tx, ty] 字段. 6 个数字.
+          不传 → 保留 yaml 原值. 与 x/y/width/height 独立, 可以只改 affine 不动 ROI.
         """
         length = int(self.headers.get("Content-Length", 0))
         if length == 0 or length > 4096:
@@ -325,13 +327,24 @@ class Handler(BaseHTTPRequestHandler):
         new_y = body.get("y")
         new_w = body.get("width")
         new_h = body.get("height")
+        new_affine = body.get("affine")
         if not isinstance(cam_id, int) or cam_id < 0 or cam_id >= 6:
             self.send_text("cam must be int 0..5", status=400)
             return
 
+        # 校验 affine: 必须是长度为 6 的 list, 元素都是数字
+        if new_affine is not None:
+            if (not isinstance(new_affine, list)) or len(new_affine) != 6:
+                self.send_text("affine must be list of 6 numbers [a, b, c, d, tx, ty]", status=400)
+                return
+            for v in new_affine:
+                if not isinstance(v, (int, float)):
+                    self.send_text("affine elements must be numbers", status=400)
+                    return
+
         # 至少要传一个字段
-        if all(v is None for v in (new_x, new_y, new_w, new_h)):
-            self.send_text("need at least one of x/y/width/height", status=400)
+        if all(v is None for v in (new_x, new_y, new_w, new_h)) and new_affine is None:
+            self.send_text("need at least one of x/y/width/height/affine", status=400)
             return
 
         # 读 yaml, 修改, 写回 (用临时文件 + rename 原子替换)
@@ -345,6 +358,7 @@ class Handler(BaseHTTPRequestHandler):
         new_lines = []
         in_target = False
         replaced = False
+        affine_inserted = False  # 跟踪 affine 是替换还是插入
 
         def maybe_replace(line, field, value):
             """in_target 时, 如果 line 是 field: 开头, 替换之; 否则原样返回"""
@@ -353,6 +367,9 @@ class Handler(BaseHTTPRequestHandler):
                 return line
             if re.match(rf"^\s*{field}\s*:", line):
                 replaced = True
+                if field == "affine":
+                    formatted = ", ".join(f"{float(v):.6f}" for v in value)
+                    return f"   affine: [{formatted}]"
                 return f"   {field}: {int(value)}"
             return line
 
@@ -369,7 +386,36 @@ class Handler(BaseHTTPRequestHandler):
                     line = maybe_replace(line, "y", new_y)
                     line = maybe_replace(line, "width", new_w)
                     line = maybe_replace(line, "height", new_h)
+                    line = maybe_replace(line, "affine", new_affine)
             new_lines.append(line)
+
+        # 处理 affine 是新增 (yaml 里没有 affine 行) 的情况: 在 cam 块末尾插入
+        if new_affine is not None and not replaced:
+            # 重新扫一遍, 这次专门做 affine 插入
+            out_lines = []
+            in_target = False
+            for line in new_lines:
+                if re.match(rf"^\s*{key}\s*$", line):
+                    in_target = True
+                    out_lines.append(line)
+                    continue
+                if in_target:
+                    if re.match(r"^\s*cam\d+:", line):
+                        # 到达下一个 cam 块, 在这里之前先插入 affine
+                        if not affine_inserted:
+                            formatted = ", ".join(f"{float(v):.6f}" for v in new_affine)
+                            out_lines.append(f"   affine: [{formatted}]")
+                            affine_inserted = True
+                            replaced = True
+                        in_target = False
+                out_lines.append(line)
+            # 如果 cam 是最后一个 cam 块, 上面不会触发; 在末尾追加
+            if in_target and not affine_inserted:
+                formatted = ", ".join(f"{float(v):.6f}" for v in new_affine)
+                out_lines.append(f"   affine: [{formatted}]")
+                affine_inserted = True
+                replaced = True
+            new_lines = out_lines
 
         if not replaced:
             self.send_text(f"cam{cam_id} not found in yaml", status=404)
@@ -386,6 +432,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # v3.x: C++ 端有 RoiYamlWatcher (500ms 轮询 mtime), <1s 内 RebuildLayout 自动生效.
+        # v3.x.1: affine 改动也会触发 RebuildLayout (内含 SetWarpData 重算 xmap/ymap).
         self.send_json({
             "ok": True,
             "message": f"cam{cam_id} updated, yaml watcher will reload in <1s",
@@ -394,6 +441,7 @@ class Handler(BaseHTTPRequestHandler):
             "y": new_y,
             "width": new_w,
             "height": new_h,
+            "affine": new_affine,
         })
 
 # ============ 启动 ============

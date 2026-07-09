@@ -14,33 +14,45 @@ save:
 #   x/y 是源帧 NV12 的像素坐标, width/height 是剪裁出来的尺寸.
 #   App 启动时如果这个文件不存在, 会跑 Bootstrap 自动检测并覆盖写入.
 #   valid 由 w/h>0 推导, 不写.
+# v3.x.1 (2026-07-09): 新增 affine: 2x3 行主序 [a b c d tx ty] (cv::Mat 表示法).
+#   px = a*sx + b*sy + tx  (源帧像素 sx,sy → 参照帧像素 px,py)
+#   py = c*sx + d*sy + ty
+#   默认 = 单位阵 (a=1,b=0,c=0,d=1,tx=0,ty=0), 表示 no-warp.
+#   Bootstrap 阶段 App::BootStrapOptimalLayout 通过 cv::estimateAffinePartial2D
+#   (特征匹配 vs cam0) 计算出来覆盖写入. cam0 永远为单位阵 (它是参照帧).
 cam0:
    x: 0
    y: 0
    width: 2560
    height: 1440
+   affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 cam1:
    x: 0
    y: 0
    width: 2560
    height: 1440
+   affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 cam2:
    x: 0
    y: 0
    width: 2560
    height: 1440
+   affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 cam3:
    x: 0
    y: 0
    width: 2560
    height: 1440
+   affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 cam4:
    x: 0
    y: 0
    width: 2560
    height: 1440
+   affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 cam5:
    x: 0
    y: 0
    width: 2560
    height: 1440
+   affine: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]

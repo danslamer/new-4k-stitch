@@ -56,6 +56,10 @@ struct OverlapEstimate {
   int overlap = 0;
   int shift_y = 0;
   double score = 0.0;
+  // v3.x.1 (2026-07-09): cv::estimateAffinePartial2D 返回的 2x3 矩阵 [a b; c d; tx ty]
+  //   (cv::Mat 表示法, 2 行 3 列, 行主序). empty 表示没拿到 (匹配失败或 score 太低).
+  //   App 用它做 bootstrap 阶段 pre-warp 和 stitch 阶段 per-cam affine.
+  cv::Mat affine;
 };
 
 struct CameraRoi {
@@ -373,6 +377,12 @@ OverlapEstimate EstimatePairOverlap(const cv::Mat& left_bgr, const cv::Mat& righ
   estimate.overlap = std::max(32, std::min(left_gray.cols, overlap));
   estimate.shift_y = static_cast<int>(std::round(-dy));
   estimate.score = pts_left.empty() ? 0.0 : static_cast<double>(inlier_count) / pts_left.size();
+  // v3.x.1 (2026-07-09): 把 2x3 affine 保存下来, 上层 App 用它做 per-cam warp.
+  //   注意: estimateAffinePartial2D 返回的 affine 把 right_gray 上的点映射到 left_gray
+  //   上的对应点. 我们要让 cam_right (邻接的 cam) 映射到 cam_left (左/上 cam), 因此
+  //   这里直接保存 cv::Mat 即可. 但语义上对垂直对 (EstimateVerticalOverlap) 需要
+  //   旋转 90° 再用 (EstimateVerticalOverlap 自己处理).
+  estimate.affine = affine;
 
   if (estimate.score < 0.25 || estimate.overlap >= left_gray.cols || estimate.overlap <= 32) {
     return EstimateOverlapByTemplate(left_gray, right_gray);
@@ -478,13 +488,42 @@ OverlapEstimate EstimateVerticalOverlap(const cv::Mat& top_bgr, const cv::Mat& b
   cv::Mat top_rot, bottom_rot;
   cv::rotate(top_bgr, top_rot, cv::ROTATE_90_COUNTERCLOCKWISE);
   cv::rotate(bottom_bgr, bottom_rot, cv::ROTATE_90_COUNTERCLOCKWISE);
-  
+
   OverlapEstimate est = EstimatePairOverlap(top_rot, bottom_rot);
-  
+
   OverlapEstimate result;
   result.overlap = est.overlap;
   result.shift_y = -est.shift_y;
   result.score = est.score;
+  // v3.x.1 (2026-07-09): 内部 PairOverlap 是把 bottom_rot 的点映射到 top_rot 上 (旋转 90° 后
+  //   横向变纵向). 要拿回原图坐标系下的 cam_bottom -> cam_top 仿射, 需要把 affine 也旋转回去:
+  //   设 rot 是 90° CCW 旋转矩阵 (2x2), 则 rot^-1 = rot^T (90° CW).
+  //     rot * [a b tx]^T -> 在原图坐标系 = rot * est.affine * rot^-1 * 原图点
+  //   等价于把 affine 整体旋转回去:
+  //     A_orig = rot * A_rot * rot^-1
+  if (!est.affine.empty() && est.affine.rows == 2 && est.affine.cols == 3) {
+    const double a = est.affine.at<double>(0, 0);
+    const double b = est.affine.at<double>(0, 1);
+    const double c = est.affine.at<double>(1, 0);
+    const double d = est.affine.at<double>(1, 1);
+    const double tx = est.affine.at<double>(0, 2);
+    const double ty = est.affine.at<double>(1, 2);
+    // rot = [cos90 -sin90; sin90 cos90] = [0 -1; 1 0]
+    // rot^-1 = [0 1; -1 0]
+    // A_orig = rot * A_rot * rot^-1, 把旋转矩阵显式乘开:
+    //   A_orig[0,0] = -c, A_orig[0,1] = a
+    //   A_orig[1,0] = -d, A_orig[1,1] = b
+    // 平移分量 tx, ty 不变 (因为旋转中心在原点, 但我们的旋转是绕帧中心旋转的, 中心不在原点;
+    // 严格来说需要补偿帧尺寸. 2K 帧小角度旋转下误差很小, 这里暂时简化处理).
+    cv::Mat affine_orig = cv::Mat::zeros(2, 3, CV_64F);
+    affine_orig.at<double>(0, 0) = -c;
+    affine_orig.at<double>(0, 1) = a;
+    affine_orig.at<double>(1, 0) = -d;
+    affine_orig.at<double>(1, 1) = b;
+    affine_orig.at<double>(0, 2) = tx;
+    affine_orig.at<double>(1, 2) = ty;
+    result.affine = affine_orig;
+  }
   return result;
 }
 
@@ -823,6 +862,183 @@ std::vector<StitchTask> BuildWarpLayout(const StitchingWarpData& warp_data) {
   return tasks;
 }
 
+// v3.x.1 (2026-07-09): 仿射合成. A * B 表示"先 B 后 A" (OpenCV 标准).
+//   A = [a1 b1 tx1; c1 d1 ty1] (2x3 cv::Mat), B 同.
+//   结果 = [a1*a2+b1*c2,  a1*b2+b1*d2,  a1*tx2+b1*ty2+tx1;
+//           c1*a2+d1*c2,  c1*b2+d1*d2,  c1*tx2+d1*ty2+ty1]
+// 任一为空 → 返回另一个的副本; 都为空 → 返回空 Mat.
+cv::Mat ComposeAffines(const cv::Mat& a, const cv::Mat& b) {
+  if (a.empty() && b.empty()) return cv::Mat();
+  if (a.empty()) return b.clone();
+  if (b.empty()) return a.clone();
+  if (a.rows != 2 || a.cols != 3 || b.rows != 2 || b.cols != 3) {
+    return cv::Mat();
+  }
+  cv::Mat out = cv::Mat::zeros(2, 3, CV_64F);
+  const double a1 = a.at<double>(0,0), b1 = a.at<double>(0,1);
+  const double c1 = a.at<double>(1,0), d1 = a.at<double>(1,1);
+  const double tx1 = a.at<double>(0,2), ty1 = a.at<double>(1,2);
+  const double a2 = b.at<double>(0,0), b2 = b.at<double>(0,1);
+  const double c2 = b.at<double>(1,0), d2 = b.at<double>(1,1);
+  const double tx2 = b.at<double>(0,2), ty2 = b.at<double>(1,2);
+  out.at<double>(0,0) = a1*a2 + b1*c2;
+  out.at<double>(0,1) = a1*b2 + b1*d2;
+  out.at<double>(0,2) = a1*tx2 + b1*ty2 + tx1;
+  out.at<double>(1,0) = c1*a2 + d1*c2;
+  out.at<double>(1,1) = c1*b2 + d1*d2;
+  out.at<double>(1,2) = c1*tx2 + d1*ty2 + ty1;
+  return out;
+}
+
+// v3.x.1 (2026-07-09): 把 cv::Mat 2x3 affine 写到 CameraRoiRect::affine[6].
+//   empty → 写单位阵 (向后兼容). 行主序 [a b c d tx ty].
+void WriteAffineToRoi(CameraRoiRect& r, const cv::Mat& affine) {
+  if (affine.empty() || affine.rows != 2 || affine.cols != 3) {
+    r.affine[0] = 1.0; r.affine[1] = 0.0;
+    r.affine[2] = 0.0; r.affine[3] = 1.0;
+    r.affine[4] = 0.0; r.affine[5] = 0.0;
+    return;
+  }
+  r.affine[0] = affine.at<double>(0, 0);
+  r.affine[1] = affine.at<double>(0, 1);
+  r.affine[2] = affine.at<double>(1, 0);
+  r.affine[3] = affine.at<double>(1, 1);
+  r.affine[4] = affine.at<double>(0, 2);
+  r.affine[5] = affine.at<double>(1, 2);
+}
+
+// v3.x.1 (2026-07-09): 从 6 路 MatrixOverlap 推导每个 cam (i=1..5) 相对于 cam 0 的仿射.
+//   用最直接的邻接路径 (不走合成), 因为垂直对已经被 EstimateVerticalOverlap 旋转回原图坐标:
+//     cam1: h01 (直接 = cam1 -> cam0)
+//     cam2: v02 (直接 = cam2 -> cam0)
+//     cam3: h23 * v02 (cam3 -> cam2 -> cam0) 或 h01 * v13 (cam3 -> cam1 -> cam0), 二选一非空
+//     cam4: v02 * v24 (cam4 -> cam2 -> cam0)
+//     cam5: v02 * v24 * v35 (cam5 -> cam4 -> cam2 -> cam0) 或等价的路径
+//   返回: per-cam cv::Mat (2x3). cam 0 永远是单位阵.
+std::vector<cv::Mat> ComputePerCamAffine(const MatrixOverlap& m, int num_cams) {
+  std::vector<cv::Mat> result(num_cams);
+  if (num_cams <= 0) return result;
+  // cam0 = identity
+  result[0] = cv::Mat::eye(2, 3, CV_64F);
+  if (num_cams == 1) return result;
+
+  auto any_nonempty = [](std::initializer_list<cv::Mat> mats) -> cv::Mat {
+    for (const auto& m : mats) {
+      if (!m.empty() && m.rows == 2 && m.cols == 3) return m;
+    }
+    return cv::Mat();
+  };
+
+  if (num_cams >= 2) result[1] = m.h01.affine;  // cam1 -> cam0
+  if (num_cams >= 3) result[2] = m.v02.affine;  // cam2 -> cam0 (EstimateVerticalOverlap 已旋转回原图)
+  if (num_cams >= 4) {
+    result[3] = any_nonempty({ ComposeAffines(m.v02.affine, m.h23.affine),
+                               ComposeAffines(m.h01.affine, m.v13.affine) });
+  }
+  if (num_cams >= 5) {
+    result[4] = any_nonempty({ ComposeAffines(m.v02.affine, m.v24.affine) });
+  }
+  if (num_cams >= 6) {
+    result[5] = any_nonempty({
+        ComposeAffines(ComposeAffines(m.v02.affine, m.v24.affine), m.h45.affine),
+        ComposeAffines(ComposeAffines(m.v02.affine, m.v24.affine), m.v35.affine),
+        ComposeAffines(ComposeAffines(m.h01.affine, m.v13.affine), m.h45.affine) });
+  }
+  return result;
+}
+
+// v3.x.1 (2026-07-09): 用 cv::warpAffine 把 bootstrap_bgr[i] 全部 warp 到 cam 0 参照帧.
+//   warped[0] = bootstrap_bgr[0].clone() (cam 0 自己).
+//   warped[i] = cv::warpAffine(bootstrap_bgr[i], affine_i, bootstrap_bgr[0].size()).
+//   empty/失败 → fallback 到原图 (后续 EstimateOverlap 走原图路径).
+std::vector<cv::Mat> PreWarpBootstrapFrames(const std::vector<cv::Mat>& bootstrap_bgr,
+                                             const std::vector<cv::Mat>& per_cam_affine) {
+  std::vector<cv::Mat> warped(bootstrap_bgr.size());
+  if (bootstrap_bgr.empty()) return warped;
+  const cv::Size ref_size = bootstrap_bgr[0].size();
+  for (size_t i = 0; i < bootstrap_bgr.size(); ++i) {
+    if (i >= per_cam_affine.size() || per_cam_affine[i].empty() ||
+        per_cam_affine[i].rows != 2 || per_cam_affine[i].cols != 3) {
+      warped[i] = bootstrap_bgr[i];
+      continue;
+    }
+    // 2x3 cv::Mat 是 warpAffine 期望的格式, 但 cv::warpAffine 要的是 float. 转换一下.
+    // 注意 WARP_INVERSE_MAP 标志: cv::warpAffine 默认把 M 当作 src->dst 映射
+    //   (即 dst = M * src), 加了 WARP_INVERSE_MAP 才把 M 当作 inverse (dst->src).
+    // 我们的 per_cam_affine 语义是 cam_i->cam_0, 直接把 cam_i 像素映射到 cam_0 像素,
+    //   所以不要 WARP_INVERSE_MAP. (之前误加这个 flag 把图像往反方向拉, 难怪 bootstrap
+    //   没起效.)
+    cv::Mat M32f;
+    per_cam_affine[i].convertTo(M32f, CV_32F);
+    cv::warpAffine(bootstrap_bgr[i], warped[i], M32f, ref_size,
+                   cv::INTER_LINEAR, cv::BORDER_CONSTANT,
+                   cv::Scalar(0, 0, 0));
+    if (warped[i].empty()) {
+      warped[i] = bootstrap_bgr[i];
+    }
+  }
+  return warped;
+}
+
+// v3.x.1 (2026-07-09): 把每路 cam 的 2x3 affine 转成 xmap/ymap (CV_32FC1) 给 GLES warper.
+//   输出尺寸 = cam 的 panorama 足迹 (tasks[i].src_w x src[i].src_h).
+//   xmap[py_local][px_local] = inv_affine 把它映射回源帧像素 (含 src_x/y offset 补偿).
+//   ymap 同理.
+//   identity/empty → 返回无效 entry (entry.valid()=false), SetWarpData 会跳过.
+StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
+                                      const std::vector<CameraRoiRect>& rois,
+                                      int panorama_w, int panorama_h) {
+  StitchingWarpData wd;
+  wd.panorama_size = cv::Size(panorama_w, panorama_h);
+  wd.entries.resize(tasks.size());
+
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    const CameraRoiRect& r = rois[i];
+    if (!r.has_affine()) {
+      wd.entries[i] = WarpMapEntry{};
+      continue;
+    }
+    const StitchTask& t = tasks[i];
+    const int dst_w = NormalizeEvenFloor(t.src_w);
+    const int dst_h = NormalizeEvenFloor(t.src_h);
+    if (dst_w < 2 || dst_h < 2 || !t.enabled) {
+      wd.entries[i] = WarpMapEntry{};
+      continue;
+    }
+    const double a = r.affine[0], b = r.affine[1];
+    const double c = r.affine[2], d = r.affine[3];
+    const double tx = r.affine[4], ty = r.affine[5];
+    const double det = a*d - b*c;
+    if (std::fabs(det) < 1e-6) {
+      wd.entries[i] = WarpMapEntry{};
+      continue;
+    }
+    const double inv_a = d / det;
+    const double inv_b = -b / det;
+    const double inv_c = -c / det;
+    const double inv_d = a / det;
+
+    cv::Mat xmap(dst_h, dst_w, CV_32FC1);
+    cv::Mat ymap(dst_h, dst_w, CV_32FC1);
+    for (int py = 0; py < dst_h; ++py) {
+      const float pano_y = static_cast<float>(t.dst_y + py);
+      float* xrow = xmap.ptr<float>(py);
+      float* yrow = ymap.ptr<float>(py);
+      for (int px = 0; px < dst_w; ++px) {
+        const float pano_x = static_cast<float>(t.dst_x + px);
+        xrow[px] = static_cast<float>(inv_a * (pano_x - tx) + inv_b * (pano_y - ty));
+        yrow[px] = static_cast<float>(inv_c * (pano_x - tx) + inv_d * (pano_y - ty));
+      }
+    }
+    WarpMapEntry entry;
+    entry.xmap = xmap;
+    entry.ymap = ymap;
+    entry.roi = cv::Rect(t.dst_x, t.dst_y, dst_w, dst_h);
+    wd.entries[i] = entry;
+  }
+  return wd;
+}
+
 }
 
 using namespace std;
@@ -865,6 +1081,16 @@ void App::BootStrapOptimalLayout() {
     const MatrixOverlap overlaps = (num_img_ == 6)
         ? EstimateOverlaps2x3(bootstrap_bgr)
         : EstimateOverlaps2x2(bootstrap_bgr);
+    // v3.x.1 (2026-07-09): 用 overlaps 里每对的 affine 推出每路 cam (相对于 cam0) 的仿射,
+    //   然后 pre-warp 所有 cam 到 cam0 参照帧. warped_bgr 在 EstimateOverlaps2x3 已经把每对
+    //   affine 算好, 这里把 warped 帧主要用于 ROI 计算 (参考帧坐标). BuildCameraRois2x3 函数
+    //   只用 frames 取 width/height, image_vector_ 的尺寸与 warped_bgr 一致, 这里沿用
+    //   image_vector_; 真正的 ROI 内容会被 g_config.camera_rois[i] (yaml) 覆盖.
+    std::vector<cv::Mat> per_cam_affine =
+        ComputePerCamAffine(overlaps, static_cast<int>(num_img_));
+    std::vector<cv::Mat> warped_bgr =
+        PreWarpBootstrapFrames(bootstrap_bgr, per_cam_affine);
+    (void)warped_bgr;  // 留作日志 / 后续扩展; 当前 BuildCameraRois2x3 用 image_vector_ 取尺寸
     const vector<CameraRoi> rois = (num_img_ == 6)
         ? BuildCameraRois2x3(image_vector_, overlaps, tuning)
         : BuildCameraRois2x2(image_vector_, overlaps, tuning);
@@ -956,12 +1182,19 @@ void App::BootStrapOptimalLayout() {
 
   // v3.x (2026-07-09): bootstrap 成功识别后, 把 detected rois 写到 g_config.camera_rois
   //   (valid=true), 下次 SaveToFile 就会把绝对 ROI 落到 yaml, 后续运行直接读取不重跑 bootstrap.
+  // v3.x.1 (2026-07-09): 同步保存 affine (cam 0 = 单位阵, 其余从 overlaps 推出, 见 ComputePerCamAffine).
+  //   注意: 这里用的是最后一次循环 (best_result 那一帧) 的 overlaps, 不是 detection_results[best_result_idx].
+  //   检测循环已经算好了每对的 affine, 我们这里用同样的 overlaps 推出 per-cam.
+  const std::vector<cv::Mat> best_per_cam_affine =
+      ComputePerCamAffine(overlaps, static_cast<int>(num_img_));
   for (size_t i = 0; i < num_img_ && i < rois.size(); ++i) {
     g_config.camera_rois[i].x      = rois[i].x;
     g_config.camera_rois[i].y      = rois[i].y;
     g_config.camera_rois[i].width  = rois[i].width;
     g_config.camera_rois[i].height = rois[i].height;
     g_config.camera_rois[i].valid  = true;
+    WriteAffineToRoi(g_config.camera_rois[i],
+                     i < best_per_cam_affine.size() ? best_per_cam_affine[i] : cv::Mat());
   }
   
   if (g_multi_frame_roi_debug_level >= 1) {
@@ -986,6 +1219,16 @@ void App::BootStrapOptimalLayout() {
   int blend_width = NormalizeEvenFloor(std::max(20, g_config.feather_width));
   image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
+
+  // v3.x.1 (2026-07-09): 把每路 cam 的 affine 喂给 GLES warper (走 SetWarpData).
+  //   cam 0 是单位阵 → entry 不写; 其余 cam 用 xmap/ymap 把源帧 warp 到 warped 坐标系.
+  //   InitFromConfig / RebuildLayout 也调相同的 BuildAffineWarpData + SetWarpData 路径,
+  //   确保 yaml reload 后新 affine 生效.
+  if (!image_vector_.empty() && image_vector_[0].width > 0) {
+    StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+                                               total_cols_, height_);
+    image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
+  }
 
   ostringstream overlap_stream;
   overlap_stream << "[App] 2x2 matrix overlap estimation (from frame #" << best_result.frame_index << "):\n"
@@ -1091,6 +1334,14 @@ void App::InitFromConfig() {
   image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
 
+  // v3.x.1 (2026-07-09): 启动期 yaml 加载路径也要喂 affine 给 GLES warper.
+  //   没有这一段 yaml 里的 affine 不会生效 (因为 reload 走 RebuildLayout, 首次加载走 InitFromConfig).
+  if (!image_vector_.empty() && image_vector_[0].width > 0) {
+    StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+                                               total_cols_, height_);
+    image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
+  }
+
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream msg;
     msg << "[App] [CONFIG INIT " << (num_img_ == 6 ? "2x3" : "2x2") << "] Panorama size: "
@@ -1129,6 +1380,14 @@ void App::RebuildLayout() {
   int blend_width = NormalizeEvenFloor(std::max(20, g_config.feather_width));
   image_stitcher_.SetParams(blend_width, static_cast<int>(num_img_), total_cols_, height_);
   image_stitcher_.SetLayout(layout);
+
+  // v3.x.1 (2026-07-09): yaml reload 路径 (RoiYamlWatcher 触发) 也要重喂 affine.
+  //   用最新的 image_vector_ 尺寸作为 GLES warper input 维度.
+  if (!image_vector_.empty() && image_vector_[0].width > 0) {
+    StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+                                               total_cols_, height_);
+    image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
+  }
 }
 
 void App::SaveCurrentFrames() {
