@@ -1,3 +1,5 @@
+%YAML:1.0
+---
 # ============================================================
 # v3.0 (2026-07-08): 6 路网络摄像头 (PoE 交换机接入开发板)
 # v3.2 (2026-07-09): 加 output: 块, 启用 2 路 RTSP 推流
@@ -12,7 +14,7 @@ auto_calibrate: 0
 #   /stitch_diff  帧差掩码 (变动的红色高亮 + 矩形框)
 output:
   enabled: true
-  bind_address: 0.0.0.0
+  bind_address: "0.0.0.0"
   port: 8554
   auth_enabled: false
   auth_user: admin
@@ -36,7 +38,7 @@ output:
 
 cameras:
   - type: rtsp
-    uri: rtsp://admin:123456@192.168.1.11:554/video1
+    uri: "rtsp://admin:123456@192.168.1.11:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -46,7 +48,7 @@ cameras:
     latency_ms: 120
     use_tcp: true
   - type: rtsp
-    uri: rtsp://admin:123456@192.168.1.12:554/video1
+    uri: "rtsp://admin:123456@192.168.1.12:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -56,7 +58,7 @@ cameras:
     latency_ms: 120
     use_tcp: true
   - type: rtsp
-    uri: rtsp://admin:123456@192.168.1.13:554/video1
+    uri: "rtsp://admin:123456@192.168.1.13:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -66,7 +68,7 @@ cameras:
     latency_ms: 120
     use_tcp: true
   - type: rtsp
-    uri: rtsp://admin:123456@192.168.1.14:554/video1
+    uri: "rtsp://admin:123456@192.168.1.14:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -76,7 +78,7 @@ cameras:
     latency_ms: 120
     use_tcp: true
   - type: rtsp
-    uri: rtsp://admin:123456@192.168.1.15:554/video1
+    uri: "rtsp://admin:123456@192.168.1.15:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -86,7 +88,7 @@ cameras:
     latency_ms: 120
     use_tcp: true
   - type: rtsp
-    uri: rtsp://admin:123456@192.168.1.16:554/video1
+    uri: "rtsp://admin:123456@192.168.1.16:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -94,4 +96,4 @@ cameras:
     user_id: admin
     user_pw: 123456
     latency_ms: 120
-    use_tcp: true
+    use_tcp: true"

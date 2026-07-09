@@ -1,27 +1,15 @@
+%YAML:1.0
 ---
-# ============================================================
-# ROI tuning 占位 (v3.0 / 2026-07-08)
-#
-# Sprint 0: 6 路 offset 全 0, 镜头 2.8mm FOV 102.5°, h_overlap=560, v_overlap=650
-#   (见 docs/NETWORK_CAMERA_PLAN.md §0.5/§0.6/§0.7)
-#
-# Sprint 1: bootstrap 算法会自己覆盖这些值 (基于 feature match)
-# Sprint 2: tools/calibrate_extrinsics.py 跑出来的真值覆盖
-#
-# 与 roi_config.cc LoadFromFile/SaveToFile 对称 (cam0..cam5).
-# ============================================================
 mode: dataset
 step_size: 1
-selected_cam: 0
+selected_cam: 1
 feather:
    enabled: 1
    width: 120
-   strength: 2.0
+   strength: 2.
 save:
    enabled: 0
    interval: 30
-
-# 6 路 ROI 占位 (offset 0,0 = ROI = 全帧)
 cam0:
    offset_x: 0
    offset_y: 0
