@@ -1261,9 +1261,13 @@ void App::BootStrapOptimalLayout() {
   //   InitFromConfig / RebuildLayout 也调相同的 BuildAffineWarpData + SetWarpData 路径,
   //   确保 yaml reload 后新 affine 生效.
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
-    // v3.x.2 (2026-07-09): 喂入畸变校正 map (水平 cam pair), 让 GLES warper 一次 GPU
+    // v3.x.2 (2026-07-09): 喂入畸变校正 map (6 路 cam 全做), 让 GLES warper 一次 GPU
     //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
-    StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+    //   g_config.camera_rois 是 CameraRoiRect[6] 数组, 转成 vector 给 BuildAffineWarpData.
+    const std::vector<CameraRoiRect> rois_vec(
+        g_config.camera_rois,
+        g_config.camera_rois + sizeof(g_config.camera_rois) / sizeof(g_config.camera_rois[0]));
+    StitchingWarpData wd = BuildAffineWarpData(layout, rois_vec,
                                                undist_xmap_vector_, undist_ymap_vector_,
                                                total_cols_, height_);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
@@ -1376,9 +1380,13 @@ void App::InitFromConfig() {
   // v3.x.1 (2026-07-09): 启动期 yaml 加载路径也要喂 affine 给 GLES warper.
   //   没有这一段 yaml 里的 affine 不会生效 (因为 reload 走 RebuildLayout, 首次加载走 InitFromConfig).
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
-    // v3.x.2 (2026-07-09): 喂入畸变校正 map (水平 cam pair), 让 GLES warper 一次 GPU
+    // v3.x.2 (2026-07-09): 喂入畸变校正 map (6 路 cam 全做), 让 GLES warper 一次 GPU
     //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
-    StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+    //   g_config.camera_rois 是 CameraRoiRect[6] 数组, 转成 vector 给 BuildAffineWarpData.
+    const std::vector<CameraRoiRect> rois_vec(
+        g_config.camera_rois,
+        g_config.camera_rois + sizeof(g_config.camera_rois) / sizeof(g_config.camera_rois[0]));
+    StitchingWarpData wd = BuildAffineWarpData(layout, rois_vec,
                                                undist_xmap_vector_, undist_ymap_vector_,
                                                total_cols_, height_);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
@@ -1426,9 +1434,13 @@ void App::RebuildLayout() {
   // v3.x.1 (2026-07-09): yaml reload 路径 (RoiYamlWatcher 触发) 也要重喂 affine.
   //   用最新的 image_vector_ 尺寸作为 GLES warper input 维度.
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
-    // v3.x.2 (2026-07-09): 喂入畸变校正 map (水平 cam pair), 让 GLES warper 一次 GPU
+    // v3.x.2 (2026-07-09): 喂入畸变校正 map (6 路 cam 全做), 让 GLES warper 一次 GPU
     //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
-    StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+    //   g_config.camera_rois 是 CameraRoiRect[6] 数组, 转成 vector 给 BuildAffineWarpData.
+    const std::vector<CameraRoiRect> rois_vec(
+        g_config.camera_rois,
+        g_config.camera_rois + sizeof(g_config.camera_rois) / sizeof(g_config.camera_rois[0]));
+    StitchingWarpData wd = BuildAffineWarpData(layout, rois_vec,
                                                undist_xmap_vector_, undist_ymap_vector_,
                                                total_cols_, height_);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
