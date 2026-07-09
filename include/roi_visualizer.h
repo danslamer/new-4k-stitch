@@ -11,13 +11,19 @@ extern bool g_show_roi_markers;
 
 enum VisAction {
     kVisNone = 0,
-    kVisStepUp,
-    kVisStepDown,
-    kVisStepLeft,
-    kVisStepRight,
+    kVisStepUp,        // 方向键: y -= step
+    kVisStepDown,      // y += step
+    kVisStepLeft,      // x -= step
+    kVisStepRight,     // x += step
+    // v3.x (2026-07-09): shift+方向键 调整 ROI 尺寸
+    kVisResizeUp,      // height -= step
+    kVisResizeDown,    // height += step
+    kVisResizeLeft,    // width -= step
+    kVisResizeRight,   // width += step
     kVisNextCam,
     kVisPrevCam,
     kVisSaveConfig,
+    kVisRefreshFrames,  // v3.x (2026-07-09): 在 debug 模式里重新抓最新帧作为快照, 看动态场景
     kVisEnterDebug,
     kVisExitDebug,
     kVisStepSize1,
@@ -39,10 +45,12 @@ struct StitchTask;
 
 class RoiVisualizer {
 public:
-    static bool Init(int panorama_width, int panorama_height);
+    // v3.x (2026-07-09): 加 num_cams 参数 — 4 路 (2x2) 和 6 路 (2x3) 共用 visualizer,
+    //   用 num_cams 决定画 ROI marker 的数量 + Tab 切换的范围. 默认 6 兼容现状.
+    static bool Init(int panorama_width, int panorama_height, int num_cams = 6);
     static void Shutdown();
-    
-    static VisAction ShowStreamingFrame(const uint8_t* bgr_data, 
+
+    static VisAction ShowStreamingFrame(const uint8_t* bgr_data,
                                          int width, int height,
                                          int stride, double fps);
     static VisAction ShowDebugFrame(const uint8_t* bgr_data,
@@ -58,6 +66,7 @@ private:
     static int display_h_;
     static int panorama_w_;
     static int panorama_h_;
+    static int num_cams_;  // 4 (2x2) 或 6 (2x3), 由 Init 注入
     static bool initialized_;
     
     static void FillRect(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b);
@@ -71,7 +80,8 @@ private:
     static void DrawFeatherSaveInfo();
     
     static VisAction PollEvents(bool debug_mode);
-    static VisAction ParseKey(SDL_Keycode key);
+    // v3.x (2026-07-09): shift 标志传入, 让方向键既能挪 (x,y) 也能改 (w,h)
+    static VisAction ParseKey(SDL_Keycode key, bool shift);
     static VisAction HandleDebugAction(VisAction action);
     
     static int NormalizeEvenFloor(int value);

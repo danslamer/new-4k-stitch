@@ -106,6 +106,9 @@ add_executable(${PROJECT_NAME}
     include/logger.h
     src/roi_config.cc
     include/roi_config.h
+    # v3.x: 监听 roi_tuning.yaml 修改, 实时 reload (2026-07-09)
+    src/roi_yaml_watcher.cc
+    include/roi_yaml_watcher.h
     include/camera_intrinsics.h  # v3.0: K 矩阵占位 (fx=1027 fy=1378 cx=1280 cy=720)
     src/roi_visualizer.cc
     include/roi_visualizer.h

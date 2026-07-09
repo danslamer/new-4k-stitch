@@ -11,6 +11,7 @@
 #include "frame_diff.h"
 #include "output_streams.h"
 #include "gst_rtsp_server.h"
+#include "roi_yaml_watcher.h"
 
 #include <memory>
 #include <vector>
@@ -108,6 +109,13 @@ class App {
     std::unique_ptr<frame_diff::FrameDiff> frame_diff_;
     bool rtsp_output_enabled_ = false;
     output_streams::ServerConfig rtsp_cfg_;  // 缓存, 给 gst_rtsp_server 用
+
+    // v3.x (2026-07-09): 监听 roi_tuning.yaml 修改, 实时 reload + RebuildLayout.
+    //   后台 std::thread 每 500ms stat 一次 mtime, 变化时 set atomic flag.
+    //   主线程每帧 ShouldReload() 检查, true 时重新 load + rebuild.
+    //   yaml_path_ 缓存路径, 给 watcher 构造用.
+    std::unique_ptr<RoiYamlWatcher> roi_yaml_watcher_;
+    std::string yaml_path_;
 };
 
 #endif

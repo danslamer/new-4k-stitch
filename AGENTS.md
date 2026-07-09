@@ -99,7 +99,7 @@ sudo cat /sys/class/devfreq/27800000.gpu/load                    # GPU 负载
 
 | 位置 | 当前 | 目标 |
 |---|---|---|
-| `include/roi_config.h` | `RoiOffset roi_offsets[6]` | （已完成 4→6 扩展, 数组越界护栏待改 6→N 通用） |
+| `include/roi_config.h` | `CameraRoiRect camera_rois[6]` (v3.x: 改成绝对 ROI, 不再是 offset) | （已完成 4→6 扩展, 数组越界护栏待改 6→N 通用） |
 | `src/app.cc:BuildDefaultTuning` | `i < 6` 已解除 cap | — |
 | `src/app.cc:EstimateOverlaps2x3` / `BuildCameraRois2x3` / `BuildStitchLayout2x3` | 6 路版本 | （与 2×2 版本并存，按 `num_img_` 分支） |
 | `src/image_stitcher.cc:BlendSeams` | 6 路 + 6 dispatch_seam | — |

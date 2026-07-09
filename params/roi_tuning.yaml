@@ -10,21 +10,37 @@ feather:
 save:
    enabled: 0
    interval: 0
+# v3.x (2026-07-09): 每路相机保存"源帧上剪哪一块"的绝对 ROI, 不是偏移量.
+#   x/y 是源帧 NV12 的像素坐标, width/height 是剪裁出来的尺寸.
+#   App 启动时如果这个文件不存在, 会跑 Bootstrap 自动检测并覆盖写入.
+#   valid 由 w/h>0 推导, 不写.
 cam0:
-   offset_x: 0
-   offset_y: 0
+   x: 0
+   y: 0
+   width: 2560
+   height: 1440
 cam1:
-   offset_x: 0
-   offset_y: 0
+   x: 0
+   y: 0
+   width: 2560
+   height: 1440
 cam2:
-   offset_x: 0
-   offset_y: 0
+   x: 0
+   y: 0
+   width: 2560
+   height: 1440
 cam3:
-   offset_x: 0
-   offset_y: 0
+   x: 0
+   y: 0
+   width: 2560
+   height: 1440
 cam4:
-   offset_x: 0
-   offset_y: 0
+   x: 0
+   y: 0
+   width: 2560
+   height: 1440
 cam5:
-   offset_x: 0
-   offset_y: 0
+   x: 0
+   y: 0
+   width: 2560
+   height: 1440

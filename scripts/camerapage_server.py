@@ -306,7 +306,10 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_roi_post(self):
-        """POST /api/roi: body = {"cam": 0, "offset_x": 10, "offset_y": -5}"""
+        """POST /api/roi: body = {"cam": 0, "x": 100, "y": 200, "width": 1920, "height": 1080}
+        v3.x (2026-07-09): 改成绝对 ROI. {x, y, width, height} 任意子集, 没传字段保留 yaml 原值.
+        旧的 offset_x/offset_y 不再读, 用旧 API 会直接返回 400.
+        """
         length = int(self.headers.get("Content-Length", 0))
         if length == 0 or length > 4096:
             self.send_text("Invalid request body", status=400)
@@ -318,10 +321,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         cam_id = body.get("cam")
-        offset_x = body.get("offset_x")
-        offset_y = body.get("offset_y")
+        new_x = body.get("x")
+        new_y = body.get("y")
+        new_w = body.get("width")
+        new_h = body.get("height")
         if not isinstance(cam_id, int) or cam_id < 0 or cam_id >= 6:
             self.send_text("cam must be int 0..5", status=400)
+            return
+
+        # 至少要传一个字段
+        if all(v is None for v in (new_x, new_y, new_w, new_h)):
+            self.send_text("need at least one of x/y/width/height", status=400)
             return
 
         # 读 yaml, 修改, 写回 (用临时文件 + rename 原子替换)
@@ -335,6 +345,17 @@ class Handler(BaseHTTPRequestHandler):
         new_lines = []
         in_target = False
         replaced = False
+
+        def maybe_replace(line, field, value):
+            """in_target 时, 如果 line 是 field: 开头, 替换之; 否则原样返回"""
+            nonlocal replaced
+            if value is None:
+                return line
+            if re.match(rf"^\s*{field}\s*:", line):
+                replaced = True
+                return f"   {field}: {int(value)}"
+            return line
+
         for line in lines:
             if re.match(rf"^\s*{key}\s*$", line):
                 in_target = True
@@ -343,14 +364,11 @@ class Handler(BaseHTTPRequestHandler):
             if in_target:
                 if re.match(r"^\s*cam\d+:", line):
                     in_target = False
-                elif offset_x is not None and re.match(r"^\s*offset_x:", line):
-                    new_lines.append(f"   offset_x: {int(offset_x)}")
-                    replaced = True
-                    continue
-                elif offset_y is not None and re.match(r"^\s*offset_y:", line):
-                    new_lines.append(f"   offset_y: {int(offset_y)}")
-                    replaced = True
-                    continue
+                else:
+                    line = maybe_replace(line, "x", new_x)
+                    line = maybe_replace(line, "y", new_y)
+                    line = maybe_replace(line, "width", new_w)
+                    line = maybe_replace(line, "height", new_h)
             new_lines.append(line)
 
         if not replaced:
@@ -367,14 +385,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text(f"Write failed: {e}", status=500)
             return
 
-        # 注: C++ 端目前不轮询 yaml, 需要重启 image-stitching 生效
-        # (后续阶段 1.5 加 inotify 或 1s 轮询)
+        # v3.x: C++ 端有 RoiYamlWatcher (500ms 轮询 mtime), <1s 内 RebuildLayout 自动生效.
         self.send_json({
             "ok": True,
-            "message": f"cam{cam_id} offset updated, restart image-stitching to apply",
+            "message": f"cam{cam_id} updated, yaml watcher will reload in <1s",
             "cam": cam_id,
-            "offset_x": offset_x,
-            "offset_y": offset_y,
+            "x": new_x,
+            "y": new_y,
+            "width": new_w,
+            "height": new_h,
         })
 
 # ============ 启动 ============

@@ -218,9 +218,11 @@ std::string handle_network() {
 }
 
 // POST /api/roi: 原子改 roi_tuning.yaml
-// body 形如: {"cam": 0, "offset_x": 10, "offset_y": -5}
+// body 形如: {"cam": 0, "x": 100, "y": 200, "width": 1920, "height": 1080}
+// v3.x (2026-07-09): 改成绝对 ROI. {x, y, width, height} 任意子集, 没传的字段保留 yaml 原值.
+//   旧字段 offset_x / offset_y 不再读; 用摄像机页面的旧 API 会直接返回 error.
 std::string handle_roi_post(const std::string& body) {
-    // 极简 JSON 解析: 找 "cam": N, "offset_x": N, "offset_y": N
+    // 极简 JSON 解析: 找 "cam": N, "x": N, "y": N, "width": N, "height": N
     auto find_int = [&](const std::string& key) -> int {
         std::regex re("\"" + key + "\"\\s*:\\s*(-?\\d+)");
         std::smatch m;
@@ -229,11 +231,13 @@ std::string handle_roi_post(const std::string& body) {
     };
 
     int cam = find_int("cam");
-    int off_x = find_int("offset_x");
-    int off_y = find_int("offset_y");
-    if (cam < 0 || cam >= 6 || off_x == INT_MIN || off_y == INT_MIN) {
-        return "{\"ok\": false, \"error\": \"invalid JSON, need cam/offset_x/offset_y\"}\n";
+    if (cam < 0 || cam >= 6) {
+        return "{\"ok\": false, \"error\": \"invalid cam (need 0..5)\"}\n";
     }
+    const int new_x = find_int("x");
+    const int new_y = find_int("y");
+    const int new_w = find_int("width");
+    const int new_h = find_int("height");
 
     std::string yaml_path = g_project_root + "/params/roi_tuning.yaml";
     std::string content = read_file_str(yaml_path);
@@ -241,7 +245,7 @@ std::string handle_roi_post(const std::string& body) {
         return "{\"ok\": false, \"error\": \"roi_tuning.yaml not found\"}\n";
     }
 
-    // 找 camX: 块, 改 offset_x 和 offset_y
+    // 找 camX: 块, 按字段名替换
     std::string key = "cam" + std::to_string(cam) + ":";
     std::vector<std::string> lines;
     std::istringstream iss(content);
@@ -249,7 +253,19 @@ std::string handle_roi_post(const std::string& body) {
     while (std::getline(iss, line)) lines.push_back(line);
 
     bool in_target = false;
-    bool replaced_x = false, replaced_y = false;
+    bool replaced_any = false;
+    auto try_replace = [&](const std::string& field, int value) -> bool {
+        if (value == INT_MIN) return false;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::string t = trim(lines[i]);
+            if (in_target && t.rfind(field + ":", 0) == 0) {
+                lines[i] = "   " + field + ": " + std::to_string(value);
+                return true;
+            }
+        }
+        return false;
+    };
+
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string t = trim(lines[i]);
         if (t == key) { in_target = true; continue; }
@@ -257,16 +273,27 @@ std::string handle_roi_post(const std::string& body) {
             && t != key) {
             in_target = false;  // 进入下一个 cam 块
         }
-        if (in_target && t.rfind("offset_x:", 0) == 0) {
-            lines[i] = "   offset_x: " + std::to_string(off_x);
-            replaced_x = true;
-        } else if (in_target && t.rfind("offset_y:", 0) == 0) {
-            lines[i] = "   offset_y: " + std::to_string(off_y);
-            replaced_y = true;
-        }
     }
-    if (!replaced_x && !replaced_y) {
-        return "{\"ok\": false, \"error\": \"cam" + std::to_string(cam) + " not found in yaml\"}\n";
+    // 上面一轮只是定位 cam 块, 实际改字段从开头再扫一次 (逻辑更清晰)
+    in_target = false;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string t = trim(lines[i]);
+        if (t == key) { in_target = true; continue; }
+        if (in_target && t.rfind("cam", 0) == 0 && t.find(':') != std::string::npos
+            && t != key) {
+            in_target = false;
+            continue;
+        }
+        if (!in_target) continue;
+
+        if (try_replace("x", new_x))      replaced_any = true;
+        if (try_replace("y", new_y))      replaced_any = true;
+        if (try_replace("width", new_w))  replaced_any = true;
+        if (try_replace("height", new_h)) replaced_any = true;
+    }
+    if (!replaced_any) {
+        return "{\"ok\": false, \"error\": \"cam" + std::to_string(cam)
+            + " not found in yaml (need x/y/width/height at least one)\"}\n";
     }
 
     // 写临时文件 + rename 原子替换
@@ -284,7 +311,7 @@ std::string handle_roi_post(const std::string& body) {
         return "{\"ok\": false, \"error\": \"rename failed\"}\n";
     }
     return "{\"ok\": true, \"message\": \"cam" + std::to_string(cam)
-        + " updated, restart image-stitching to apply\"}\n";
+        + " updated, yaml watcher will reload in <1s\"}\n";
 }
 
 // 静态文件 handler: 读 file + 设 MIME

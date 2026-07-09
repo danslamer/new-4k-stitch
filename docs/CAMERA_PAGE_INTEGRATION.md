@@ -123,12 +123,13 @@ curl -s --max-time 3 http://localhost:8080/api/config | head -c 80
 # %YAML:1.0 ...  (yaml 全文)
 
 # POST 调 ROI（原子替换 yaml）
+# v3.x (2026-07-09): 改成绝对 ROI. {x, y, width, height} 任意子集都可传, 没传的保留 yaml 原值.
 curl -X POST http://localhost:8080/api/roi \
      -H "Content-Type: application/json" \
-     -d ''"'"'{"cam":0,"offset_x":5,"offset_y":-3}'"'"''
-# {"ok":true,"message":"cam0 updated, restart image-stitching to apply"}
-grep "offset_x" ~/Projects/new-4k-stitch/params/roi_tuning.yaml
-# 应看到 cam0: offset_x: 5
+     -d ''"'"'{"cam":0,"x":100,"y":50,"width":2360,"height":1340}'"'"''
+# {"ok":true,"message":"cam0 updated, yaml watcher will reload in <1s"}
+grep -A 4 "cam0:" ~/Projects/new-4k-stitch/params/roi_tuning.yaml
+# 应看到 cam0 下的 x/y/width/height 已被覆盖
 
 # 静态文件
 curl -s --max-time 3 http://localhost:8080/ | head -c 60

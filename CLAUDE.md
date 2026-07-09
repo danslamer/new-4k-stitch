@@ -80,7 +80,7 @@ Hot paths touch only DMA-BUF fds; BGR conversions go through RGA (`ExportHardwar
 
 When refactoring anything that loops over cameras, these are the places that were extended from 4 → 6 in v2.3 and must stay consistent:
 
-- `include/roi_config.h` — `RoiOffset roi_offsets[6]` and `StitchGlobalConfig`
+- `include/roi_config.h` — `CameraRoiRect camera_rois[6]` and `StitchGlobalConfig` (v3.x: 直接存绝对 ROI 坐标, 不再是 offset)
 - `src/app.cc` — `BuildDefaultTuning` (no longer capped at 4), `EstimateOverlaps2x3` / `BuildCameraRois2x3` / `BuildStitchLayout2x3`, `BlendSeams` (6 dispatch_seam)
 - `src/roi_visualizer.cc` — Tab cycles over 6 cams
 - `params/camera_sources.yaml` — 6 camera blocks (yaml is the canonical list; adding cams needs no C++ changes)

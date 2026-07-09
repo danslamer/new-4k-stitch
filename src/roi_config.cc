@@ -1,4 +1,4 @@
-﻿#include "roi_config.h"
+#include "roi_config.h"
 
 #include <opencv2/opencv.hpp>
 #include <algorithm>
@@ -51,15 +51,25 @@ bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config
         }
     }
 
-    // v3.0 (2026-07-08): 6 路 ROI 占位 (cam0..cam5). Sprint 0 接受 offset 全 (0,0);
-    //   Sprint 2 标定结果从 camchain_*.yaml 覆盖.
+    // v3.x (2026-07-09): 直接读 cam{i}.{x, y, width, height}. valid 由 width/height>0 推导.
+    //   老的 offset_x/offset_y 字段被忽略 — 旧 yaml 第一次加载会全部 valid=false,
+    //   App::App() 看到 valid 全 false 就重跑 bootstrap, 把新格式写回.
     static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3", "cam4", "cam5"};
     for (int i = 0; i < 6; ++i) {
         cv::FileNode cam_node = fs[cam_names[i]];
-        if (!cam_node.empty()) {
-            config.roi_offsets[i].offset_x = static_cast<int>(cam_node["offset_x"]);
-            config.roi_offsets[i].offset_y = static_cast<int>(cam_node["offset_y"]);
+        if (cam_node.empty()) continue;
+
+        CameraRoiRect& r = config.camera_rois[i];
+        // 老字段存在 -> 打日志, 忽略 (用 Bootstrap 兜底)
+        if (!cam_node["offset_x"].empty() || !cam_node["offset_y"].empty()) {
+            // 不做 in-place 迁移, 因为缺 overlap 信息. 触发 Bootstrap 即可.
         }
+
+        if (!cam_node["x"].empty())       r.x      = static_cast<int>(cam_node["x"]);
+        if (!cam_node["y"].empty())       r.y      = static_cast<int>(cam_node["y"]);
+        if (!cam_node["width"].empty())   r.width  = static_cast<int>(cam_node["width"]);
+        if (!cam_node["height"].empty())  r.height = static_cast<int>(cam_node["height"]);
+        r.valid = (r.width > 0 && r.height > 0);
     }
 
     fs.release();
@@ -100,12 +110,14 @@ bool RoiConfig::SaveToFile(const std::string& path, const StitchGlobalConfig& co
     fs << "interval" << config.save_interval;
     fs << "}";
 
-    // v3.0: 同步 cam0..cam5 (与 LoadFromFile 对称)
+    // v3.x (2026-07-09): 写 cam{i}.{x, y, width, height}. valid 不写, 由 w/h>0 推导.
     static const char* cam_names[] = {"cam0", "cam1", "cam2", "cam3", "cam4", "cam5"};
     for (int i = 0; i < 6; ++i) {
         fs << cam_names[i] << "{";
-        fs << "offset_x" << config.roi_offsets[i].offset_x;
-        fs << "offset_y" << config.roi_offsets[i].offset_y;
+        fs << "x"      << config.camera_rois[i].x;
+        fs << "y"      << config.camera_rois[i].y;
+        fs << "width"  << config.camera_rois[i].width;
+        fs << "height" << config.camera_rois[i].height;
         fs << "}";
     }
 

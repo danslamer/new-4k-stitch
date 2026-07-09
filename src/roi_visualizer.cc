@@ -20,15 +20,22 @@ constexpr int CHAR_SPACING = 1;
 constexpr int DISPLAY_DEFAULT_W = 1280;
 constexpr int DISPLAY_DEFAULT_H = 720;
 
-constexpr uint8_t CAM_COLORS_BGR[4][3] = {
-    {0, 255, 0},
-    {0, 0, 255},
-    {255, 0, 0},
-    {0, 255, 255}
+constexpr uint8_t CAM_COLORS_BGR[6][3] = {
+    {0, 255, 0},     // cam0 - green
+    {0, 0, 255},     // cam1 - red
+    {255, 0, 0},     // cam2 - blue
+    {0, 255, 255},   // cam3 - yellow
+    {255, 0, 255},   // cam4 - magenta
+    {255, 255, 0}    // cam5 - cyan
 };
 
-const char* CAM_LABELS[4] = {"Cam0", "Cam1", "Cam2", "Cam3"};
-const char* CAM_POSITIONS[4] = {"LT(C0)", "RT(C1)", "LB(C2)", "RB(C3)"};
+// v3.x (2026-07-09): 扩到 6 项 (2x3 布局):
+//   cam0 LT 左上, cam1 RT 右上, cam2 LM 左中, cam3 RM 右中, cam4 LB 左下, cam5 RB 右下.
+// 4 路 (2x2) 走 cam0..cam3 复用前 4 项.
+const char* CAM_LABELS[6] = {"Cam0", "Cam1", "Cam2", "Cam3", "Cam4", "Cam5"};
+const char* CAM_POSITIONS[6] = {
+    "LT(C0)", "RT(C1)", "LM(C2)", "RM(C3)", "LB(C4)", "RB(C5)"
+};
 
 static const uint8_t FONT_5x7[][7][5] = {
     {{0,0,0,0,0},{0,0,0,0,0},{0,0,0,0,0},{0,0,0,0,0},{0,0,0,0,0},{0,0,0,0,0},{0,0,0,0,0}}, // space
@@ -106,6 +113,7 @@ int RoiVisualizer::display_w_ = 0;
 int RoiVisualizer::display_h_ = 0;
 int RoiVisualizer::panorama_w_ = 0;
 int RoiVisualizer::panorama_h_ = 0;
+int RoiVisualizer::num_cams_ = 6;  // 默认 6, Init() 重新注入
 bool RoiVisualizer::initialized_ = false;
 
 int RoiVisualizer::NormalizeEvenFloor(int value) {
@@ -132,9 +140,10 @@ int RoiVisualizer::ScaleH(int h) {
     return h * display_h_ / panorama_h_;
 }
 
-bool RoiVisualizer::Init(int panorama_width, int panorama_height) {
+bool RoiVisualizer::Init(int panorama_width, int panorama_height, int num_cams) {
     panorama_w_ = panorama_width;
     panorama_h_ = panorama_height;
+    num_cams_ = num_cams > 0 ? num_cams : 6;  // 兜底 6
     
     const char* display = getenv("DISPLAY");
     Logger::GetInstance().Log("[RoiVisualizer] DISPLAY env: " + 
@@ -343,29 +352,34 @@ VisAction RoiVisualizer::ShowDebugFrame(const uint8_t* bgr_data,
 }
 
 void RoiVisualizer::DrawROIMarkers(const std::vector<StitchTask>& tasks) {
-    if (tasks.size() < 4) return;
-    
-    for (int i = 0; i < 4; ++i) {
+    // v3.x (2026-07-09): 用 num_cams_ 决定画多少个 cam 框, 兼容 2x2 (4) 和 2x3 (6).
+    //   边界用 std::min 三重兜底: 不超过 num_cams_, 不超过 tasks.size(), 不超过颜色表.
+    const int n = std::min({num_cams_,
+                            static_cast<int>(tasks.size()),
+                            static_cast<int>(sizeof(CAM_COLORS_BGR) / sizeof(CAM_COLORS_BGR[0]))});
+    if (n <= 0) return;
+
+    for (int i = 0; i < n; ++i) {
         if (!tasks[i].enabled) continue;
-        
+
         bool rotated = (tasks[i].rotation_deg == 90 || tasks[i].rotation_deg == 270);
         int w = rotated ? tasks[i].src_h : tasks[i].src_w;
         int h = rotated ? tasks[i].src_w : tasks[i].src_h;
-        
+
         int sx = ScaleX(tasks[i].dst_x);
         int sy = ScaleY(tasks[i].dst_y);
         int sw = ScaleW(w);
         int sh = ScaleH(h);
-        
+
         uint8_t r = CAM_COLORS_BGR[i][0];
         uint8_t g = CAM_COLORS_BGR[i][1];
         uint8_t b = CAM_COLORS_BGR[i][2];
-        
+
         int thickness = (i == g_config.selected_cam) ? 3 : 2;
         DrawRectOutline(sx, sy, sw, sh, r, g, b, thickness);
-        
+
         DrawText(sx + 5, sy + 5, CAM_LABELS[i], r, g, b);
-        
+
         if (i == g_config.selected_cam) {
             DrawText(sx + 5, sy + 5 + (FONT_H + 1) * FONT_SCALE, "[SEL]", r, g, b);
         }
@@ -380,19 +394,26 @@ void RoiVisualizer::DrawFpsOverlay(double fps) {
 
 void RoiVisualizer::DrawControlInfo() {
     int cam = g_config.selected_cam;
-    RoiOffset off = g_config.roi_offsets[cam];
-    
+    const CameraRoiRect& r = g_config.camera_rois[cam];
+
     std::ostringstream oss;
+    // v3.x (2026-07-09): 显示完整 ROI 坐标 (x, y, w, h) — yaml 里就是这四个字段.
     oss << CAM_POSITIONS[cam]
-        << " Ox:" << off.offset_x << " Oy:" << off.offset_y
+        << " x:" << r.x << " y:" << r.y
+        << " w:" << r.width << " h:" << r.height
         << " St:" << g_config.step_size;
-    
+
     int text_h = (FONT_H + 2) * FONT_SCALE;
-    int bar_h = text_h + 10;
+    int bar_h = (text_h + 4) * 2;
     int y_pos = display_h_ - bar_h - (FONT_H + 2) * FONT_SCALE - 5;
-    
+
     FillRect(0, y_pos, display_w_, bar_h, 40, 40, 40);
-    DrawText(10, y_pos + 5, oss.str(), 255, 255, 255);
+    DrawText(10, y_pos + 4, oss.str(), 255, 255, 255);
+    // v3.x (2026-07-09): 简短按键提示. 方向键挪位置, shift+方向键改尺寸;
+    //   R 重新抓当前帧 (debug 里画面"暂停"是 by design, 调参需要稳定参考).
+    DrawText(10, y_pos + 4 + text_h + 2,
+             "Arrows:move  Shift+Arrows:resize  Tab:cam  R:refresh  E:save  Q:quit",
+             180, 180, 180);
 }
 
 void RoiVisualizer::DrawFeatherSaveInfo() {
@@ -417,13 +438,15 @@ VisAction RoiVisualizer::PollEvents(bool debug_mode) {
             return kVisExitDebug;
         }
         if (event.type == SDL_KEYDOWN) {
-            VisAction action = ParseKey(event.key.keysym.sym);
-            
+            // v3.x (2026-07-09): shift 状态透传到 ParseKey, 让方向键 + shift 切到 resize 模式.
+            const bool shift = (event.key.keysym.mod & KMOD_SHIFT) != 0;
+            VisAction action = ParseKey(event.key.keysym.sym, shift);
+
             if (!debug_mode) {
                 if (action == kVisEnterDebug) return kVisEnterDebug;
                 return kVisNone;
             }
-            
+
             if (action != kVisNone) {
                 return HandleDebugAction(action);
             }
@@ -439,16 +462,17 @@ VisAction RoiVisualizer::PollEvents(bool debug_mode) {
     return kVisNone;
 }
 
-VisAction RoiVisualizer::ParseKey(SDL_Keycode key) {
+VisAction RoiVisualizer::ParseKey(SDL_Keycode key, bool shift) {
     switch (key) {
-        case SDLK_UP:    return kVisStepUp;
-        case SDLK_DOWN:  return kVisStepDown;
-        case SDLK_LEFT:  return kVisStepLeft;
-        case SDLK_RIGHT: return kVisStepRight;
-        case SDLK_w:     return kVisStepUp;
-        case SDLK_s:     return kVisStepDown;
-        case SDLK_a:     return kVisStepLeft;
-        case SDLK_d:     return kVisStepRight;
+        // v3.x (2026-07-09): shift + 方向键改 w/h, 否则挪 x/y
+        case SDLK_UP:    return shift ? kVisResizeUp    : kVisStepUp;
+        case SDLK_DOWN:  return shift ? kVisResizeDown  : kVisStepDown;
+        case SDLK_LEFT:  return shift ? kVisResizeLeft  : kVisStepLeft;
+        case SDLK_RIGHT: return shift ? kVisResizeRight : kVisStepRight;
+        case SDLK_w:     return shift ? kVisResizeUp    : kVisStepUp;
+        case SDLK_s:     return shift ? kVisResizeDown  : kVisStepDown;
+        case SDLK_a:     return shift ? kVisResizeLeft  : kVisStepLeft;
+        case SDLK_d:     return shift ? kVisResizeRight : kVisStepRight;
         case SDLK_TAB:   return kVisNextCam;
         case SDLK_1:     return kVisStepSize1;
         case SDLK_5:     return kVisStepSize5;
@@ -458,6 +482,7 @@ VisAction RoiVisualizer::ParseKey(SDL_Keycode key) {
         case SDLK_q:     return kVisExitDebug;
         case SDLK_ESCAPE:return kVisExitDebug;
         case SDLK_e:     return kVisSaveConfig;
+        case SDLK_r:     return kVisRefreshFrames;  // v3.x: debug 模式下重新抓帧
         case SDLK_f:     return kVisFeatherToggle;
         case SDLK_PLUS:  
         case SDLK_EQUALS:return kVisFeatherWidthUp;
@@ -472,10 +497,12 @@ VisAction RoiVisualizer::ParseKey(SDL_Keycode key) {
 
 VisAction RoiVisualizer::HandleDebugAction(VisAction action) {
     int cam = g_config.selected_cam;
-    
+
     switch (action) {
         case kVisNextCam:
-            g_config.selected_cam = (g_config.selected_cam + 1) % 4;
+            // v3.x (2026-07-09): 用 num_cams_ (4 for 2x2, 6 for 2x3) 而不是硬编码 4.
+            //   同时兜底 selected_cam 防止 yaml / 视觉器外部把 cam 写到 5 但模式是 2x2 的情况.
+            g_config.selected_cam = (g_config.selected_cam + 1) % num_cams_;
             return kVisNone;
         case kVisToggleMarkers:
             g_show_roi_markers = !g_show_roi_markers;
@@ -493,16 +520,33 @@ VisAction RoiVisualizer::HandleDebugAction(VisAction action) {
             g_config.step_size = 50;
             return kVisNone;
         case kVisStepUp:
-            g_config.roi_offsets[cam].offset_y -= g_config.step_size;
+            // v3.x (2026-07-09): 直接改 g_config.camera_rois[i] 的 (x, y), BuildCameraRois
+            //   下次调用就读到新值. 偶数对齐交给 NormalizeEvenFloor.
+            g_config.camera_rois[cam].y -= g_config.step_size;
             return kVisNeedRestitch;
         case kVisStepDown:
-            g_config.roi_offsets[cam].offset_y += g_config.step_size;
+            g_config.camera_rois[cam].y += g_config.step_size;
             return kVisNeedRestitch;
         case kVisStepLeft:
-            g_config.roi_offsets[cam].offset_x -= g_config.step_size;
+            g_config.camera_rois[cam].x -= g_config.step_size;
             return kVisNeedRestitch;
         case kVisStepRight:
-            g_config.roi_offsets[cam].offset_x += g_config.step_size;
+            g_config.camera_rois[cam].x += g_config.step_size;
+            return kVisNeedRestitch;
+        case kVisResizeUp:
+            // shift+方向键 — 缩 w/h. 最小 2 像素保底, 不然 BuildCameraRois 抛 runtime_error.
+            g_config.camera_rois[cam].height =
+                std::max(2, g_config.camera_rois[cam].height - g_config.step_size);
+            return kVisNeedRestitch;
+        case kVisResizeDown:
+            g_config.camera_rois[cam].height += g_config.step_size;
+            return kVisNeedRestitch;
+        case kVisResizeLeft:
+            g_config.camera_rois[cam].width =
+                std::max(2, g_config.camera_rois[cam].width - g_config.step_size);
+            return kVisNeedRestitch;
+        case kVisResizeRight:
+            g_config.camera_rois[cam].width += g_config.step_size;
             return kVisNeedRestitch;
         case kVisFeatherToggle:
             g_config.feather_enabled = !g_config.feather_enabled;
@@ -515,6 +559,10 @@ VisAction RoiVisualizer::HandleDebugAction(VisAction action) {
             g_config.feather_width = NormalizeEvenFloor(
                 std::max(20, g_config.feather_width - 10));
             return kVisNeedRebuild;
+        case kVisRefreshFrames:
+            // v3.x (2026-07-09): 透传, 由 caller (App) 拉新帧 + SaveCurrentFrames.
+            //   这里不直接动数据是因为 get_image_vector 涉及 6 路解码器, 必须 caller 触发.
+            return kVisRefreshFrames;
         case kVisSaveToggle:
             g_config.save_enabled = !g_config.save_enabled;
             return kVisNone;

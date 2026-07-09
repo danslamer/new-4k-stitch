@@ -49,8 +49,6 @@ struct CameraTuning {
   int crop_right = 0;
   int crop_top = 0;
   int crop_bottom = 0;
-  int offset_x = 0;
-  int offset_y = 0;
   bool enabled = true;
 };
 
@@ -215,11 +213,8 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
 
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
-
-  for (size_t i = 0; i < num_cameras && i < 6; ++i) {
-    tuning[i].offset_x = g_config.roi_offsets[i].offset_x;
-    tuning[i].offset_y = g_config.roi_offsets[i].offset_y;
-  }
+  // v3.x (2026-07-09): offset_x/y 已删. ROI 直接来自 g_config.camera_rois[i] (yaml),
+  //   BuildCameraRois2x3/2x2 内自己读, 不再通过 CameraTuning 间接传.
   return tuning;
 }
 
@@ -554,12 +549,11 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   int Y3_2 = Y[2] + overlaps.h23.shift_y;
   X[3] = (X3_1 + X3_2) / 2;
   Y[3] = (Y3_1 + Y3_2) / 2;
-  
-  for (int i = 0; i < 4; ++i) {
-    X[i] += tuning[i].offset_x;
-    Y[i] += tuning[i].offset_y;
-  }
-  
+
+  // v3.x (2026-07-09): tuning offset 不再加到 panorama 位置 X[i]/Y[i],
+  //   改成加到 source 帧的 ROI 剪裁起点上 (见下面 rois[i].x/y += offset).
+  //   与 2x3 路径语义对齐: 剪裁窗口在源图平移, 不动目标网格.
+
   int X_mid_01 = (X[1] + X[0] + W[0]) / 2;
   int X_mid_23 = (X[3] + X[2] + W[2]) / 2;
   int cut_x = NormalizeEvenFloor((X_mid_01 + X_mid_23) / 2);
@@ -611,7 +605,19 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
   rois[3].y = NormalizeEvenFloor(cut_y_bottom - Y[3] + tuning[3].crop_top);
   rois[3].width = NormalizeEvenFloor(max_x - cut_x_right - tuning[3].crop_left - tuning[3].crop_right);
   rois[3].height = NormalizeEvenFloor(max_y - cut_y_bottom - tuning[3].crop_top - tuning[3].crop_bottom);
-  
+
+  // v3.x (2026-07-09): tuning offset 已删. yaml 里存的绝对 ROI 优先, valid=false 走
+  //   上面的 crop_* 默认值. 视觉器调参直接改 g_config.camera_rois, 本函数下次调用生效.
+  for (int i = 0; i < 4; ++i) {
+    const CameraRoiRect& cfg = g_config.camera_rois[i];
+    if (cfg.valid) {
+      rois[i].x      = NormalizeEvenFloor(cfg.x);
+      rois[i].y      = NormalizeEvenFloor(cfg.y);
+      rois[i].width  = NormalizeEvenFloor(cfg.width);
+      rois[i].height = NormalizeEvenFloor(cfg.height);
+    }
+  }
+
   for (int i = 0; i < 4; ++i) {
     if (rois[i].x < 0) rois[i].x = 0;
     if (rois[i].y < 0) rois[i].y = 0;
@@ -621,7 +627,7 @@ std::vector<CameraRoi> BuildCameraRois2x2(const std::vector<NV12Frame>& frames,
       throw std::runtime_error("invalid 2x2 crop mapping for camera " + std::to_string(i));
     }
   }
-  
+
   return rois;
 }
 
@@ -684,7 +690,7 @@ std::vector<CameraRoi> BuildCameraRois2x3(const std::vector<NV12Frame>& frames,
   std::vector<CameraRoi> rois(n);
 
   // 简化策略: 每个 cam 满分辨率取 ROI, 不裁剪
-  // (真正的 ROI 调整由 tuning.offset_x/y 在 BuildStitchLayout2x3 里做微调)
+  // (真正的 ROI 由 g_config.camera_rois[i] 在最后覆盖 — 下面有 v3.x 注释)
   for (int i = 0; i < n; ++i) {
     rois[i].x = 0;
     rois[i].y = 0;
@@ -704,6 +710,19 @@ std::vector<CameraRoi> BuildCameraRois2x3(const std::vector<NV12Frame>& frames,
   // v24/v35 shift_x -> cam4/cam5 的 x 偏移
   rois[4].x = NormalizeEvenFloor(overlaps.v24.shift_y);
   rois[5].x = NormalizeEvenFloor(overlaps.v35.shift_y);
+
+  // v3.x (2026-07-09): 优先用 yaml 存的绝对 ROI (g_config.camera_rois[i]).
+  //   valid=true 才覆盖, 否则保留上面的 overlap 兜底值. 后续 visualizer 调参
+  //   也是直接改 g_config.camera_rois, RebuildLayout 重新调本函数即可生效.
+  for (int i = 0; i < n; ++i) {
+    const CameraRoiRect& cfg = g_config.camera_rois[i];
+    if (cfg.valid) {
+      rois[i].x      = NormalizeEvenFloor(cfg.x);
+      rois[i].y      = NormalizeEvenFloor(cfg.y);
+      rois[i].width  = NormalizeEvenFloor(cfg.width);
+      rois[i].height = NormalizeEvenFloor(cfg.height);
+    }
+  }
 
   // 边界 clip (不超 cam 实际尺寸)
   for (int i = 0; i < n; ++i) {
@@ -768,11 +787,14 @@ std::vector<StitchTask> BuildStitchLayout2x3(const std::vector<CameraRoi>& rois,
   int col_x[2] = { 0, NormalizeEvenFloor(W - overlap_h) };
   int row_y[3] = { 0, NormalizeEvenFloor(H - overlap_v), NormalizeEvenFloor(2 * (H - overlap_v)) };
 
+  // v3.x (2026-07-09): offset 已经在 BuildCameraRois2x3 加到 source ROI (rois[i].x/y) 上了,
+  //   dst 只用 grid 位置, 不再加 tuning offset. 行为: 剪裁窗口在源图平移 → 剪下来的画面
+  //   仍落在标准网格位置, 不会因 offset 把画面拖出 panorama.
   for (int i = 0; i < n; ++i) {
     int col = i % 2;   // 0 or 1
     int row = i / 2;   // 0, 1, or 2
-    tasks[i].dst_x = col_x[col] + tuning[i].offset_x;
-    tasks[i].dst_y = row_y[row] + tuning[i].offset_y;
+    tasks[i].dst_x = col_x[col];
+    tasks[i].dst_y = row_y[row];
   }
 
   // panorama 尺寸
@@ -931,6 +953,16 @@ void App::BootStrapOptimalLayout() {
   const MatrixOverlap& overlaps = best_result.overlaps;
   const vector<CameraRoi>& rois = best_result.rois;
   const vector<StitchTask>& layout = best_result.layout;
+
+  // v3.x (2026-07-09): bootstrap 成功识别后, 把 detected rois 写到 g_config.camera_rois
+  //   (valid=true), 下次 SaveToFile 就会把绝对 ROI 落到 yaml, 后续运行直接读取不重跑 bootstrap.
+  for (size_t i = 0; i < num_img_ && i < rois.size(); ++i) {
+    g_config.camera_rois[i].x      = rois[i].x;
+    g_config.camera_rois[i].y      = rois[i].y;
+    g_config.camera_rois[i].width  = rois[i].width;
+    g_config.camera_rois[i].height = rois[i].height;
+    g_config.camera_rois[i].valid  = true;
+  }
   
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream summary_msg;
@@ -1281,9 +1313,12 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   }
 
   if (visual_mode_) {
-    Logger::GetInstance().Log("[App] Initializing visualizer with panorama size: " + 
-                              std::to_string(total_cols_) + "x" + std::to_string(height_));
-    if (!RoiVisualizer::Init(total_cols_, height_)) {
+    Logger::GetInstance().Log("[App] Initializing visualizer with panorama size: " +
+                              std::to_string(total_cols_) + "x" + std::to_string(height_) +
+                              " num_cams=" + std::to_string(num_img_));
+    // v3.x (2026-07-09): 把 num_img_ (4 或 6) 传给 visualizer, 决定画几个 cam 框 +
+    //   Tab 切换的范围. 默认 6 兼容老调用方.
+    if (!RoiVisualizer::Init(total_cols_, height_, static_cast<int>(num_img_))) {
       Logger::GetInstance().Log("[App] OpenCV highgui init failed, disabling visual mode");
       Logger::GetInstance().Log("[App] Check if DISPLAY environment variable is set correctly");
       visual_mode_ = false;
@@ -1291,9 +1326,23 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
       Logger::GetInstance().Log("[App] Visualizer initialized successfully");
     }
   }
+
+  // v3.x (2026-07-09): 启动 yaml watcher. 必须在 SaveToFile / InitFromConfig 之后启动,
+  //   这样 watcher 记下的基线 mtime 就是当前最新的 yaml 状态, 不会把启动后立刻写入的
+  //   yaml 当成"外部修改"误触发 reload. yaml 不存在时 Start() 静默失败, 主循环也不 reload.
+  yaml_path_ = "../params/roi_tuning.yaml";
+  if (g_use_roi_config) {
+    roi_yaml_watcher_.reset(new RoiYamlWatcher(yaml_path_));
+    roi_yaml_watcher_->Start();
+  }
 }
 
 App::~App() {
+  // v3.x (2026-07-09): 先停 yaml watcher, 避免它和 main thread 抢着 reload.
+  if (roi_yaml_watcher_) {
+    roi_yaml_watcher_->Stop();
+    roi_yaml_watcher_.reset();
+  }
   ReleaseSavedFrames();
   if (visual_mode_) RoiVisualizer::Shutdown();
   mjpeg_streamer::shutdown();   // 阶段 2: 唤醒 wait 的 consumer, 清缓冲
@@ -1417,6 +1466,33 @@ App::~App() {
       }
     }
 
+    // v3.x (2026-07-09): 实时 yaml reload. watcher 后台线程检测到 mtime 跳变后会
+    //   set pending flag, 这里 Consume 后 reload g_config + RebuildLayout.
+    //   跑在主线程: 单写者, 不需要锁 g_config. debug_mode_ 不处理 (用 saved frame 调参,
+    //   不应被外部 yaml 修改抢断).
+    if (roi_yaml_watcher_ && roi_yaml_watcher_->ShouldReload() && !debug_mode_) {
+      roi_yaml_watcher_->Consume();
+      StitchGlobalConfig new_cfg;
+      if (RoiConfig::LoadFromFile(yaml_path_, new_cfg)) {
+        g_config = new_cfg;
+        try {
+          RebuildLayout();
+          Logger::GetInstance().Log(
+              "[App] YAML reloaded + layout rebuilt (cam0 roi=" +
+              std::to_string(g_config.camera_rois[0].x) + "," +
+              std::to_string(g_config.camera_rois[0].y) + " " +
+              std::to_string(g_config.camera_rois[0].width) + "x" +
+              std::to_string(g_config.camera_rois[0].height) + ")");
+        } catch (const std::exception& e) {
+          Logger::GetInstance().LogError(
+              std::string("[App] YAML reload RebuildLayout failed: ") + e.what());
+        }
+      } else {
+        Logger::GetInstance().LogError(
+            "[App] YAML reload failed (parse error?), keeping previous config");
+      }
+    }
+
     const double t2 = cv::getTickCount();
     double fps = 1.0 / ((t2 - t0) / cv::getTickFrequency());
 
@@ -1452,6 +1528,16 @@ App::~App() {
           Logger::GetInstance().Log("[App] [DEBUG] Feather params changed, layout rebuilt and restitched");
         }
         
+        if (action == kVisRefreshFrames) {
+          // v3.x (2026-07-09): 临时解锁, 拉一帧最新的 (六个 decoder 都到齐为止),
+          //   再重新拷到 saved_drm_bufs_. 之后 frames_locked_ 由 SaveCurrentFrames 内部
+          //   设回 true, 行为跟初次进 debug 一致.
+          frames_locked_ = false;
+          sensorDataInterface_.get_image_vector(image_vector_);
+          SaveCurrentFrames();
+          RestitchSavedFrames();
+          Logger::GetInstance().Log("[App] [DEBUG] refreshed saved frames from live");
+        }
         if (action == kVisSaveConfig) {
           try {
       RoiConfig::SaveToFile("../params/roi_tuning.yaml", g_config);

@@ -71,7 +71,7 @@ bash tools/sprint0_smoke.sh                                          # v3.0 骨�
 | v3.0 Sprint 1 同步 + 稳定 | ⏳ 计划 | watchdog + NTP/PTP、L2 |
 | v3.0 Sprint 2 标定 + 美化 | ⏳ 计划 | 实际 K 矩阵覆盖 FOV 反推占位、标定板视频录入 |
 
-**6 路硬编码改造列表**（迁移进度, 集中在 [`AGENTS.md`](AGENTS.md) "6 路硬编码位置速查"）：`roi_offsets[6]`、`i < 6`、`EstimateOverlaps2x3` / `BuildCameraRois2x3` / `BuildStitchLayout2x3` / `BlendSeams` 6 路、`roi_visualizer` Tab 6 路循环 — 全部已完成。
+**6 路硬编码改造列表**（迁移进度, 集中在 [`AGENTS.md`](AGENTS.md) "6 路硬编码位置速查"）：`camera_rois[6]` (v3.x 改成存绝对 ROI)、`i < 6`、`EstimateOverlaps2x3` / `BuildCameraRois2x3` / `BuildStitchLayout2x3` / `BlendSeams` 6 路、`roi_visualizer` Tab 6 路循环 — 全部已完成。
 
 **新代码动 `AGENTS.md` 前必读**：6 路硬编码位置速查（[`AGENTS.md`](AGENTS.md)）+ 当前活跃计划（[`docs/NETWORK_CAMERA_PLAN.md`](docs/NETWORK_CAMERA_PLAN.md)）+ 踩过的坑（[`docs/HISTORY.md`](docs/HISTORY.md) § 3）。
 
