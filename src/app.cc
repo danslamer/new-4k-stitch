@@ -1060,10 +1060,11 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
     const bool is_identity_affine =
         (a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0 && tx == 0.0 && ty == 0.0);
     if (is_identity_affine && have_undist && (t.dst_x != 0 || t.dst_y != 0)) {
-      Logger::GetInstance().LogInfo(
-          "[App] BuildAffineWarpData: cam%zu affine=identity + undist loaded; "
-          "auto-substituting pure translation [1,0,%d; 0,1,%d] for cell offset.",
-          i, t.dst_x, t.dst_y);
+      Logger::GetInstance().Log(
+          "[App] BuildAffineWarpData: cam" + std::to_string(i) +
+          " affine=identity + undist loaded; auto-substituting pure translation "
+          "[1,0," + std::to_string(t.dst_x) + "; 0,1," + std::to_string(t.dst_y) +
+          "] for cell offset.");
       tx = t.dst_x;
       ty = t.dst_y;
     }
