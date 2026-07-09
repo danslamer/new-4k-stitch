@@ -1,4 +1,4 @@
-﻿#include "app.h"
+#include "app.h"
 #include "status_writer.h"
 #include "http_server.h"
 #include "mjpeg_streamer.h"
@@ -992,6 +992,43 @@ void App::BootStrapOptimalLayout() {
   SaveDetectedRoiDebug(best_bootstrap_bgr, rois);
 }
 
+
+bool App::InitRtspOutput() {
+#if HAVE_GST_RTSP_SERVER
+    // 读 yaml 顶层 `output:` 块.
+    rtsp_cfg_ = output_streams::LoadFromYaml("../params/camera_sources.yaml");
+    if (!rtsp_cfg_.enabled) {
+        Logger::GetInstance().Log(
+            "[App] output.enabled=false in yaml, RTSP output disabled");
+        return false;
+    }
+
+    // 构造 FrameDiff 配置.
+    frame_diff::DiffConfig fd_cfg;
+    fd_cfg.threshold = rtsp_cfg_.diff_threshold;
+    fd_cfg.bbox_min_area = rtsp_cfg_.diff_bbox_min_area;
+    frame_diff_.reset(new frame_diff::FrameDiff(fd_cfg));
+    Logger::GetInstance().Log(
+        "[App] FrameDiff ready: threshold=" + std::to_string(fd_cfg.threshold) +
+        " bbox_min=" + std::to_string(fd_cfg.bbox_min_area));
+
+    // 启 GST RTSP server.
+    auto& srv = gst_rtsp_server::GstRtspServer::GetInstance();
+    if (!srv.Start(rtsp_cfg_, rtsp_cfg_.streams)) {
+        Logger::GetInstance().LogError(
+            "[App] gst_rtsp_server Start failed, RTSP output disabled");
+        frame_diff_.reset();
+        return false;
+    }
+    Logger::GetInstance().Log(
+        "[App] RTSP output enabled on port " + std::to_string(rtsp_cfg_.port) +
+        " streams=" + std::to_string(rtsp_cfg_.streams.size()));
+    return true;
+#endif  // HAVE_GST_RTSP_SERVER
+
+  // HAVE_GST_RTSP_SERVER=0: RTSP 没编译进来, 默认关.
+  return false;
+}
 void App::SyncConfigToGlobals() {
 }
 
@@ -1174,6 +1211,9 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   mjpeg_streamer::init();
 
   sensorDataInterface_.InitVideoCapture(num_img_);
+  // v3.2 (2026-07-09): 启动 RTSP 推流 (yaml output.enabled=true). 在 stitch 之前 init, 让 pipeline ready.
+  rtsp_output_enabled_ = InitRtspOutput();
+
   image_vector_.resize(num_img_);
 
   bool config_loaded = false;
@@ -1260,6 +1300,10 @@ App::~App() {
   drm_free(mjpeg_drm_buf_);     // 阶段 2
   drm_free(output_drm_buf_);
   stitch_status::shutdown();  // v2.3 阶段 1: 清理 status 文件
+
+  // v3.2: 关 RTSP server (detach glib main loop, 停 pump 线程).
+  gst_rtsp_server::GstRtspServer::GetInstance().Stop();
+  frame_diff_.reset();
 }
 
 [[noreturn]] void App::run_stitching() {
@@ -1285,6 +1329,33 @@ App::~App() {
     
     if (g_config.feather_enabled) {
       image_stitcher_.BlendSeams(stitch_input, image_concat_);
+
+    // v3.2 (2026-07-09): 帧差掩码 + 2 路 RTSP 推流. (yaml output.enabled=true)
+    if (rtsp_output_enabled_ && !debug_mode_) {
+      // ExportNv12DrmBufferToBgr returns cv::UMat (OpenCL); convert to Mat for RTSP push.
+      cv::UMat stitched_umat_for_rtsp = ExportNv12DrmBufferToBgr(output_drm_buf_);
+      if (!stitched_umat_for_rtsp.empty()) {
+        cv::Mat stitched_bgr_for_rtsp = stitched_umat_for_rtsp.getMat(cv::ACCESS_READ);
+        gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
+            "/stitch", stitched_bgr_for_rtsp);
+        if (frame_diff_) {
+          // frame_diff needs NV12Frame (fd + width + height + stride).
+          // Build a NV12Frame view from output_drm_buf_ without copying.
+          NV12Frame nv12_view;
+          nv12_view.fd = output_drm_buf_.fd;
+          nv12_view.width = output_drm_buf_.width;
+          nv12_view.height = output_drm_buf_.height;
+          nv12_view.stride_w = static_cast<int>(output_drm_buf_.pitch);
+          nv12_view.stride_h = output_drm_buf_.height;
+          cv::Mat mask_bgr = frame_diff_->ComputeMask(nv12_view);
+          if (!mask_bgr.empty()) {
+            gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
+                "/stitch_diff", mask_bgr);
+          }
+        }
+      }
+    }
+
     }
 
     // 阶段 2: CameraPage "实时预览" MJPEG 推流.
@@ -1432,8 +1503,22 @@ App::~App() {
       stitch_status::GlobalStatus stitch_gstatus;
       memset(&stitch_gstatus, 0, sizeof(stitch_gstatus));
       stitch_gstatus.num_cameras = static_cast<int>(num_img_);
+
+      // mode 计算: 与 sensor_data_interface::InitVideoCapture 同步 — 显式 env 优先,
+      // 否则 yaml 里有 rtsp 就当 camera 模式, 否则 dataset. 不要单独看 env, 否则 yaml
+      // 自动切到 camera 时 mode 还是 0, CameraPage 会以为是 dataset.
       const char* env_mode = getenv("INPUT_SOURCE_MODE");
-      stitch_gstatus.mode = (env_mode && strcmp(env_mode, "camera") == 0) ? 1 : 0;
+      const CameraSourceList& src_list = GetCameraSourceList();
+      int computed_mode = 0;  // 0 = dataset, 1 = camera
+      if (env_mode != nullptr) {
+        if (strcmp(env_mode, "camera") == 0) computed_mode = 1;
+      } else {
+        for (const auto& src : src_list.cameras) {
+          if (src.is_rtsp()) { computed_mode = 1; break; }
+        }
+      }
+      stitch_gstatus.mode = computed_mode;
+
       stitch_gstatus.panorama_w = total_cols_;
       stitch_gstatus.panorama_h = height_;
       stitch_gstatus.current_fps = fps;
@@ -1450,7 +1535,14 @@ App::~App() {
         c.height = image_vector_[i].height;
         // v1 测试: 用 cam0/cam1 占位, 后续通过 public getter 拿 CameraSourceList 的 uri
         snprintf(c.name, sizeof(c.name), "cam%zu", i);
-        snprintf(c.uri, sizeof(c.uri), "../datasets/2k-test/cam%zu.mp4", i);
+        // uri: 优先从 yaml 拿真值, 别再硬编码 mp4 路径. yaml 缺/越界才退回占位.
+        if (i < src_list.cameras.size() && !src_list.cameras[i].uri.empty()) {
+          std::string uri = src_list.cameras[i].uri;
+          if (uri.size() >= sizeof(c.uri)) uri.resize(sizeof(c.uri) - 1);
+          snprintf(c.uri, sizeof(c.uri), "%s", uri.c_str());
+        } else {
+          snprintf(c.uri, sizeof(c.uri), "../datasets/2k-test/cam%zu.mp4", i);
+        }
       }
       stitch_status::update(stitch_gstatus);
     }

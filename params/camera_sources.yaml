@@ -1,40 +1,40 @@
----
 # ============================================================
 # v3.0 (2026-07-08): 6 路网络摄像头 (PoE 交换机接入开发板)
-#
-# 用法:
-#   1. 把下面 6 路的 `uri` / `user_id` / `user_pw` 填实
-#      (摄像机 web 后台确认 RTSP URL, 海康/大华/雄迈格式不同)
-#   2. 板端: export INPUT_SOURCE_MODE=camera
-#   3. 跑: bash tools/sprint0_smoke.sh
-#
-# 字段说明:
-#   type             : file | rtsp (file 仅 dev/test 用)
-#   uri              : file → ../datasets/2k-test-h264/tXX.mp4
-#                      rtsp → rtsp://user:pass@host:port/path
-#   width / height   : 2560 × 1440 (2K)
-#   fps              : 30
-#   pixel_format     : NV12 (mppvideodec 唯一支持格式)
-#   user_id / user_pw: rtsp 专用, 空字符串 = 无认证
-#   latency_ms       : rtspsrc jitter buffer (80-200)
-#   use_tcp          : true (TCP 抗丢) / false (UDP 低延迟)
-#   connect_timeout_s: rtspsrc 信令 + TCP connect 超时
-#   retry_attempts   : 单路 RTC 失败重试 (默认 5)
-#   reconnect_backoff_ms: 断线重连退避
-#   frame_drop_threshold: fps / 期望fps 低于此值告警
-#
-# 顶层:
-#   sync_window_ms   : 6 路 PTS 拉齐窗, 默认 16ms (1 帧 @60fps)
-#   auto_calibrate   : Sprint 2 启动期自标定, 默认 false
-#
-# 当前 IP: 6 路 192.168.1.11..16 摄像机, 板端: 192.168.1.10 (set_cam_ips.sh 可一键换)
+# v3.2 (2026-07-09): 加 output: 块, 启用 2 路 RTSP 推流
+# 当前 IP: 6 路 192.168.1.11..16 摄像机, 板端: 192.168.1.10
 # ============================================================
 
 sync_window_ms: 16
 auto_calibrate: 0
 
+# v3.2 (2026-07-09): 输出 2 路 RTSP 推流
+#   /stitch       拼接完成画面 (H.264 HW 编码)
+#   /stitch_diff  帧差掩码 (变动的红色高亮 + 矩形框)
+output:
+  enabled: true
+  bind_address: 0.0.0.0
+  port: 8554
+  auth_enabled: false
+  auth_user: admin
+  auth_pass: CHANGE_ME
+  on_demand: false
+  diff_threshold: 30
+  diff_bbox_min_area: 100
+  streams:
+    - path: /stitch
+      width: 0
+      height: 0
+      fps: 30
+      bitrate_kbps: 4000
+      encoder: h264_hw
+    - path: /stitch_diff
+      width: 0
+      height: 0
+      fps: 30
+      bitrate_kbps: 2000
+      encoder: h264_hw
+
 cameras:
-  # ----- cam0: 2×3 网格左上 -----
   - type: rtsp
     uri: rtsp://admin:123456@192.168.1.11:554/video1
     width: 2560
@@ -45,12 +45,6 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
-
-  # ----- cam1: 2×3 网格右上 -----
   - type: rtsp
     uri: rtsp://admin:123456@192.168.1.12:554/video1
     width: 2560
@@ -61,12 +55,6 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
-
-  # ----- cam2: 2×3 网格左中 -----
   - type: rtsp
     uri: rtsp://admin:123456@192.168.1.13:554/video1
     width: 2560
@@ -77,12 +65,6 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
-
-  # ----- cam3: 2×3 网格右中 -----
   - type: rtsp
     uri: rtsp://admin:123456@192.168.1.14:554/video1
     width: 2560
@@ -93,12 +75,6 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
-
-  # ----- cam4: 2×3 网格左下 -----
   - type: rtsp
     uri: rtsp://admin:123456@192.168.1.15:554/video1
     width: 2560
@@ -109,12 +85,6 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
-
-  # ----- cam5: 2×3 网格右下 -----
   - type: rtsp
     uri: rtsp://admin:123456@192.168.1.16:554/video1
     width: 2560
@@ -125,7 +95,3 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8

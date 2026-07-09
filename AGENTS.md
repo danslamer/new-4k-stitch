@@ -1,4 +1,4 @@
-﻿# AGENTS.md
+# AGENTS.md
 
 Codex / Claude Code / 其他 AI agent 入口。详细设计、踩坑记录、操作手册见 `docs/`：
 
@@ -9,7 +9,9 @@ Codex / Claude Code / 其他 AI agent 入口。详细设计、踩坑记录、操
 - **docs/RTSP_OUTPUT_PLAN.md** — **v3.1 输出侧计划**（拼接全景 RTSP 服务化, 端口 8554, `rtsp://<board>:8554/stitch` + `/stitch_sub`）
 
 
-- **`docs/QUICK_START_IP_ONLY.md`** — `改 IP 就能用` 5 步入门 (commit set_cam_ips.sh 后, 改完 IP + 一行启动, 自动走 RTSP camera 模式)---
+- **`docs/QUICK_START_IP_ONLY.md`** — `改 IP 就能用` 5 步入门 (commit set_cam_ips.sh 后, 改完 IP + 一行启动, 自动走 RTSP camera 模式)
+- **`docs/RTSP_OUTPUT_PLAN.md`** — v3.1 输出侧计划（**v3.2 已实现**: 帧差掩码 + 2 路 RTSP 推流 `/stitch` + `/stitch_diff`）
+---
 
 ## 仓库定位
 

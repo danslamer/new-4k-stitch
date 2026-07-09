@@ -8,7 +8,11 @@
 #include "drm_allocator.h"
 #include "roi_config.h"
 #include "roi_visualizer.h"
+#include "frame_diff.h"
+#include "output_streams.h"
+#include "gst_rtsp_server.h"
 
+#include <memory>
 #include <vector>
 
 using namespace std;
@@ -59,6 +63,12 @@ class App {
     void ReleaseSavedFrames();
     void RestitchSavedFrames();
 
+    // v3.2: 输出流 RTSP 推流初始化. 读 yaml 顶层 `output:` 块, 决定是否起 server.
+    //   创建 FrameDiff 实例 (按配置 threshold).
+    //   启 GstRtspServer (port=server_cfg.port, streams=server_cfg.streams).
+    // 返回: true=rtsp output 启用, false=关闭 (默认).
+    bool InitRtspOutput();
+
     size_t num_img_;
 
     SensorDataInterface sensorDataInterface_;
@@ -84,11 +94,20 @@ class App {
     // 阶段 2: MJPEG panorama 推流 (CameraPage "实时预览" 用).
     // panorama NV12 -> RGA downscale -> small NV12 -> cvtColor -> cv::imencode -> mjpeg_streamer::update().
     // gate: 每 mjpeg_interval_ 帧做一次 (默认 2 = 15 FPS, 避免吃掉 stitch loop 30 FPS 预算).
-    DrmBuffer     mjpeg_drm_buf_;            // RGA 降采样目标: 960x816 NV12 DMA-BUF
-    int           mjpeg_width_   = 960;      // 降采样后宽
-    int           mjpeg_height_  = 816;      // 降采样后高
-    int           mjpeg_interval_ = 2;       // 每 N 帧编码一次
-    int           mjpeg_quality_ = 75;       // cv::imencode jpeg quality
+    DrmBuffer     mjpeg_drm_buf_;
+    int           mjpeg_width_   = 960;
+    int           mjpeg_height_  = 816;
+    int           mjpeg_interval_ = 2;
+    int           mjpeg_quality_ = 75;
+
+    // v3.2 (2026-07-09): 帧差掩码 + 2 路 RTSP 推流.
+    //   frame_diff_: 持前一帧, 每帧出 BGR 掩码 (dimmed + red highlights + bbox).
+    //   rtsp_output_enabled_: yaml output.enabled=true 时为 true.
+    //   启: InitRtspOutput() 在 run_stitching() 开头调一次.
+    //   跑: 拼接完一帧后, 转换 BGR -> push /stitch, 算 mask -> push /stitch_diff.
+    std::unique_ptr<frame_diff::FrameDiff> frame_diff_;
+    bool rtsp_output_enabled_ = false;
+    output_streams::ServerConfig rtsp_cfg_;  // 缓存, 给 gst_rtsp_server 用
 };
 
 #endif

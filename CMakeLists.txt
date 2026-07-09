@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.10)
 project(image-stitching LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 11)
@@ -55,6 +55,22 @@ pkg_check_modules(GSTVIDEO REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
 # gstreamer 1.20 allocators: 提供 gst_dmabuf_memory_get_fd / gst_is_dmabuf_memory.
 # 板端 gst 1.20.3 已带 (gst-plugins-base 包).
 pkg_check_modules(GSTALLOC REQUIRED IMPORTED_TARGET gstreamer-allocators-1.0)
+# v3.2 (2026-07-09): RTSP server (gst-rtsp-server-1.0).
+# 板端先试: sudo apt install gstreamer1.0-rtsp-server-1.0
+# 找不到的话, 试 libgstrtspserver-1.0-dev (apt 镜像里有时只用这个名)
+# 还不行: 编辑 params/camera_sources.yaml 把 output.enabled 设 false, 拼接功能照常工作
+pkg_check_modules(GSTRTSPSERVER IMPORTED_TARGET gstreamer-rtsp-server-1.0)
+if(NOT GSTRTSPSERVER_FOUND)
+  pkg_check_modules(GSTRTSPSERVER IMPORTED_TARGET libgstrtspserver-1.0)
+endif()
+if(NOT GSTRTSPSERVER_FOUND)
+  message(WARNING "gstreamer-rtsp-server-1.0 not found; RTSP output disabled (yaml output.enabled will be ignored).")
+  set(GSTRTSPSERVER_ENABLED OFF)
+  set(HAVE_GST_RTSP_SERVER 0)
+else()
+  set(GSTRTSPSERVER_ENABLED ON)
+  set(HAVE_GST_RTSP_SERVER 1)
+endif()
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
 pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
 pkg_check_modules(GBM REQUIRED IMPORTED_TARGET gbm)
@@ -72,6 +88,13 @@ add_executable(${PROJECT_NAME}
     include/gst_mpp_decoder.h
     src/stitching_param_generater.cc
     include/stitching_param_generater.h
+    # v3.2: 帧差掩码 + 2 路 RTSP 输出
+    src/frame_diff.cc
+    include/frame_diff.h
+    src/output_streams.cc
+    include/output_streams.h
+    src/gst_rtsp_server.cc
+    include/gst_rtsp_server.h
     src/drm_allocator.cc
     include/drm_allocator.h
     include/nv12_frame.h
@@ -97,11 +120,19 @@ add_executable(${PROJECT_NAME}
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     include
+    ${CMAKE_CURRENT_BINARY_DIR}/include  # for generated config.h (HAVE_GST_RTSP_SERVER)
     ${OpenCV_INCLUDE_DIRS}
     ${AVFORMAT_INCLUDE_DIRS}
     ${AVCODEC_INCLUDE_DIRS}
     ${AVUTIL_INCLUDE_DIRS}
 )
+
+# 条件链接 GSTRTSPSERVER — 用变量代替 if() / endif() 内联, 避免 CMake 把 if/endif
+# 关键字当成 link library 名称传给 ld.
+set(_rtsp_link_target "")
+if(GSTRTSPSERVER_ENABLED)
+  set(_rtsp_link_target PkgConfig::GSTRTSPSERVER)
+endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${OpenCV_LIBS}
@@ -114,6 +145,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GSTAPP
     PkgConfig::GSTVIDEO
     PkgConfig::GSTALLOC
+    ${_rtsp_link_target}
     PkgConfig::EGL
     PkgConfig::GLESV2
     PkgConfig::GBM
@@ -130,3 +162,10 @@ if(ENABLE_RGA_DMA_STITCHING)
     target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_RGA_DMA_STITCHING=1)
     target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::RGA PkgConfig::LIBDRM)
 endif()
+
+# v3.2 (2026-07-09): 由 CMake 生成 include/config.h, 标记可选功能 (RTSP server 等).
+# 必须放在所有 set(HAVE_xxx ...) 之后 — 否则 #cmakedefine01 拿不到正确值.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake_config.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/config.h"
+)

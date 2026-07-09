@@ -1,0 +1,5 @@
+// cmake_config.h.in - 由 CMake configure_file 生成.
+// 标记可选功能. 缺包时把对应宏设为 0, 源码 #if HAVE_xxx 跳过.
+#pragma once
+
+#cmakedefine01 HAVE_GST_RTSP_SERVER

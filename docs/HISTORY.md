@@ -1,4 +1,4 @@
-﻿# HISTORY
+# HISTORY
 
 设计演进时间线（精简）+ **完整操作手册** + **踩过的坑**。当前活跃计划见 `NETWORK_CAMERA_PLAN.md`（v3.0 IP camera 改造）。
 
@@ -376,3 +376,92 @@ Y 平面 + 交织 UV。`stride_w`/`stride_h` 可能 ≠ `width`/`height`（查 `
 - `tools/sprint0_smoke.sh` — v3.0 Sprint 0 骨架贯通验收（PASS 才进 Sprint 1）
 
 > 参考论文：Du, Chengyao, et al. (2020). *GPU based parallel optimization for real time panoramic video stitching.* Pattern Recognition Letters, 133, 62-69.
+
+## 7. v3.2 (2026-07-09): 帧差掩码 + 2 路 RTSP 推流
+
+**目标**: 拼接完 1 帧后, 计算前后两帧差值生成掩码, 推两路 RTSP (`/stitch` 全景 + `/stitch_diff` 帧差掩码).
+
+**新增模块**:
+
+- `include/frame_diff.h/cc` (`FrameDiff`): NV12→BGR→absdiff→threshold→findContours. 输出 BGR mask (背景 = current × 0.4, 前景 = 红色高亮 + bbox). 持 prev frame 缓存, 线程不安全 (假定 stitch 线程单线程).
+- `include/output_streams.h/cc`: yaml 顶层 `output:` 块解析. 加载 `ServerConfig` (port, auth, on_demand, diff_threshold...) 和 `StreamConfig[]` (path, width, height, fps, bitrate, encoder).
+- `include/gst_rtsp_server.h/cc` (`GstRtspServer`): 单例, gst-rtsp-server 包装. 每路输出 = 1 个 GstRTSPMediaFactory (shared media) + 1 个 per-stream `StreamPipeline` (生产者 → mutex+cv 队列 → pump 线程 → appsrc → `mpph264enc` → `rtph264pay`).
+
+**Pipeline 模板** (per stream):
+
+```
+appsrc name=appsrc_<path> format=time is-live=true do-timestamp=true block=false max-bytes=0 \
+    caps="video/x-raw,format=BGR,width=W,height=H,framerate=F/1" \
+  ! videoconvert ! video/x-raw,format=NV12 \
+  ! mpph264enc bps=BITRATE*1000 rc-mode=cbr gop=FPS*2 \
+  ! h264parse ! rtph264pay name=pay0 pt=96 config-interval=1
+```
+
+**集成点**:
+
+- `App::InitRtspOutput()` (run_stitching 开头调一次): 读 yaml `output:` 块 → 构造 FrameDiff → GstRtspServer::Start(port=8554, streams=[/stitch, /stitch_diff])
+- stitch loop 内 (BlendSeams 之后): 转 BGR → push `/stitch`; FrameDiff::ComputeMask → push `/stitch_diff`. 每帧都跑, appsrc 端 `max-buffers=1` 丢旧帧.
+- `App::~App()`: `GstRtspServer::Stop()` (detach glib loop, join pump threads).
+
+**yaml 配置** (params/camera_sources.yaml 顶层 `output:`):
+
+```yaml
+output:
+  enabled: true
+  bind_address: 0.0.0.0
+  port: 8554
+  auth_enabled: false
+  auth_user: admin
+  auth_pass: CHANGE_ME
+  on_demand: false
+  diff_threshold: 30
+  diff_bbox_min_area: 100
+  streams:
+    - path: /stitch
+      width: 0
+      height: 0
+      fps: 30
+      bitrate_kbps: 4000
+      encoder: h264_hw
+    - path: /stitch_diff
+      width: 0
+      height: 0
+      fps: 30
+      bitrate_kbps: 2000
+      encoder: h264_hw
+```
+
+**操作**:
+
+```bash
+ffplay rtsp://board-ip:8554/stitch
+ffplay rtsp://board-ip:8554/stitch_diff
+ffplay -fflags nobuffer -rtsp_transport tcp rtsp://board-ip:8554/stitch
+```
+
+**新增编译依赖**:
+
+- 板端: `apt install gstreamer1.0-rtsp-server-1.0`
+- CMake: `pkg_check_modules(GSTRTSPSERVER REQUIRED IMPORTED_TARGET gstreamer-rtsp-server-1.0)` + 链 `PkgConfig::GSTRTSPSERVER`
+
+**性能影响 (估)**:
+
+- `FrameDiff` 1 帧: NV12→BGR (5-15ms) + absdiff+threshold+findContours (3-8ms) = ~10-23ms@2K
+- 2 路 mpph264enc 1080p30 HW: ~5ms×2 = 10ms
+- 总: stitch (~13ms) + diff (~15ms) + 2x encode (~10ms) = ~38ms, 略超 33ms 预算. 实际可能在 RGA NV12→BGR 复用上抢回来. 不行就把 diff fps 限到 15.
+
+**踩坑提示**:
+
+- 不要把 `stitch_status::shutdown` 之类的清理写在 `}` 外面 (file scope). 手动加 cleanup 时容易踩 — 已修.
+- OpenCV FileStorage 在 GBK locale 的 PC 上读 UTF-8 yaml 会报 `Input file is invalid` — PC 问题不是 board 问题, 板端 UTF-8 locale 正常.
+
+**踩坑提示 (2026-07-09 实测补充)**:
+
+- 板端 apt 找不到 `gstreamer1.0-rtsp-server-1.0` 时 (rocktech 部分镜像裁过 universe):
+  - 试 `sudo apt install libgstrtspserver-1.0-dev` (有的镜像只用这个名, pkg-config 能识别 `libgstrtspserver-1.0`)
+  - 还不行: 编译会 WARN, 链不会失败 (CMake 自动把 `HAVE_GST_RTSP_SERVER` 设 0)
+  - 运行时: RTSP 相关函数变成 no-op, 拼接功能不受影响
+  - yaml 端: 此时即使设 `output.enabled: true` 也不会启 server, 但也不会崩
+  - 想强制关掉 RTSP: yaml 顶层 `output.enabled: false`
+- 写 `cmake_config.h.in` 让 CMake 把 pkg 检测结果传成宏 (`HAVE_GST_RTSP_SERVER`), 源码 #if 跳过.
+- `appsrc_/stitch` 这种带 / 的 element name 在 gstreamer 0.x 是非法的, 现版本基本宽容但最好 sanitize. v3.2 已经做 `c == '\\\'' ? '\\\''_\\\'' : c` 把 / 换成 _.
