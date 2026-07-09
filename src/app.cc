@@ -1000,10 +1000,6 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
 
   for (size_t i = 0; i < tasks.size(); ++i) {
     const CameraRoiRect& r = rois[i];
-    if (!r.has_affine()) {
-      wd.entries[i] = WarpMapEntry{};
-      continue;
-    }
     const StitchTask& t = tasks[i];
     const int dst_w = NormalizeEvenFloor(t.src_w);
     const int dst_h = NormalizeEvenFloor(t.src_h);
@@ -1011,9 +1007,33 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
       wd.entries[i] = WarpMapEntry{};
       continue;
     }
-    const double a = r.affine[0], b = r.affine[1];
-    const double c = r.affine[2], d = r.affine[3];
-    const double tx = r.affine[4], ty = r.affine[5];
+
+    // v3.x.2.1 (2026-07-09): 关键修复 — 之前 !r.has_affine() 直接 skip, 导致 yaml 里
+    //   所有 cam 是单位阵时整路都不走 GLES warper, 也不做 undist. 现在: 至少要有
+    //   affine 或 undist 之一才进入 GLES warper; 都没有 → 走老 RGA blit 路径.
+    //
+    //   注意: identity affine + have_undist 仅对 panorama 坐标 == 源帧坐标 的 cam 正确
+    //   (典型 cam 0, dst_x=0, dst_y=0). 其它 cam (dst_x>0 或 dst_y>0) 必须先 bootstrap
+    //   算出真实 affine, 否则 GLES warper 会把所有像素映射到源帧越界.
+    const bool has_affine = r.has_affine();
+    const bool have_undist = (i < undist_xmap_vector.size() &&
+                              i < undist_ymap_vector.size() &&
+                              !undist_xmap_vector[i].empty() &&
+                              !undist_ymap_vector[i].empty() &&
+                              undist_xmap_vector[i].type() == CV_32FC1 &&
+                              undist_ymap_vector[i].type() == CV_32FC1);
+    if (!has_affine && !have_undist) {
+      wd.entries[i] = WarpMapEntry{};
+      continue;
+    }
+
+    // 没 affine 时用单位阵占位 (仅 cam 0 这种 dst_x=0, dst_y=0 的情形正确).
+    double a = 1.0, b = 0.0, c = 0.0, d = 1.0, tx = 0.0, ty = 0.0;
+    if (has_affine) {
+      a = r.affine[0]; b = r.affine[1];
+      c = r.affine[2]; d = r.affine[3];
+      tx = r.affine[4]; ty = r.affine[5];
+    }
     const double det = a*d - b*c;
     if (std::fabs(det) < 1e-6) {
       wd.entries[i] = WarpMapEntry{};
@@ -1024,15 +1044,8 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
     const double inv_c = -c / det;
     const double inv_d = a / det;
 
-    // v3.x.2: 准备该 cam 的畸变校正 map (可能为空 = no-undistort)
-    const bool have_undist = (i < undist_xmap_vector.size() &&
-                              i < undist_ymap_vector.size() &&
-                              !undist_xmap_vector[i].empty() &&
-                              !undist_ymap_vector[i].empty() &&
-                              undist_xmap_vector[i].type() == CV_32FC1 &&
-                              undist_ymap_vector[i].type() == CV_32FC1);
-    const cv::Mat& ux = have_undist ? undist_xmap_vector[i] : cv::Mat();
-    const cv::Mat& uy = have_undist ? undist_ymap_vector[i] : cv::Mat();
+    const cv::Mat& ux = undist_xmap_vector[i];
+    const cv::Mat& uy = undist_ymap_vector[i];
     const int umap_w = have_undist ? ux.cols : 0;
     const int umap_h = have_undist ? ux.rows : 0;
 
@@ -1053,8 +1066,9 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
           continue;
         }
         // step 2: 查 undist 表 → 原始 (畸变) 源帧坐标
-        // cv::remap 风格: 浮点坐标在边界外用 BORDER_CONSTANT(0). 我们的 cv::initUndistortRectifyMap
-        //   生成的是 CV_32FC1, 越界值可能为 -1 (默认) 或 0; 反正 GLES 采样越界会 clamp 到边.
+        // cv::initUndistortRectifyMap 生成的是反向 remap 表: undist_xmap(dy, dx) = src_x.
+        //   越界值由 initUndistortRectifyMap 默认填 -1; GLES 采样越界会 clamp 到边 texel,
+        //   与原 warp 路径行为一致, 不引入新风险.
         const int csx_i = static_cast<int>(csx_f);
         const int csy_i = static_cast<int>(csy_f);
         if (csx_i < 0 || csx_i >= umap_w || csy_i < 0 || csy_i >= umap_h) {
