@@ -998,9 +998,20 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
         return false;
     }
 
-    ImportedBuffer* source = GetOrCreateInputBuffer(input);
+    // v3.x.7 (2026-07-09): 不要再缓存 input frame — mppvideodec DMA-BUF pool 会在 6 路 cam
+    //   间**回收** fd, 缓存按 fd 命中会把 cam i 的 EGLImage texture 错给 cam j 用, 视觉上
+    //   就是 cell 里随机显示别的 cam (top-left 时而是 cam0 时而是 cam3).
+    //   正确解法: 每帧重新 ImportBuffer (EGLImage 零拷贝, 只付 EGL state setup 开销 ~us 级).
+    //   上一帧的 ImportedBuffer 在本函数末尾 Release 掉, 不漏.
+    ImportedBuffer imported_source;
+    if (!ImportBuffer(input, &imported_source)) {
+        Logger::GetInstance().LogError("[RkGlesWarper] WarpFrame ImportBuffer(source) failed.");
+        return false;
+    }
+    ImportedBuffer* source = &imported_source;
     ImportedBuffer* target = GetOrCreateOutputBuffer(output);
-    if (source == nullptr || target == nullptr) {
+    if (target == nullptr) {
+        ReleaseImportedBuffer(source);
         return false;
     }
 
@@ -1015,6 +1026,7 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
                            0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         glDeleteFramebuffers(1, &framebuffer);
+        ReleaseImportedBuffer(source);
         return false;
     }
     if (!RenderPlane(framebuffer,
@@ -1026,6 +1038,7 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
                      program.output_height,
                      false)) {
         glDeleteFramebuffers(1, &framebuffer);
+        ReleaseImportedBuffer(source);
         return false;
     }
 
@@ -1036,6 +1049,7 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
                            0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         glDeleteFramebuffers(1, &framebuffer);
+        ReleaseImportedBuffer(source);
         return false;
     }
     if (!RenderPlane(framebuffer,
@@ -1047,6 +1061,7 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
                      program.uv_height,
                      true)) {
         glDeleteFramebuffers(1, &framebuffer);
+        ReleaseImportedBuffer(source);
         return false;
     }
 
@@ -1058,6 +1073,7 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
         Logger::GetInstance().LogError(
             std::string("[RkGlesWarper] WarpFrame gl error=") + GetGlErrorString(error) +
             " camera_index=" + std::to_string(camera_index));
+        ReleaseImportedBuffer(source);
         return false;
     }
     if (IsDebugEnabled(3)) {
@@ -1067,5 +1083,6 @@ bool RkGlesWarper::WarpFrame(int camera_index, const NV12Frame& input, const Drm
             " input_fd=" + std::to_string(input.fd) +
             " output_fd=" + std::to_string(output.fd));
     }
+    ReleaseImportedBuffer(source);
     return true;
 }
