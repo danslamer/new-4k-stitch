@@ -1550,21 +1550,18 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   // v3.2 (2026-07-09): 启动 RTSP 推流 (yaml output.enabled=true). 在 stitch 之前 init, 让 pipeline ready.
   rtsp_output_enabled_ = InitRtspOutput();
 
-  // v3.x.2 (2026-07-09): 水平 cam pair 畸变校正. 启动期读 params/camchain_<i>.yaml,
-  //   算 initUndistortRectifyMap 出 CV_32FC1 的 xmap/ymap. 只对 cam1/cam3/cam5 做 (cam0/cam2/cam4
-  //   是参照帧, 不需要). 任何 cam 缺 yaml / 字段不齐 → 该 cam 留空, GLES warper 自动 skip.
-  //   注意: 暂时只对"水平相邻"cam 做, 垂直对 v02/v13/v24/v35 不做 (overlap 小, 校正后 ROI
-  //   可能错位).
+  // v3.x.2 (2026-07-09): 6 路 cam 全做畸变校正 (2026-07-09 改: 之前限定水平 cam pair,
+  //   用户确认 2x3 6 路 cam 都做, 包括 cam0/cam2/cam4 参照帧). 启动期读 params/camchain_<i>.yaml,
+  //   算 initUndistortRectifyMap 出 CV_32FC1 的 xmap/ymap. 任何 cam 缺 yaml / 字段不齐 →
+  //   该 cam 留空, GLES warper 自动 skip, 不影响其他 cam.
+  //   注: 这意味着 cam0 (单位阵 + 有 undist map) 现在会先做畸变校正, 再被 GLES warper 视为
+  //   "xmap 是 inverse affine" 处理. 因为 cam0 的 affine 是单位阵, inv 是单位阵, 等价于
+  //   "只做畸变校正"; 这是期望行为.
   {
     undist_xmap_vector_.assign(num_img_, cv::Mat());
     undist_ymap_vector_.assign(num_img_, cv::Mat());
     int loaded = 0;
-    // 水平 cam pair 的右 cam: 1, 3, 5. 它们的畸变校正 map 通过 left↔right 关联, 但 OpenCV
-    //   的 initUndistortRectifyMap 是 per-cam, 所以我们只需读 yaml 各自的 K/D/R 即可.
-    static const int kHorizontalCams[] = {1, 3, 5};
-    for (size_t k = 0; k < sizeof(kHorizontalCams) / sizeof(kHorizontalCams[0]); ++k) {
-      const int i = kHorizontalCams[k];
-      if (i >= static_cast<int>(num_img_)) continue;
+    for (size_t i = 0; i < num_img_; ++i) {
       const std::string path = std::string("../params/camchain_") + std::to_string(i) + ".yaml";
       camera_intrinsics::CamchainIntrinsics ci;
       if (!camera_intrinsics::LoadCamchain(path, &ci)) {
@@ -1595,8 +1592,8 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
           std::to_string(live_h) + ")");
     }
     Logger::GetInstance().Log(
-        "[App] [UNDISTORT] total loaded: " + std::to_string(loaded) +
-        "/3 horizontal cams. Vertical cams (v02/v13/v24/v35) are NOT undistorted.");
+        "[App] [UNDISTORT] total loaded: " + std::to_string(loaded) + "/" +
+        std::to_string(num_img_) + " cams (2x3 grid, all undistorted if yaml present).");
   }
 
   image_vector_.resize(num_img_);
