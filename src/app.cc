@@ -18,6 +18,7 @@
 #include <opencv2/highgui.hpp>
 
 #include "stitching_param_generater.h"
+#include "camera_intrinsics.h"  // v3.x.2: LoadCamchain + BuildUndistortMap
 
 extern "C" {
 #include <rga/RgaApi.h>
@@ -985,8 +986,13 @@ std::vector<cv::Mat> PreWarpBootstrapFrames(const std::vector<cv::Mat>& bootstra
 //   xmap[py_local][px_local] = inv_affine 把它映射回源帧像素 (含 src_x/y offset 补偿).
 //   ymap 同理.
 //   identity/empty → 返回无效 entry (entry.valid()=false), SetWarpData 会跳过.
+// v3.x.2 (2026-07-09): 如果该 cam 有 undist_xmap/undist_ymap (从 camchain_*.yaml 算出),
+//   把畸变校正再合成一次进 xmap/ymap. final_src = undist(affine_inv(pano)).
+//   GLES sampler 一次 lookup 同时完成畸变校正 + 仿射对齐, 完全 GPU, 不破 DMA-BUF.
 StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
                                       const std::vector<CameraRoiRect>& rois,
+                                      const std::vector<cv::Mat>& undist_xmap_vector,
+                                      const std::vector<cv::Mat>& undist_ymap_vector,
                                       int panorama_w, int panorama_h) {
   StitchingWarpData wd;
   wd.panorama_size = cv::Size(panorama_w, panorama_h);
@@ -1018,6 +1024,18 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
     const double inv_c = -c / det;
     const double inv_d = a / det;
 
+    // v3.x.2: 准备该 cam 的畸变校正 map (可能为空 = no-undistort)
+    const bool have_undist = (i < undist_xmap_vector.size() &&
+                              i < undist_ymap_vector.size() &&
+                              !undist_xmap_vector[i].empty() &&
+                              !undist_ymap_vector[i].empty() &&
+                              undist_xmap_vector[i].type() == CV_32FC1 &&
+                              undist_ymap_vector[i].type() == CV_32FC1);
+    const cv::Mat& ux = have_undist ? undist_xmap_vector[i] : cv::Mat();
+    const cv::Mat& uy = have_undist ? undist_ymap_vector[i] : cv::Mat();
+    const int umap_w = have_undist ? ux.cols : 0;
+    const int umap_h = have_undist ? ux.rows : 0;
+
     cv::Mat xmap(dst_h, dst_w, CV_32FC1);
     cv::Mat ymap(dst_h, dst_w, CV_32FC1);
     for (int py = 0; py < dst_h; ++py) {
@@ -1026,8 +1044,26 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
       float* yrow = ymap.ptr<float>(py);
       for (int px = 0; px < dst_w; ++px) {
         const float pano_x = static_cast<float>(t.dst_x + px);
-        xrow[px] = static_cast<float>(inv_a * (pano_x - tx) + inv_b * (pano_y - ty));
-        yrow[px] = static_cast<float>(inv_c * (pano_x - tx) + inv_d * (pano_y - ty));
+        // step 1: 逆仿射 → 校正后源帧坐标 (corrected_src)
+        const float csx_f = static_cast<float>(inv_a * (pano_x - tx) + inv_b * (pano_y - ty));
+        const float csy_f = static_cast<float>(inv_c * (pano_x - tx) + inv_d * (pano_y - ty));
+        if (!have_undist) {
+          xrow[px] = csx_f;
+          yrow[px] = csy_f;
+          continue;
+        }
+        // step 2: 查 undist 表 → 原始 (畸变) 源帧坐标
+        // cv::remap 风格: 浮点坐标在边界外用 BORDER_CONSTANT(0). 我们的 cv::initUndistortRectifyMap
+        //   生成的是 CV_32FC1, 越界值可能为 -1 (默认) 或 0; 反正 GLES 采样越界会 clamp 到边.
+        const int csx_i = static_cast<int>(csx_f);
+        const int csy_i = static_cast<int>(csy_f);
+        if (csx_i < 0 || csx_i >= umap_w || csy_i < 0 || csy_i >= umap_h) {
+          xrow[px] = -1.0f;
+          yrow[px] = -1.0f;
+          continue;
+        }
+        xrow[px] = ux.at<float>(csy_i, csx_i);
+        yrow[px] = uy.at<float>(csy_i, csx_i);
       }
     }
     WarpMapEntry entry;
@@ -1225,7 +1261,10 @@ void App::BootStrapOptimalLayout() {
   //   InitFromConfig / RebuildLayout 也调相同的 BuildAffineWarpData + SetWarpData 路径,
   //   确保 yaml reload 后新 affine 生效.
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
+    // v3.x.2 (2026-07-09): 喂入畸变校正 map (水平 cam pair), 让 GLES warper 一次 GPU
+    //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
     StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+                                               undist_xmap_vector_, undist_ymap_vector_,
                                                total_cols_, height_);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
   }
@@ -1337,7 +1376,10 @@ void App::InitFromConfig() {
   // v3.x.1 (2026-07-09): 启动期 yaml 加载路径也要喂 affine 给 GLES warper.
   //   没有这一段 yaml 里的 affine 不会生效 (因为 reload 走 RebuildLayout, 首次加载走 InitFromConfig).
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
+    // v3.x.2 (2026-07-09): 喂入畸变校正 map (水平 cam pair), 让 GLES warper 一次 GPU
+    //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
     StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+                                               undist_xmap_vector_, undist_ymap_vector_,
                                                total_cols_, height_);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
   }
@@ -1384,7 +1426,10 @@ void App::RebuildLayout() {
   // v3.x.1 (2026-07-09): yaml reload 路径 (RoiYamlWatcher 触发) 也要重喂 affine.
   //   用最新的 image_vector_ 尺寸作为 GLES warper input 维度.
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
+    // v3.x.2 (2026-07-09): 喂入畸变校正 map (水平 cam pair), 让 GLES warper 一次 GPU
+    //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
     StitchingWarpData wd = BuildAffineWarpData(layout, g_config.camera_rois,
+                                               undist_xmap_vector_, undist_ymap_vector_,
                                                total_cols_, height_);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
   }
@@ -1504,6 +1549,55 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
   sensorDataInterface_.InitVideoCapture(num_img_);
   // v3.2 (2026-07-09): 启动 RTSP 推流 (yaml output.enabled=true). 在 stitch 之前 init, 让 pipeline ready.
   rtsp_output_enabled_ = InitRtspOutput();
+
+  // v3.x.2 (2026-07-09): 水平 cam pair 畸变校正. 启动期读 params/camchain_<i>.yaml,
+  //   算 initUndistortRectifyMap 出 CV_32FC1 的 xmap/ymap. 只对 cam1/cam3/cam5 做 (cam0/cam2/cam4
+  //   是参照帧, 不需要). 任何 cam 缺 yaml / 字段不齐 → 该 cam 留空, GLES warper 自动 skip.
+  //   注意: 暂时只对"水平相邻"cam 做, 垂直对 v02/v13/v24/v35 不做 (overlap 小, 校正后 ROI
+  //   可能错位).
+  {
+    undist_xmap_vector_.assign(num_img_, cv::Mat());
+    undist_ymap_vector_.assign(num_img_, cv::Mat());
+    int loaded = 0;
+    // 水平 cam pair 的右 cam: 1, 3, 5. 它们的畸变校正 map 通过 left↔right 关联, 但 OpenCV
+    //   的 initUndistortRectifyMap 是 per-cam, 所以我们只需读 yaml 各自的 K/D/R 即可.
+    static const int kHorizontalCams[] = {1, 3, 5};
+    for (size_t k = 0; k < sizeof(kHorizontalCams) / sizeof(kHorizontalCams[0]); ++k) {
+      const int i = kHorizontalCams[k];
+      if (i >= static_cast<int>(num_img_)) continue;
+      const std::string path = std::string("../params/camchain_") + std::to_string(i) + ".yaml";
+      camera_intrinsics::CamchainIntrinsics ci;
+      if (!camera_intrinsics::LoadCamchain(path, &ci)) {
+        Logger::GetInstance().Log(
+            "[App] [UNDISTORT] cam" + std::to_string(i) + ": " + path +
+            " missing or invalid, skip (will not undistort this cam)");
+        continue;
+      }
+      // live 帧分辨率在 image_vector_ 还没填时拿不到. 用 yaml 里的 calib 尺寸 + 设备常见
+      //   2560x1440 兜底 (camera_sources.yaml 默认). 实际 stitch 时 BuildAffineWarpData
+      //   检查 map 尺寸, 不一致时会被 cv::remap 的边界裁剪兜住.
+      const int live_w = 2560;
+      const int live_h = 1440;
+      cv::Mat xmap, ymap;
+      if (!camera_intrinsics::BuildUndistortMap(ci, live_w, live_h, &xmap, &ymap)) {
+        Logger::GetInstance().LogError(
+            "[App] [UNDISTORT] cam" + std::to_string(i) +
+            ": initUndistortRectifyMap failed, skip");
+        continue;
+      }
+      undist_xmap_vector_[i] = xmap;
+      undist_ymap_vector_[i] = ymap;
+      ++loaded;
+      Logger::GetInstance().Log(
+          "[App] [UNDISTORT] cam" + std::to_string(i) + ": " + path +
+          " loaded (calib " + std::to_string(ci.calib_w) + "x" +
+          std::to_string(ci.calib_h) + " -> live " + std::to_string(live_w) + "x" +
+          std::to_string(live_h) + ")");
+    }
+    Logger::GetInstance().Log(
+        "[App] [UNDISTORT] total loaded: " + std::to_string(loaded) +
+        "/3 horizontal cams. Vertical cams (v02/v13/v24/v35) are NOT undistorted.");
+  }
 
   image_vector_.resize(num_img_);
 

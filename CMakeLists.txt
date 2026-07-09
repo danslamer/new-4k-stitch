@@ -110,6 +110,7 @@ add_executable(${PROJECT_NAME}
     src/roi_yaml_watcher.cc
     include/roi_yaml_watcher.h
     include/camera_intrinsics.h  # v3.0: K 矩阵占位 (fx=1027 fy=1378 cx=1280 cy=720)
+    src/camera_intrinsics.cc     # v3.x.2: LoadCamchain + BuildUndistortMap
     src/roi_visualizer.cc
     include/roi_visualizer.h
     src/status_writer.cc

@@ -12,8 +12,17 @@
 //   - tools/calibrate_intrinsics.py 跑出实测量 → 写到 params/camchain_*.yaml
 //   - App 在启动期读 camchain_*.yaml 把 IntrinsicsPlaceholder 覆盖
 //
+// v3.x.2 (2026-07-09): 加 LoadCamchain() + initUndistortRectifyMap 路径.
+//   只对水平相邻 cam pair (h01/h23/h45) 做畸变校正, 垂直对 (v02/v13/v24/v35)
+//   不做 (overlap 小, 校正后 ROI 还可能错位). 把 undist_xmap/undist_ymap 合成
+//   进 GLES warper 的 xmap/ymap, GPU 一遍搞定畸变+仿射, 不破 DMA-BUF 路径.
+//
 #ifndef IMAGE_STITCHING_CAMERA_INTRINSICS_H
 #define IMAGE_STITCHING_CAMERA_INTRINSICS_H
+
+#include <opencv2/opencv.hpp>
+#include <string>
+#include <vector>
 
 namespace camera_intrinsics {
 
@@ -44,6 +53,30 @@ struct Intrinsics {
         return kDefault;
     }
 };
+
+// v3.x.2 (2026-07-09): 从 params/camchain_<cam_id>.yaml 读 KMat/D/RMat/width/height.
+//   yaml 用 OpenCV FileStorage (!!opencv-matrix). camchain_<i>.yaml 是相对工程根目录.
+//   返回 false 时 (文件不存在 / 字段缺失) 让上层决定是否走 fallback 单位阵.
+//   calib_width/calib_height 输出 yaml 里 width/height 字段 (用于 K 缩放, 我们的
+//   标定用 1920x1080 但 live stream 是 2560x1440, 必须 scale K).
+struct CamchainIntrinsics {
+    cv::Mat K;          // 3x3 CV_64F
+    cv::Mat D;          // Nx1 CV_64F (畸变系数)
+    cv::Mat R;          // 3x3 CV_64F (rectify 旋转, cam0 = eye)
+    int     calib_w = 1920;
+    int     calib_h = 1080;
+    bool    valid = false;
+};
+
+bool LoadCamchain(const std::string& yaml_path, CamchainIntrinsics* out);
+
+// v3.x.2: 给定 camchain K/D/R + 标定分辨率 + live 流分辨率, 输出 live 流坐标系下的
+//   undist_xmap / undist_ymap (CV_32FC1). 走 cv::initUndistortRectifyMap, K 自动
+//   按比例缩放 (fx/fy/cx/cy * scale). D 不变. R 不变.
+//   返回 false 时 (D 空 / R 空 / 尺寸非法) 不写 map.
+bool BuildUndistortMap(const CamchainIntrinsics& ci,
+                       int live_w, int live_h,
+                       cv::Mat* undist_xmap, cv::Mat* undist_ymap);
 
 }  // namespace camera_intrinsics
 

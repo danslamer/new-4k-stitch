@@ -116,6 +116,14 @@ class App {
     //   yaml_path_ 缓存路径, 给 watcher 构造用.
     std::unique_ptr<RoiYamlWatcher> roi_yaml_watcher_;
     std::string yaml_path_;
+
+    // v3.x.2 (2026-07-09): 水平 cam pair 的畸变校正 map. 启动期从 camchain_<i>.yaml
+    //   加载 K/D/R, 缩放到 live 分辨率 (2560x1440), 走 cv::initUndistortRectifyMap 生成
+    //   CV_32FC1 的 xmap/ymap. 注入到 BuildAffineWarpData 的 xmap/ymap 合成路径, GLES warper
+    //   一次 GPU pass 完成畸变+仿射. 没加载的 cam (cam0 / cam2 / cam4 或 yaml 缺失) 留空,
+    //   SetWarpData 会跳过, 走无畸变路径.
+    std::vector<cv::Mat> undist_xmap_vector_;
+    std::vector<cv::Mat> undist_ymap_vector_;
 };
 
 #endif
