@@ -216,6 +216,21 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   return bgr_host.getUMat(cv::ACCESS_READ);
 }
 
+// v3.2.1 (2026-07-09): 在 BGR 图上画红色圆点, 标注帧差检测到的运动质心.
+//   centroids 空时是 no-op (motion stop → 圆点立刻消失, 满足需求).
+//   半径按图像短边自适应: 4800x4080 panorama -> 40px; 960x816 MJPEG -> 8px.
+//   用 1px 黑色描边 + FILLED 红色填充, 避免在亮/暗背景上被淹没, 在彩色物体上也不丢辨识度.
+void DrawRedDots(cv::Mat& bgr, const std::vector<cv::Point2f>& centroids) {
+  if (bgr.empty() || centroids.empty()) return;
+  const int radius = std::max(8, std::min(bgr.cols, bgr.rows) / 100);
+  for (const auto& c : centroids) {
+    const cv::Point center(static_cast<int>(std::round(c.x)),
+                           static_cast<int>(std::round(c.y)));
+    cv::circle(bgr, center, radius + 1, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+    cv::circle(bgr, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+  }
+}
+
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
   // v3.x (2026-07-09): offset_x/y 已删. ROI 直接来自 g_config.camera_rois[i] (yaml),
@@ -1012,9 +1027,16 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
     //   所有 cam 是单位阵时整路都不走 GLES warper, 也不做 undist. 现在: 至少要有
     //   affine 或 undist 之一才进入 GLES warper; 都没有 → 走老 RGA blit 路径.
     //
-    //   注意: identity affine + have_undist 仅对 panorama 坐标 == 源帧坐标 的 cam 正确
-    //   (典型 cam 0, dst_x=0, dst_y=0). 其它 cam (dst_x>0 或 dst_y>0) 必须先 bootstrap
-    //   算出真实 affine, 否则 GLES warper 会把所有像素映射到源帧越界.
+    // v3.x.7 (2026-07-09): identity affine 在 GLES warper 路径下需要补偿 cell 偏移.
+    //   老 RGA blit 路径下, RGA 显式指定 dst rect = (dst_x, dst_y, dst_x+cw, dst_y+ch),
+    //   即使 forward affine 是 identity, RGA 也知道把整张 src 贴到 cell 位置. GLES warper
+    //   走 inverse lookup: csx_f/csy_f 必须映射回 src frame 坐标, 此时 forward affine
+    //   = identity 意味着 (pano_x, pano_y) 直接是 src 坐标, 对 dst_x>0 的 cam 会越界
+    //   (cam1 dst_x=2240, src frame = 2560, 越界 1920 px → 全部填 -1 → 全部 clamp 到
+    //   src 边, 视觉上就是 6 路堆到左上角). 修法: 当 have_undist 且 forward affine 退化
+    //   到 identity, 把 forward 改成 pure translation [1, 0, dst_x; 0, 1, dst_y], 这样
+    //   csx_f = pano_x - dst_x, csy_f = pano_y - dst_y, 落在 undist_xmap 范围内.
+    //   have_undist=false 时不修, 让 RGA blit 走老逻辑 (cell 位置由 RGA 显式 dst rect 控).
     const bool has_affine = r.has_affine();
     const bool have_undist = (i < undist_xmap_vector.size() &&
                               i < undist_ymap_vector.size() &&
@@ -1027,12 +1049,23 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
       continue;
     }
 
-    // 没 affine 时用单位阵占位 (仅 cam 0 这种 dst_x=0, dst_y=0 的情形正确).
+    // 没 affine 时用单位阵占位 (RGA blit 路径用, 没问题). 有 affine 时读 yaml.
     double a = 1.0, b = 0.0, c = 0.0, d = 1.0, tx = 0.0, ty = 0.0;
     if (has_affine) {
       a = r.affine[0]; b = r.affine[1];
       c = r.affine[2]; d = r.affine[3];
       tx = r.affine[4]; ty = r.affine[5];
+    }
+    // v3.x.7: identity affine + have_undist + cell 非原点 → 自动改成 cell 位置平移.
+    const bool is_identity_affine =
+        (a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0 && tx == 0.0 && ty == 0.0);
+    if (is_identity_affine && have_undist && (t.dst_x != 0 || t.dst_y != 0)) {
+      Logger::GetInstance().LogInfo(
+          "[App] BuildAffineWarpData: cam%zu affine=identity + undist loaded; "
+          "auto-substituting pure translation [1,0,%d; 0,1,%d] for cell offset.",
+          i, t.dst_x, t.dst_y);
+      tx = t.dst_x;
+      ty = t.dst_y;
     }
     const double det = a*d - b*c;
     if (std::fabs(det) < 1e-6) {
@@ -1087,6 +1120,79 @@ StitchingWarpData BuildAffineWarpData(const std::vector<StitchTask>& tasks,
     wd.entries[i] = entry;
   }
   return wd;
+}
+
+// v3.x.3 (2026-07-09): 当 ba_estimator::EstimateCameraParamsBA 跑通时, 用 BA 算出的 K/R + camchain
+//   undist map 合成出 per-cam xmap/ymap (CV_32FC1, cell 大小, 直接喂 GLES warper).
+//   失败或 BA 未跑时 → 兜底到 BuildAffineWarpData (v3.x.2 老路径).
+//   live_w/live_h = 单 cam live 分辨率 (默认 2560x1440); undist_xmap/y 是 camchain 加载的
+//   initUndistortRectifyMap 输出, 大小也是 live w × live h.
+//
+// 返回 StitchingWarpData, panorama_size 用 tasks 中 cell 包围出的最大 dst_x+cw / dst_y+ch.
+StitchingWarpData BuildOrFallbackWarpData(
+    const std::vector<StitchTask>& tasks,
+    const std::vector<CameraRoiRect>& rois,
+    const std::vector<cv::Mat>& undist_xmap_vector,
+    const std::vector<cv::Mat>& undist_ymap_vector,
+    const ba_estimator::BaResult& ba,
+    bool ba_succeeded,
+    int live_w, int live_h) {
+  StitchingWarpData wd;
+  int pano_w = 0;
+  int pano_h = 0;
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    const int right = tasks[i].dst_x + std::max(0, tasks[i].src_w);
+    const int bot   = tasks[i].dst_y + std::max(0, tasks[i].src_h);
+    if (right > pano_w) pano_w = right;
+    if (bot   > pano_h) pano_h = bot;
+  }
+  wd.panorama_size = cv::Size(pano_w, pano_h);
+  wd.entries.resize(tasks.size());
+
+  if (ba_succeeded && live_w > 0 && live_h > 0 &&
+      static_cast<int>(tasks.size()) == 6) {
+    int cell_src_w[6] = {0}, cell_src_h[6] = {0};
+    int cell_dst_x[6] = {0}, cell_dst_y[6] = {0};
+    for (int i = 0; i < 6; ++i) {
+      if (i < static_cast<int>(tasks.size())) {
+        cell_src_w[i] = std::max(0, tasks[i].src_w);
+        cell_src_h[i] = std::max(0, tasks[i].src_h);
+        cell_dst_x[i] = std::max(0, tasks[i].dst_x);
+        cell_dst_y[i] = std::max(0, tasks[i].dst_y);
+      }
+    }
+    ba_estimator::StitcherWarpOutput sw;
+    const bool ok = ba_estimator::BuildStitcherWarpMaps(
+        ba, undist_xmap_vector, undist_ymap_vector,
+        cell_src_w, cell_src_h, cell_dst_x, cell_dst_y,
+        live_w, live_h, &sw);
+    if (ok) {
+      for (int i = 0; i < 6 && i < static_cast<int>(tasks.size()); ++i) {
+        if (!sw.final_xmap[i].empty() && !sw.final_ymap[i].empty()) {
+          WarpMapEntry entry;
+          entry.xmap = sw.final_xmap[i];
+          entry.ymap = sw.final_ymap[i];
+          entry.roi  = cv::Rect(cell_dst_x[i], cell_dst_y[i],
+                                cell_src_w[i], cell_src_h[i]);
+          wd.entries[i] = entry;
+        }
+      }
+      // 哪些 cam 没被 BA 填上 (空 entries), 后续 BuildAffineWarpData 会填. 用兜底覆盖 wd.
+      const size_t n = std::min(tasks.size(), wd.entries.size());
+      for (size_t i = 0; i < n; ++i) {
+        if (wd.entries[i].xmap.empty()) {
+          wd.entries[i] = WarpMapEntry{};
+        }
+      }
+      return wd;
+    }
+    // BA 跑通但 bake 失败 → log + 兜底
+    Logger::GetInstance().LogError(
+        "[App] BuildOrFallbackWarpData: BuildStitcherWarpMaps failed, "
+        "falling back to BuildAffineWarpData");
+  }
+  return BuildAffineWarpData(tasks, rois, undist_xmap_vector, undist_ymap_vector,
+                             pano_w, pano_h);
 }
 
 }
@@ -1246,7 +1352,57 @@ void App::BootStrapOptimalLayout() {
     WriteAffineToRoi(g_config.camera_rois[i],
                      i < best_per_cam_affine.size() ? best_per_cam_affine[i] : cv::Mat());
   }
-  
+
+  // v3.x.3 (2026-07-09): SIFT+BA 一跑出 K[i] / R[i] / K_live[i] (单个采集后一次, ~3 s).
+  //   与 EstimateOverlaps2x3 不冲突: overlap 拿 cell 位置 (dst_x/y + src_w/h),
+  //   BA 拿 warp 几何; cell 位置仍从 overlap 来 (proven path), 但 warp 用 BA 算的 R.
+  //   失败时 ba_succeeded_=false, 后面 BuildOrFallbackWarpData 走 BuildAffineWarpData.
+  //   用帧: 重采集一次保证 BA 看到的是当前 stream (不是 detection loop 里 frozen 那一帧).
+  sensorDataInterface_.get_image_vector(image_vector_);
+  std::vector<cv::Mat> best_bootstrap_bgr_for_ba(num_img_);
+  for (size_t i = 0; i < num_img_; ++i) {
+    best_bootstrap_bgr_for_ba[i] = ExportHardwareFrameToBgr(image_vector_[i]);
+  }
+  Logger::GetInstance().Log(
+      "[App] [BA] running SIFT + BundleAdjusterAffinePartial on frame #" +
+      std::to_string(best_result.frame_index) + " (n=" +
+      std::to_string(num_img_) + ")");
+  ba_estimator::BaResult ba_result;
+  ba_succeeded_ = false;
+  const char* ba_skip_env = std::getenv("STITCH_BA_SKIP");
+  if (ba_skip_env && std::atoi(ba_skip_env) == 1) {
+    Logger::GetInstance().Log("[App] [BA] STITCH_BA_SKIP=1, skipping BA");
+  } else if (ba_estimator::EstimateCameraParamsBA(
+                 best_bootstrap_bgr_for_ba, "../params", &ba_result)) {
+    ba_succeeded_ = true;
+    ba_result_ = ba_result;
+    for (size_t i = 0; i < num_img_ && i < 6; ++i) {
+      // K: 用 camchain 加载结果 (ba_result.K[i]) — 那里已做过 camchain + 占位 fallback.
+      if (!ba_result.K[i].empty() && ba_result.K[i].rows == 3 &&
+          ba_result.K[i].cols == 3) {
+        const double* k = ba_result.K[i].ptr<double>(0);
+        for (int j = 0; j < 9; ++j) {
+          g_config.camera_rois[i].K[j] = k[j];
+        }
+      }
+      // R: BA 算出的 3x3.
+      if (!ba_result.R[i].empty() && ba_result.R[i].rows == 3 &&
+          ba_result.R[i].cols == 3) {
+        const float* r = ba_result.R[i].ptr<float>(0);
+        for (int j = 0; j < 9; ++j) {
+          g_config.camera_rois[i].R[j] = static_cast<double>(r[j]);
+        }
+      }
+      g_config.camera_rois[i].have_ba_R = true;
+    }
+    Logger::GetInstance().Log("[App] [BA] succeeded, K/R/have_ba_R persisted to "
+                              "g_config; BuildOrFallbackWarpData will use BA "
+                              "xmap/ymap path");
+  } else {
+    Logger::GetInstance().LogError(
+        "[App] [BA] failed; falling back to BuildAffineWarpData");
+  }
+
   if (g_multi_frame_roi_debug_level >= 1) {
     ostringstream summary_msg;
     summary_msg << "[App] [MULTI-FRAME ROI " << (num_img_ == 6 ? "2x3" : "2x2") << "] Detection completed: "
@@ -1272,18 +1428,18 @@ void App::BootStrapOptimalLayout() {
 
   // v3.x.1 (2026-07-09): 把每路 cam 的 affine 喂给 GLES warper (走 SetWarpData).
   //   cam 0 是单位阵 → entry 不写; 其余 cam 用 xmap/ymap 把源帧 warp 到 warped 坐标系.
-  //   InitFromConfig / RebuildLayout 也调相同的 BuildAffineWarpData + SetWarpData 路径,
-  //   确保 yaml reload 后新 affine 生效.
+  //   InitFromConfig / RebuildLayout 也调相同的 BuildOrFallbackWarpData + SetWarpData 路径,
+  //   确保 yaml reload 后新 warp 生效.
+  // v3.x.3 (2026-07-09): BA 成功时, BuildOrFallbackWarpData 用 BA 的 K/R + camchain undist
+  //   bake xmap/ymap; 失败时回退到 BuildAffineWarpData (v3.x.2 老路径).
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
-    // v3.x.2 (2026-07-09): 喂入畸变校正 map (6 路 cam 全做), 让 GLES warper 一次 GPU
-    //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
-    //   g_config.camera_rois 是 CameraRoiRect[6] 数组, 转成 vector 给 BuildAffineWarpData.
     const std::vector<CameraRoiRect> rois_vec(
         g_config.camera_rois,
         g_config.camera_rois + sizeof(g_config.camera_rois) / sizeof(g_config.camera_rois[0]));
-    StitchingWarpData wd = BuildAffineWarpData(layout, rois_vec,
-                                               undist_xmap_vector_, undist_ymap_vector_,
-                                               total_cols_, height_);
+    StitchingWarpData wd = BuildOrFallbackWarpData(
+        layout, rois_vec, undist_xmap_vector_, undist_ymap_vector_,
+        ba_result_, ba_succeeded_,
+        image_vector_[0].width, image_vector_[0].height);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
   }
 
@@ -1396,16 +1552,16 @@ void App::InitFromConfig() {
 
   // v3.x.1 (2026-07-09): 启动期 yaml 加载路径也要喂 affine 给 GLES warper.
   //   没有这一段 yaml 里的 affine 不会生效 (因为 reload 走 RebuildLayout, 首次加载走 InitFromConfig).
+  // v3.x.3 (2026-07-09): 改走 BuildOrFallbackWarpData, ba_succeeded_ 在 App::App() 里
+  //   根据 yaml cam[*].have_ba_R 设定; ba_result_ 由构造函数从 yaml 加载 K/R 拼回.
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
-    // v3.x.2 (2026-07-09): 喂入畸变校正 map (6 路 cam 全做), 让 GLES warper 一次 GPU
-    //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
-    //   g_config.camera_rois 是 CameraRoiRect[6] 数组, 转成 vector 给 BuildAffineWarpData.
     const std::vector<CameraRoiRect> rois_vec(
         g_config.camera_rois,
         g_config.camera_rois + sizeof(g_config.camera_rois) / sizeof(g_config.camera_rois[0]));
-    StitchingWarpData wd = BuildAffineWarpData(layout, rois_vec,
-                                               undist_xmap_vector_, undist_ymap_vector_,
-                                               total_cols_, height_);
+    StitchingWarpData wd = BuildOrFallbackWarpData(
+        layout, rois_vec, undist_xmap_vector_, undist_ymap_vector_,
+        ba_result_, ba_succeeded_,
+        image_vector_[0].width, image_vector_[0].height);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
   }
 
@@ -1450,16 +1606,16 @@ void App::RebuildLayout() {
 
   // v3.x.1 (2026-07-09): yaml reload 路径 (RoiYamlWatcher 触发) 也要重喂 affine.
   //   用最新的 image_vector_ 尺寸作为 GLES warper input 维度.
+  // v3.x.3 (2026-07-09): 改走 BuildOrFallbackWarpData. yaml reload 后若 cam[*].have_ba_R
+  //   还都是 true, 保持 ba_succeeded_=true; 否则降级.
   if (!image_vector_.empty() && image_vector_[0].width > 0) {
-    // v3.x.2 (2026-07-09): 喂入畸变校正 map (6 路 cam 全做), 让 GLES warper 一次 GPU
-    //   pass 同时完成畸变校正 + 仿射对齐. cam0 是单位阵, entry 为空, 自动 skip.
-    //   g_config.camera_rois 是 CameraRoiRect[6] 数组, 转成 vector 给 BuildAffineWarpData.
     const std::vector<CameraRoiRect> rois_vec(
         g_config.camera_rois,
         g_config.camera_rois + sizeof(g_config.camera_rois) / sizeof(g_config.camera_rois[0]));
-    StitchingWarpData wd = BuildAffineWarpData(layout, rois_vec,
-                                               undist_xmap_vector_, undist_ymap_vector_,
-                                               total_cols_, height_);
+    StitchingWarpData wd = BuildOrFallbackWarpData(
+        layout, rois_vec, undist_xmap_vector_, undist_ymap_vector_,
+        ba_result_, ba_succeeded_,
+        image_vector_[0].width, image_vector_[0].height);
     image_stitcher_.SetWarpData(wd, image_vector_[0].width, image_vector_[0].height);
   }
 }
@@ -1632,6 +1788,78 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
     config_loaded = RoiConfig::LoadFromFile("../params/roi_tuning.yaml", g_config);
   }
 
+  // v3.x.3 (2026-07-09): 如果 yaml 加载成功, 且所有 6 路 cam 都标了 have_ba_R=true,
+  //   把 yaml 里的 K/R 拼回 ba_result_, 设 ba_succeeded_=true.
+  //   InitFromConfig 然后调 BuildOrFallbackWarpData 会走 BA 路径 (不重跑 SIFT+BA).
+  //   缺一就降级 (ba_succeeded_ 保持默认 false, InitFromConfig 走 BuildAffineWarpData).
+  // v3.x.3 (2026-07-09 fix): 即使都标了, R 还可能是全单位阵 (老 yaml / 上次 BA 退化),
+  //   这种情况下 BA 路径会给出全 identity warp, cell 全撑爆 source 边界 → 黑屏.
+  //   这里也检测一下 R 是不是"非平凡" (translation/rotation 起码有一个非零), 是 identity
+  //   就强制 ba_succeeded_=false 兜底.
+  ba_succeeded_ = false;
+  if (config_loaded && num_img_ == 6) {
+    bool all_have_ba_R = true;
+    for (int i = 0; i < 6; ++i) {
+      if (!g_config.camera_rois[i].have_ba_R) {
+        all_have_ba_R = false;
+        break;
+      }
+    }
+    if (all_have_ba_R) {
+      // 检测 R 是否全为单位阵 (退化)
+      bool all_r_identity = true;
+      for (int i = 0; i < 6; ++i) {
+        const CameraRoiRect& r = g_config.camera_rois[i];
+        const double tx = std::fabs(r.R[2]);     // R[0,2]
+        const double ty = std::fabs(r.R[5]);     // R[1,2]
+        const double off01 = std::fabs(r.R[1]);  // R[0,1]
+        const double off10 = std::fabs(r.R[3]);  // R[1,0]
+        const double dev = std::fabs(r.R[0] - 1.0) + std::fabs(r.R[4] - 1.0) +
+                           std::fabs(r.R[8] - 1.0);
+        if (tx > 0.05 || ty > 0.05 || off01 > 0.05 || off10 > 0.05 || dev > 0.1) {
+          all_r_identity = false;
+          break;
+        }
+      }
+      if (all_r_identity) {
+        Logger::GetInstance().Log(
+            "[App] [BA] yaml R matrices all near-identity (degenerate); "
+            "forcing affine fallback");
+      } else {
+        ba_succeeded_ = true;
+        for (int i = 0; i < 6; ++i) {
+          const CameraRoiRect& r = g_config.camera_rois[i];
+          ba_result_.K[i] = cv::Mat(3, 3, CV_64F);
+          for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+              ba_result_.K[i].at<double>(row, col) =
+                  r.K[row * 3 + col];
+            }
+          }
+          ba_result_.K_live[i] = cv::Mat(3, 3, CV_32F);
+          for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+              ba_result_.K_live[i].at<float>(row, col) =
+                  static_cast<float>(r.K[row * 3 + col]);
+            }
+          }
+          ba_result_.R[i] = cv::Mat(3, 3, CV_32F);
+          for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+              ba_result_.R[i].at<float>(row, col) =
+                  static_cast<float>(r.R[row * 3 + col]);
+            }
+          }
+        }
+        Logger::GetInstance().Log(
+            "[App] [BA] yaml has have_ba_R for all 6 cams; using BA warp path");
+      }
+    } else {
+      Logger::GetInstance().Log(
+          "[App] [BA] yaml missing have_ba_R for some cams; affine fallback");
+    }
+  }
+
   if (g_skip_bootstrap) {
     // 固定支架场景 (车载 GC4683 等): 期望用 YAML 启动, 但 YAML 缺失时仍跑一次
     // bootstrap 作为兜底, 而不是直接报错退出. 这是 2026-06 与用户确认的语义.
@@ -1757,33 +1985,48 @@ App::~App() {
     
     if (g_config.feather_enabled) {
       image_stitcher_.BlendSeams(stitch_input, image_concat_);
+    }
 
-    // v3.2 (2026-07-09): 帧差掩码 + 2 路 RTSP 推流. (yaml output.enabled=true)
+    // v3.2.1 (2026-07-09): 帧间差值 + 红色圆点追踪 (panorama 坐标系, 三路输出共用).
+    //   一次 ComputeMask 同时拿到 mask (供 /stitch_diff) 和 motion_centroids (供 /stitch + MJPEG).
+    //   centroids 严格对应"本帧检测到的大运动块质心", 运动停止 → 空 → 不画圆点 → 圆点消失.
+    //   注: 之前 RTSP 块被错套在 feather_enabled 内 (g_config.feather_enabled=false 时整路不推),
+    //   这次顺手拉到外面, 让 /stitch 和 /stitch_diff 在不羽化时也能工作.
+    std::vector<cv::Point2f> motion_centroids;
+    if (rtsp_output_enabled_ && !debug_mode_ && frame_diff_) {
+      // frame_diff needs NV12Frame (fd + width + height + stride).
+      // Build a NV12Frame view from output_drm_buf_ without copying.
+      NV12Frame nv12_view;
+      nv12_view.fd = output_drm_buf_.fd;
+      nv12_view.width = output_drm_buf_.width;
+      nv12_view.height = output_drm_buf_.height;
+      nv12_view.stride_w = static_cast<int>(output_drm_buf_.pitch);
+      nv12_view.stride_h = output_drm_buf_.height;
+      cv::Mat mask_bgr = frame_diff_->ComputeMask(nv12_view, &motion_centroids);
+      if (!mask_bgr.empty()) {
+        DrawRedDots(mask_bgr, motion_centroids);
+        gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
+            "/stitch_diff", mask_bgr);
+      }
+    }
+
+    // v3.2 (2026-07-09): RTSP /stitch 推流 (原图 + 红色圆点叠加).
     if (rtsp_output_enabled_ && !debug_mode_) {
       // ExportNv12DrmBufferToBgr returns cv::UMat (OpenCL); convert to Mat for RTSP push.
       cv::UMat stitched_umat_for_rtsp = ExportNv12DrmBufferToBgr(output_drm_buf_);
       if (!stitched_umat_for_rtsp.empty()) {
         cv::Mat stitched_bgr_for_rtsp = stitched_umat_for_rtsp.getMat(cv::ACCESS_READ);
-        gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
-            "/stitch", stitched_bgr_for_rtsp);
-        if (frame_diff_) {
-          // frame_diff needs NV12Frame (fd + width + height + stride).
-          // Build a NV12Frame view from output_drm_buf_ without copying.
-          NV12Frame nv12_view;
-          nv12_view.fd = output_drm_buf_.fd;
-          nv12_view.width = output_drm_buf_.width;
-          nv12_view.height = output_drm_buf_.height;
-          nv12_view.stride_w = static_cast<int>(output_drm_buf_.pitch);
-          nv12_view.stride_h = output_drm_buf_.height;
-          cv::Mat mask_bgr = frame_diff_->ComputeMask(nv12_view);
-          if (!mask_bgr.empty()) {
-            gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
-                "/stitch_diff", mask_bgr);
-          }
+        if (motion_centroids.empty()) {
+          // 无运动时直接推原图, 省一次 clone.
+          gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
+              "/stitch", stitched_bgr_for_rtsp);
+        } else {
+          cv::Mat stitched_with_dots = stitched_bgr_for_rtsp.clone();
+          DrawRedDots(stitched_with_dots, motion_centroids);
+          gst_rtsp_server::GstRtspServer::GetInstance().PushBgrFrame(
+              "/stitch", stitched_with_dots);
         }
       }
-    }
-
     }
 
     // 阶段 2: CameraPage "实时预览" MJPEG 推流.
@@ -1833,6 +2076,21 @@ App::~App() {
 
           cv::Mat bgr_host;
           cv::cvtColor(nv12_host, bgr_host, cv::COLOR_YUV2BGR_NV12);
+
+          // v3.2.1 (2026-07-09): 把 panorama 坐标系的 centroids 缩放到 MJPEG 尺寸再画圆点.
+          //   注意: 缩放系数按 stitch 后实际尺寸算 (避免使用历史硬编码 4800x4080);
+          //   motion_centroids 是主循环顶部算好的, 这里只是消费者, 不重算 findContours.
+          if (!bgr_host.empty() && !motion_centroids.empty() &&
+              total_cols_ > 0 && height_ > 0) {
+            const float scale_x = static_cast<float>(mjpeg_width_) / total_cols_;
+            const float scale_y = static_cast<float>(mjpeg_height_) / height_;
+            std::vector<cv::Point2f> scaled_centroids;
+            scaled_centroids.reserve(motion_centroids.size());
+            for (const auto& c : motion_centroids) {
+              scaled_centroids.emplace_back(c.x * scale_x, c.y * scale_y);
+            }
+            DrawRedDots(bgr_host, scaled_centroids);
+          }
 
           std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, mjpeg_quality_};
           std::vector<unsigned char> jpg_buf;
