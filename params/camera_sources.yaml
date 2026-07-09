@@ -5,6 +5,16 @@
 # v3.2 (2026-07-09): 加 output: 块, 启用 2 路 RTSP 推流
 # 当前 IP: 6 路 192.168.1.11..16 摄像机, 板端: 192.168.1.10
 # ============================================================
+# ★ v3.0.2 (2026-07-09): cameras 顺序必须匹配物理 2x3 布局
+#   BuildStitchLayout2x3 用 cam ID = YAML list index, row-major 摆放:
+#     cam0 (左上)  cam1 (右上)
+#     cam2 (左中)  cam3 (右中)
+#     cam4 (左下)  cam5 (右下)
+#   实际物理布局:
+#     16 11
+#     12 13
+#     15 14
+# ============================================================
 
 sync_window_ms: 16
 auto_calibrate: 0
@@ -37,6 +47,18 @@ output:
       encoder: h264_hw
 
 cameras:
+  # cam0 → (row 0, col 0) 左上 = 192.168.1.16
+  - type: rtsp
+    uri: "rtsp://admin:123456@192.168.1.16:554/video1"
+    width: 2560
+    height: 1440
+    fps: 30
+    pixel_format: NV12
+    user_id: admin
+    user_pw: 123456
+    latency_ms: 120
+    use_tcp: true
+  # cam1 → (row 0, col 1) 右上 = 192.168.1.11
   - type: rtsp
     uri: "rtsp://admin:123456@192.168.1.11:554/video1"
     width: 2560
@@ -47,6 +69,7 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
+  # cam2 → (row 1, col 0) 左中 = 192.168.1.12
   - type: rtsp
     uri: "rtsp://admin:123456@192.168.1.12:554/video1"
     width: 2560
@@ -57,6 +80,7 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
+  # cam3 → (row 1, col 1) 右中 = 192.168.1.13
   - type: rtsp
     uri: "rtsp://admin:123456@192.168.1.13:554/video1"
     width: 2560
@@ -67,16 +91,7 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
-  - type: rtsp
-    uri: "rtsp://admin:123456@192.168.1.14:554/video1"
-    width: 2560
-    height: 1440
-    fps: 30
-    pixel_format: NV12
-    user_id: admin
-    user_pw: 123456
-    latency_ms: 120
-    use_tcp: true
+  # cam4 → (row 2, col 0) 左下 = 192.168.1.15
   - type: rtsp
     uri: "rtsp://admin:123456@192.168.1.15:554/video1"
     width: 2560
@@ -87,8 +102,9 @@ cameras:
     user_pw: 123456
     latency_ms: 120
     use_tcp: true
+  # cam5 → (row 2, col 1) 右下 = 192.168.1.14
   - type: rtsp
-    uri: "rtsp://admin:123456@192.168.1.16:554/video1"
+    uri: "rtsp://admin:123456@192.168.1.14:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -96,4 +112,4 @@ cameras:
     user_id: admin
     user_pw: 123456
     latency_ms: 120
-    use_tcp: true"
+    use_tcp: true

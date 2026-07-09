@@ -5,11 +5,11 @@ step_size: 1
 selected_cam: 1
 feather:
    enabled: 1
-   width: 120
+   width: 0
    strength: 2.
 save:
    enabled: 0
-   interval: 30
+   interval: 0
 cam0:
    offset_x: 0
    offset_y: 0
