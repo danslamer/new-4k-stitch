@@ -1359,6 +1359,9 @@ bool App::InitRtspOutput() {
 #endif  // HAVE_GST_RTSP_SERVER
 
   // HAVE_GST_RTSP_SERVER=0: RTSP 没编译进来, 默认关.
+  Logger::GetInstance().LogError(
+      "[App] HAVE_GST_RTSP_SERVER=0, RTSP output disabled at compile time. "
+      "Check CMake's pkg_check_modules(gstreamer-rtsp-server-1.0) output.");
   return false;
 }
 void App::SyncConfigToGlobals() {
