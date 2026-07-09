@@ -166,8 +166,8 @@ bool GstMppDecoder::BuildRtspPipeline() {
   }
 
   _GstElement* src   = gst_element_factory_make("rtspsrc",    "src");
-  _GstElement* depay = gst_element_factory_make("rtph264depay", "depay");
-  _GstElement* parse = gst_element_factory_make("h264parse",  "parse");
+  _GstElement* depay = gst_element_factory_make("rtph265depay", "depay");
+  _GstElement* parse = gst_element_factory_make("h265parse",  "parse");
   _GstElement* dec   = gst_element_factory_make("mppvideodec", "dec");
   _GstElement* sink  = gst_element_factory_make("appsink",    "sink");
 
