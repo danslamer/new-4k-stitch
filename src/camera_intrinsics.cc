@@ -33,14 +33,38 @@ bool LoadCamchain(const std::string& yaml_path, CamchainIntrinsics* out) {
     if (out == nullptr) return false;
     out->valid = false;
 
-    cv::FileStorage fs(yaml_path, cv::FileStorage::READ);
+    cv::FileStorage fs;
+    try {
+        fs.open(yaml_path, cv::FileStorage::READ);
+    } catch (const cv::Exception& e) {
+        // 文件不存在 / 不可读 / 解析失败 — 当缺 yaml 处理, 不让 boot 阶段 terminate.
+        (void)e;
+        return false;
+    } catch (const std::exception& e) {
+        (void)e;
+        return false;
+    }
     if (!fs.isOpened()) return false;
 
-    // 直接读, 跟原版 InitUndistortMap 一致 — 不用中间 FileNode, 不用 empty() 检查.
+    // v3.x.5 (2026-07-09): 板端 OpenCV 4.5.4 binary 里 `cv::FileStorage fs(path, READ)` +
+    //   `fs["KMat"] >> K` 在某些 yaml 上会抛 'isMap() in operator[]' (fs 处于非 map state
+    //   时 operator[] 触发 assertion). 单独的小测试程序读同一份 yaml 不报, 但 image-stitching
+    //   binary 一启动就崩. 直接在 operator[] 周围包 try/catch, 跟空文件同等待遇 (当 missing
+    //   处理) — 不再 align 原版 InitUndistortMap 的"裸 open"写法.
     cv::Mat K, D, R;
-    fs["KMat"] >> K;
-    fs["D"] >> D;
-    fs["RMat"] >> R;
+    try {
+        fs["KMat"] >> K;
+        fs["D"] >> D;
+        fs["RMat"] >> R;
+    } catch (const cv::Exception& e) {
+        // 板端常踩: 'isMap() in operator[]' (fs 解析器进入 matrix-tag state 后没回到 map).
+        // 让上层当 missing/invalid 处理, 不掩盖问题 (log 在调用方打).
+        (void)e;
+        return false;
+    } catch (const std::exception& e) {
+        (void)e;
+        return false;
+    }
 
     // Sanity check: K 必须是 3x3, D 必须非空. R 缺则用单位阵 (cam0 即此情况).
     if (K.empty() || K.rows != 3 || K.cols != 3) return false;
@@ -56,8 +80,14 @@ bool LoadCamchain(const std::string& yaml_path, CamchainIntrinsics* out) {
 
     // 标定分辨率 (calib): 优先 width/height 单独字段, 缺则从 resolution 数组取.
     int w = 0, h = 0;
-    fs["width"]  >> w;
-    fs["height"] >> h;
+    try {
+        fs["width"]  >> w;
+        fs["height"] >> h;
+    } catch (const cv::Exception&) {
+        return false;
+    } catch (const std::exception&) {
+        return false;
+    }
     if (w <= 0 || h <= 0) {
         cv::FileNode res_node = fs["resolution"];
         if (!res_node.empty() && res_node.isSeq() && res_node.size() >= 2) {
