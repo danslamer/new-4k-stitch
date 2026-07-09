@@ -1,0 +1,74 @@
+{
+  "version": "1.1",
+  "description": "双相机轨迹跟踪：每 5 秒采样时间戳，检测到人员后保留从出现到消失的轨迹视频片段。",
+  "totalTimelineSec": 60,
+  "sampleIntervalSec": 5,
+  "trackResult": {
+    "personCount": 1,
+    "targetIds": ["1024"],
+    "summary": "共 1 条轨迹",
+    "crossCamera": true,
+    "details": [
+      {
+        "targetId": "1024",
+        "cameras": [
+          { "deviceName": "入口枪机-本机", "range": "T+0s ~ T+10s", "lastCoord": "(720, 380)" },
+          { "deviceName": "大厅枪机-01", "range": "T+30s ~ T+45s", "lastCoord": "(900, 340)" }
+        ]
+      }
+    ]
+  },
+  "clips": [
+    {
+      "id": "cam1",
+      "deviceId": 0,
+      "deviceName": "入口枪机-本机",
+      "detectStart": 0,
+      "detectEnd": 10,
+      "originalRange": "T+0s 有人 → T+10s 消失",
+      "timelineStart": 0,
+      "timelineEnd": 10,
+      "durationSec": 10,
+      "video": "demo/clips/cam1_track.mp4",
+      "savedPath": "demo/clips/cam1_track.mp4",
+      "fps": 25,
+      "personDetected": true,
+      "tracks": [
+        {
+          "id": "1024",
+          "keyframes": [
+            { "t": 0, "cx": 480, "cy": 320, "bw": 120, "bh": 280 },
+            { "t": 5, "cx": 640, "cy": 360, "bw": 115, "bh": 275 },
+            { "t": 10, "cx": 720, "cy": 380, "bw": 112, "bh": 272 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "cam2",
+      "deviceId": 1,
+      "deviceName": "大厅枪机-01",
+      "detectStart": 30,
+      "detectEnd": 45,
+      "originalRange": "T+30s 有人 → T+45s 消失",
+      "timelineStart": 30,
+      "timelineEnd": 45,
+      "durationSec": 15,
+      "video": "demo/clips/cam2_track.mp4",
+      "savedPath": "demo/clips/cam2_track.mp4",
+      "fps": 25,
+      "personDetected": true,
+      "tracks": [
+        {
+          "id": "1024",
+          "keyframes": [
+            { "t": 0, "cx": 200, "cy": 400, "bw": 110, "bh": 260 },
+            { "t": 5, "cx": 420, "cy": 370, "bw": 115, "bh": 268 },
+            { "t": 10, "cx": 680, "cy": 350, "bw": 118, "bh": 275 },
+            { "t": 15, "cx": 900, "cy": 340, "bw": 120, "bh": 280 }
+          ]
+        }
+      ]
+    }
+  ]
+}

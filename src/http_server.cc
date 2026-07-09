@@ -24,12 +24,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
 
 #ifndef IMAGE_STITCHING_NO_HTTP
@@ -51,6 +54,9 @@ std::thread       g_thread;
 std::string       g_camera_page_dir;
 std::string       g_status_path = "/tmp/stitch_status.json";
 std::string       g_project_root = "..";  // 相对 CWD
+
+// /api/clips/upload 文件序号, 每进程内单调递增 (不上盘, 重启归零可接受).
+static std::atomic<int> g_clip_seq{0};
 
 #ifndef IMAGE_STITCHING_NO_HTTP
 
@@ -445,6 +451,99 @@ void run_server(const Config& cfg) {
             return;
         }
         res.set_content(handle_roi_post(body), "application/json");
+    });
+
+    // POST /api/clips/upload — 浏览器 MediaRecorder 把"轨迹跟踪"开启期间
+    // 每 5 秒的 MJPEG 视频片段上传, 服务端落到 <CameraPage>/demo/clips/ 下,
+    // 文件名服务端按本地时间戳 + 序号生成, 不信任客户端 filename 防穿越.
+    // 大小上限 50MB; 仅校验简单: 必须是 multipart/form-data, 字段名 "clip".
+    svr.Post("/api/clips/upload", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        // 该仓 vendored 的 httplib API: 解析后的 multipart 数据在 req.form 上,
+        // has_file / get_file 都是 MultipartFormData 的成员, 不是 Request 的.
+        if (!req.form.has_file("clip")) {
+            res.status = 400;
+            res.set_content("{\"ok\": false, \"error\": \"missing field 'clip' (expect multipart/form-data)\"}\n",
+                            "application/json");
+            return;
+        }
+        const auto& f = req.form.get_file("clip");  // 返回 FormData (name/content/filename/content_type)
+        if (f.content.empty()) {
+            res.status = 400;
+            res.set_content("{\"ok\": false, \"error\": \"empty upload\"}\n", "application/json");
+            return;
+        }
+        if (f.content.size() > 50 * 1024 * 1024) {  // 50MB cap
+            res.status = 413;
+            res.set_content("{\"ok\": false, \"error\": \"file too large (50MB max)\"}\n",
+                            "application/json");
+            return;
+        }
+
+        // 服务器侧生成文件名: track_YYYYMMDD_HHMMSS_NNN.<ext>
+        // 序号取自服务端单调计数器 (跨进程重启保持递增).
+        // 注意: 在原文件名上 sanitize 没有任何必要, 因为我们完全不用它.
+        // ext 由内容魔数嗅探, 不信任浏览器给的 mime / filename:
+        //   - WebM / Matroska: 前 4 字节 EBML 头 1A 45 DF A3
+        //   - MP4 (isobmff): offset 4..7 = "ftyp" 盒
+        // 这俩之外的暂落到 .bin, 留给人肉排查.
+        const char* ext = "bin";
+        if (f.content.size() >= 8) {
+            const unsigned char* p =
+                reinterpret_cast<const unsigned char*>(f.content.data());
+            if (p[0] == 0x1A && p[1] == 0x45 && p[2] == 0xDF && p[3] == 0xA3) {
+                ext = "webm";
+            } else if (p[4] == 'f' && p[5] == 't' && p[6] == 'y' && p[7] == 'p') {
+                ext = "mp4";
+            }
+        }
+
+        time_t now = time(nullptr);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_buf);
+
+        std::string clips_dir = g_camera_page_dir + "/demo/clips";
+        // mkdir -p: 先 stat, 失败就 mkdir. 不用 popen (GLIBC 系统上 fork 是 overhead).
+        struct stat st;
+        if (stat(clips_dir.c_str(), &st) != 0) {
+            if (mkdir(clips_dir.c_str(), 0755) != 0) {
+                res.status = 500;
+                res.set_content("{\"ok\": false, \"error\": \"cannot create clips dir\"}\n",
+                                "application/json");
+                return;
+            }
+        }
+
+        // 序号: 进程内单调递增 + 时间戳. (重启归零可接受, 时间戳秒级已能避免冲突.)
+        int n = g_clip_seq.fetch_add(1);
+
+        char fname[96];
+        snprintf(fname, sizeof(fname), "track_%s_%03d.%s", ts, n % 1000, ext);
+        std::string target = clips_dir + "/" + fname;
+
+        std::ofstream of(target, std::ios::binary);
+        if (!of) {
+            res.status = 500;
+            res.set_content("{\"ok\": false, \"error\": \"cannot open output file\"}\n",
+                            "application/json");
+            return;
+        }
+        of.write(f.content.data(), static_cast<std::streamsize>(f.content.size()));
+        of.close();
+        if (!of.good()) {
+            res.status = 500;
+            res.set_content("{\"ok\": false, \"error\": \"write failed\"}\n",
+                            "application/json");
+            return;
+        }
+
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+                 "{\"ok\": true, \"path\": \"%s\", \"size\": %zu, \"name\": \"%s\"}\n",
+                 target.c_str(), f.content.size(), fname);
+        res.set_content(resp, "application/json");
     });
 
     // 阶段 2: GET /api/snapshot — 单帧 JPEG (玩家 / 快照工具用).

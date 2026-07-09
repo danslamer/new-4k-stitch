@@ -7,7 +7,8 @@ const PAGE_TITLES = {
   home: '图像输出',
   network: '网络配置',
   algorithm: '算法管理',
-  devices: '设备管理'
+  devices: '设备管理',
+  tracking: '轨迹跟踪'
 };
 
 const PAGE_STORAGE_KEY = 'camera-platform-active-page';
@@ -65,6 +66,7 @@ function switchPage(page, instant = false) {
 
   if (instant || !currentPanel) {
     activatePanel();
+    onPageActivated(page);
     return;
   }
 
@@ -72,7 +74,25 @@ function switchPage(page, instant = false) {
   pageSwitchTimer = setTimeout(() => {
     pageSwitchTimer = null;
     activatePanel();
+    onPageActivated(page);
   }, PAGE_TRANSITION_MS);
+}
+
+/** 页面切换完成后的模块初始化 */
+function onPageActivated(page) {
+  if (page === 'network' && typeof drawBandwidthChart === 'function') {
+    requestAnimationFrame(drawBandwidthChart);
+  }
+  if (page === 'tracking') {
+    requestAnimationFrame(() => {
+      if (typeof updateTrackingUI === 'function') updateTrackingUI();
+      if (typeof TrackingDemo !== 'undefined' && TrackingDemo.onPageEnter) {
+        TrackingDemo.onPageEnter();
+      }
+    });
+  } else if (typeof TrackingDemo !== 'undefined' && TrackingDemo.onPageLeave) {
+    TrackingDemo.onPageLeave();
+  }
 }
 
 /** 从 sessionStorage 恢复上次停留的页面 */
@@ -83,19 +103,11 @@ function restoreActivePage() {
     if (saved && PAGE_TITLES[saved]) page = saved;
   } catch (_) {}
   switchPage(page, true);
-  if (page === 'network' && typeof drawBandwidthChart === 'function') {
-    requestAnimationFrame(drawBandwidthChart);
-  }
+  onPageActivated(page);
 }
 
 document.querySelectorAll('.nav-item').forEach(item => {
-  item.addEventListener('click', () => {
-    const page = item.dataset.page;
-    switchPage(page);
-    if (page === 'network' && typeof drawBandwidthChart === 'function') {
-      requestAnimationFrame(drawBandwidthChart);
-    }
-  });
+  item.addEventListener('click', () => switchPage(item.dataset.page));
 });
 
 // ========== Toast 提示 ==========
@@ -239,14 +251,6 @@ document.getElementById('btn-fullscreen').addEventListener('click', () => {
   if (el.requestFullscreen) el.requestFullscreen();
 });
 
-function updateClock() {
-  const now = new Date();
-  document.getElementById('overlay-time').textContent = now.toLocaleString('zh-CN', { hour12: false });
-}
-setInterval(updateClock, 1000);
-updateClock();
-setInterval(updateLiveParams, 3000);
-
 // ========== 阶段 2: MJPEG panorama 实时预览接管 ==========
 // 浏览器原生 <img src="/api/stream"> 加载 multipart/x-mixed-replace.
 // 流建立 -> onload -> 加 .stream-active -> 隐藏 placeholder + 显示图.
@@ -267,20 +271,32 @@ function onStreamError(img) {
   wrap.classList.add('preview-offline');
 }
 
-// 启动时主动连 (部分浏览器延迟到 layout 后才请求 src, 显式 kick 一下)
-const mjpegImg = document.getElementById('mjpeg-stream');
-if (mjpegImg && !mjpegImg.src) {
-  mjpegImg.src = '/api/stream';
-}
-
-// 切码流 / 切 RTSP 设备时, 重新触发 onload/onerror (避免 img cache 旧流).
+/** 显式重新拉取 /api/stream (避免浏览器缓存旧 MPJEG 帧) */
 function reloadMjpegStream() {
   const img = document.getElementById('mjpeg-stream');
   if (!img) return;
-  const current = img.src;
-  img.src = '';
-  setTimeout(() => { img.src = current || '/api/stream'; }, 80);
+  const current = img.getAttribute('src') || '';
+  img.removeAttribute('src');
+  // 给浏览器一拍重置时间, 防止 img 同时处于 error 状态时不重新请求
+  setTimeout(() => { img.src = (current || '/api/stream') + '?t=' + Date.now(); }, 80);
 }
+
+/** DOMContentLoaded 后启动一次 stream, 部分浏览器要等 layout 完成才请求 img src. */
+function startMjpegStream() {
+  const img = document.getElementById('mjpeg-stream');
+  if (!img) return;
+  if (!img.getAttribute('src')) {
+    img.src = '/api/stream?t=' + Date.now();
+  }
+}
+
+function updateClock() {
+  const now = new Date();
+  document.getElementById('overlay-time').textContent = now.toLocaleString('zh-CN', { hour12: false });
+}
+setInterval(updateClock, 1000);
+updateClock();
+setInterval(updateLiveParams, 3000);
 
 // ========== 算法数据（最多 6 个） ==========
 
@@ -1314,6 +1330,9 @@ function applyPreviewDeviceUI(options = {}) {
 
     updatePreviewPlaceholder();
     renderDevices(document.getElementById('dev-search')?.value || '');
+    updateTrackingDeviceSync();
+    // 切码流 / 切 RTSP 设备时重新触发 onload/onerror (避免 img cache 旧流)
+    if (typeof reloadMjpegStream === 'function') reloadMjpegStream();
   };
 
   if (!animated) {
@@ -1553,6 +1572,75 @@ document.getElementById('btn-back-local').addEventListener('click', () => {
   if (local) switchPreviewDevice(local.id, { showToastMsg: false, animated: true });
 });
 
+// ========== 5. 轨迹跟踪（文字结果，无视频预览） ==========
+
+/** 供 tracking-demo.js 回放时更新目标坐标（可选） */
+function updateTrackTargets(targets) {
+  void targets;
+}
+
+function updateTrackingUI() {}
+
+/** 把当前预览设备名同步到跟踪页（占位，留作未来 demo 联动） */
+function updateTrackingDeviceSync() {}
+
+// ========== /api/status 实时轮询 (右栏参数面板 + 顶栏) ==========
+// /tmp/stitch_status.json 由主板 status_writer 写入, http_server 原样回吐.
+// 不影响现有的 updateLiveParams() 兜底 (无后端时仍走模拟数).
+let stitchStatusPollTimer = null;
+let stitchStatusBadCount = 0;
+
+function setLiveParam(id, text) {
+  const el = document.getElementById(id);
+  if (el && typeof text === 'string') el.textContent = text;
+}
+
+function applyStitchStatus(st) {
+  if (!st || typeof st !== 'object') return;
+  // 分辨率: 后端 panorama_w/h 是真实拼接输出尺寸
+  if (Number.isFinite(st.panorama_w) && Number.isFinite(st.panorama_h)
+      && st.panorama_w > 0 && st.panorama_h > 0) {
+    setLiveParam('live-resolution', `${st.panorama_w}×${st.panorama_h}`);
+  }
+  // 帧率: 用 status.current_fps (实测) 覆盖模拟的 25
+  if (Number.isFinite(st.current_fps) && st.current_fps > 0) {
+    setLiveParam('live-fps', `${st.current_fps.toFixed(1)} fps`);
+  }
+  // 丢帧率 (status.drop_ratio 为 0~1 百分比小数)
+  if (Number.isFinite(st.drop_ratio)) {
+    setLiveParam('live-drop', `${(st.drop_ratio * 100).toFixed(1)}%`);
+  } else if (Number.isFinite(st.frames_dropped) && Number.isFinite(st.frames_total) && st.frames_total > 0) {
+    const ratio = st.frames_dropped / st.frames_total;
+    setLiveParam('live-drop', `${(ratio * 100).toFixed(1)}%`);
+  }
+}
+
+async function pollStitchStatus() {
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    if (!res.ok) throw new Error('http ' + res.status);
+    const st = await res.json();
+    if (st && !st.warning) {
+      stitchStatusBadCount = 0;
+      applyStitchStatus(st);
+    } else {
+      stitchStatusBadCount += 1;
+    }
+  } catch (e) {
+    stitchStatusBadCount += 1;
+    void e;
+  }
+}
+
+function startStitchStatusPolling() {
+  if (stitchStatusPollTimer) return;
+  // 立即拉一次, 之后每 2s 拉一次
+  pollStitchStatus();
+  stitchStatusPollTimer = setInterval(pollStitchStatus, 2000);
+}
+
+window.updateTrackTargets = updateTrackTargets;
+
 // ========== 初始化 ==========
 loadStreamConfig('main');
 updateLiveParams();
@@ -1562,4 +1650,9 @@ updateAlgoStats();
 syncLocalDeviceUI();
 restorePreviewDevice();
 applyPreviewDeviceUI({ animated: false });
+updateTrackingUI();
 restoreActivePage();
+// 启动 MJPEG panorama stream 接管首页图像输出预览
+startMjpegStream();
+// 启动 /api/status 实时轮询 (右栏参数面板 + 顶栏设备名同步)
+startStitchStatusPolling();

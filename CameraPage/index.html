@@ -31,6 +31,10 @@
           <span class="nav-icon">📡</span>
           <span>设备管理</span>
         </div>
+        <div class="nav-item" data-page="tracking">
+          <span class="nav-icon">🎯</span>
+          <span>轨迹跟踪</span>
+        </div>
       </nav>
       <div class="sidebar-footer">V1.0.0 · 攸洋智控</div>
     </aside>
@@ -74,10 +78,9 @@
                   </div>
                 </div>
                 <div class="card-body preview-body">
-                  <div class="video-preview-area stream-active" id="video-preview">
+                  <div class="video-preview-area" id="video-preview">
                     <div class="preview-bg"></div>
                     <img class="preview-stream" id="mjpeg-stream"
-                         src="/api/stream"
                          alt="实时拼接全景"
                          onload="onStreamLoad(this)"
                          onerror="onStreamError(this)" />
@@ -561,6 +564,51 @@
           </div>
         </div>
 
+        <!-- ========== 5. 轨迹跟踪 ========== -->
+        <div class="page-panel" id="page-tracking">
+          <div class="tracking-page">
+            <div class="card card-elevated">
+              <div class="card-header">
+                <span class="card-title">启动选项</span>
+              </div>
+              <div class="card-body track-start-body">
+                <button type="button" class="track-output-option track-output-primary" id="btn-track-start">
+                  <span class="track-output-option-icon" id="track-start-icon">▶</span>
+                  <div class="track-output-option-body">
+                    <span class="track-output-option-title" id="track-start-title">启用轨迹跟踪</span>
+                    <span class="track-output-option-desc hidden" id="track-start-desc"></span>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            <div class="card card-elevated track-result-panel hidden" id="track-result-panel">
+              <div class="card-header">
+                <span class="card-title">轨迹结果</span>
+              </div>
+              <div class="card-body track-result-body">
+                <div class="track-result-section">
+                  <div class="track-result-section-title">目标轨迹</div>
+                  <div class="track-result-summary" id="track-result-summary">
+                    <span class="track-result-count">—</span>
+                  </div>
+                  <div class="track-result-detail" id="track-result-detail"></div>
+                </div>
+                <div class="track-result-section track-replay-section">
+                  <div class="track-result-section-title">轨迹回放</div>
+                  <p class="track-replay-intro" id="track-replay-desc">各主板在检测到人员后保存的轨迹片段，按时间顺序拼接回放</p>
+                  <button class="track-replay-btn" id="btn-track-replay" type="button">
+                    <span class="track-replay-btn-icon">▶</span>
+                    <span class="track-replay-btn-title">开始轨迹回放</span>
+                  </button>
+                  <div class="track-replay-status hidden" id="track-replay-status"></div>
+                  <div class="track-replay-clips" id="track-replay-clips"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>
@@ -706,5 +754,7 @@
   <div class="toast" id="toast"></div>
 
   <script src="js/app.js"></script>
+  <script src="js/track-recorder.js"></script>
+  <script src="js/tracking-demo.js"></script>
 </body>
 </html>
