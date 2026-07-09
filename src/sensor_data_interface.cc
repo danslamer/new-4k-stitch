@@ -46,6 +46,10 @@
 #include <thread>
 #include <utility>
 
+#include <sys/mman.h>  // MAP_FAILED for FillNv12Black
+
+#include "drm_allocator.h"
+
 namespace {
 
 /**
@@ -73,6 +77,31 @@ struct DecoderPerfStats {
       std::chrono::steady_clock::now();
 };
 
+/**
+ * @brief v3.x.x (2026-07-10) stall fallback — fill an NV12 DMA-BUF with true
+ *   neutral black: Y plane = 0, UV plane = 0x80. ImageStitcher::ClearOutput
+ *   uses 0x00000000 for the output panorama (renders dark blue), which would
+ *   look wrong as a per-cam panel next to live frames. UV=128 gives proper
+ *   black, matching the BT.601/709 limited-range convention.
+ */
+static void FillNv12Black(DrmBuffer& buf) {
+  if (buf.fd < 0 || buf.width <= 0 || buf.height <= 0 || buf.size == 0) {
+    return;
+  }
+  void* mapped = drm_map(buf);
+  if (mapped == MAP_FAILED) {
+    return;
+  }
+  const int pitch = static_cast<int>(buf.pitch);
+  const size_t y_size  = static_cast<size_t>(pitch) * buf.height;
+  const size_t uv_size = static_cast<size_t>(pitch) * (buf.height / 2);
+  uint8_t* y_plane  = static_cast<uint8_t*>(mapped);
+  uint8_t* uv_plane = y_plane + y_size;
+  std::memset(y_plane,  0x00, y_size);
+  std::memset(uv_plane, 0x80, uv_size);
+  drm_unmap(buf, mapped);
+}
+
 }  // namespace
 
 /**
@@ -93,6 +122,15 @@ SensorDataInterface::SensorDataInterface()
  */
 SensorDataInterface::~SensorDataInterface() {
   StopDecodeThreads();
+
+  // v3.x.x (2026-07-10): free stall-fallback black-frame DMA-BUFs.
+  // Done after StopDecodeThreads() so no decoder thread is still touching
+  // the buffers (they're only read by get_frame_vector, but be explicit).
+  for (DrmBuffer& b : black_frame_drm_vector_) {
+    drm_free(b);
+  }
+  black_frame_drm_vector_.clear();
+  stream_offline_vector_.clear();
 }
 
 /**
@@ -398,6 +436,52 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   decoder_finished_vector_ = std::vector<bool>(num_img_, false);
   drm_prime_fallback_logged_vector_ = std::vector<bool>(num_img_, false);
 
+  // v3.x.x (2026-07-10): stall fallback setup. After the per-cam decode
+  // threads are started below, each thread updates last_frame_time_vector_[i]
+  // on every successful push. get_frame_vector checks this timestamp and
+  // substitutes the black-frame DMA-BUF if the stream has been silent for
+  // longer than stream_stall_timeout_ms_, preventing the stitch loop from
+  // blocking forever on a dead RTSP stream.
+  const char* env_stall = std::getenv("STREAM_STALL_TIMEOUT_MS");
+  if (env_stall != nullptr) {
+    int v = std::atoi(env_stall);
+    if (v >= 100) {
+      stream_stall_timeout_ms_ = v;
+    }
+  }
+
+  last_frame_time_vector_ = std::vector<std::chrono::steady_clock::time_point>(
+      num_img_, std::chrono::steady_clock::time_point::max());
+  // v3.x.x: capture the wall-clock time each decoder thread is about to start,
+  // so the stall check can detect "decoder running for > timeout AND no frame
+  // ever produced" (totally unreachable camera). Set just before StartDecodeThreads.
+  decoder_start_time_vector_ = std::vector<std::chrono::steady_clock::time_point>(
+      num_img_, std::chrono::steady_clock::now());
+  stream_offline_vector_.assign(num_img_, false);
+  black_substitute_logged_vector_.assign(num_img_, false);
+
+  black_frame_drm_vector_.assign(num_img_, DrmBuffer{});
+  for (size_t i = 0; i < num_img_; ++i) {
+    // Use file_sources (local) not video_sources_ — the latter is populated
+    // a few lines below. file_sources has identical contents at this point.
+    const int w = file_sources[i].width  > 0 ? file_sources[i].width  : 2560;
+    const int h = file_sources[i].height > 0 ? file_sources[i].height : 1440;
+    if (drm_alloc_nv12(w, h, black_frame_drm_vector_[i]) != 0) {
+      Logger::GetInstance().LogError(
+          "[sensor_data_interface] black frame DMA-BUF alloc failed for cam" +
+          std::to_string(i) + " (will retry on demand)");
+      continue;
+    }
+    FillNv12Black(black_frame_drm_vector_[i]);
+    Logger::GetInstance().Log(
+        "[sensor_data_interface] cam" + std::to_string(i) +
+        " black frame ready: " + std::to_string(w) + "x" + std::to_string(h) +
+        " pitch=" + std::to_string(black_frame_drm_vector_[i].pitch));
+  }
+  Logger::GetInstance().Log(
+      "[sensor_data_interface] stall fallback enabled: STREAM_STALL_TIMEOUT_MS=" +
+      std::to_string(stream_stall_timeout_ms_));
+
   // v3.0: 同时填 video_file_paths_ (旧 thread log 兼容) + video_sources_ (新 thread 路由).
   for (size_t i = 0; i < num_img_; ++i) {
     video_file_paths_.push_back(file_sources[i].uri);
@@ -544,6 +628,22 @@ void SensorDataInterface::StartDecodeThreads() {
           decoder_ready_vector_[i] = true;
           decoder_finished_vector_[i] = false;
           decoded_frames_since_report_[i]++;
+          // v3.x.x (2026-07-10): record last-frame time so get_frame_vector
+          // can detect stalls. Updated under decode_stats_mutex_ alongside
+          // the FPS counters (same critical section).
+          last_frame_time_vector_[i] = std::chrono::steady_clock::now();
+          // v3.x.x: recovery — if we were in stall state, log + flip online.
+          // We hold decode_stats_mutex_ here (same critical section as the
+          // timestamp + FPS counter), so a plain bool read+write is race-free.
+          if (stream_offline_vector_[i]) {
+            stream_offline_vector_[i] = false;
+            // Reset log-once flag so a subsequent stall logs a fresh line.
+            black_substitute_logged_vector_[i] = false;
+            Logger::GetInstance().Log(
+                "[decoder " + std::to_string(i) +
+                "] stream RECOVERED, resuming real frames");
+            stitch_status::set_online(static_cast<int>(i), 1);
+          }
 
           const auto now = std::chrono::steady_clock::now();
           const std::chrono::duration<double> elapsed =
@@ -621,7 +721,117 @@ void SensorDataInterface::RecordVideos() {
 void SensorDataInterface::get_frame_vector(std::vector<QueuedFrame>& frame_vector) {
   frame_vector.resize(num_img_);
   for (size_t i = 0; i < num_img_; ++i) {
+    // v3.x.x (2026-07-10): stall detection — substitute black if no frame
+    // has arrived for > stream_stall_timeout_ms_. Without this, a dead RTSP
+    // stream causes get_frame_vector to block forever because WatchdogLoop
+    // reconnects in 100ms cycles and never sets finished=true.
+    //
+    // Two stall flavours (camera 3 stuck on EOS in the field is case (a)):
+    //   (a) decoder NEVER produced a frame (totally unreachable camera):
+    //       last_frame_time_vector_[i] stays at time_point::max() sentinel;
+    //       gate on (now - decoder_start_time) > timeout. This catches the
+    //       "decoder spins on EOS / pull fail forever" scenario that
+    //       decoder_ready_vector_[i]-based gates miss.
+    //   (b) decoder produced frames then went silent: last_frame_time goes
+    //       stale while decoder_ready=true.
+    //
+    // The check fires both BEFORE the wait loop (so a stalled cam is
+    // detected on the first iteration) AND INSIDE the wait loop (so a cam
+    // that becomes stalled while we're already waiting is detected on a
+    // subsequent iteration — this matters because the very first
+    // get_image_vector call comes from the bootstrap phase within ~100ms
+    // of decoder start, well before the stall timeout has elapsed).
+    auto check_stall_and_substitute = [&]() -> bool {
+      bool finished = false;
+      std::chrono::steady_clock::time_point last_ts =
+          std::chrono::steady_clock::time_point::min();
+      std::chrono::steady_clock::time_point start_ts =
+          std::chrono::steady_clock::time_point::min();
+      {
+        std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
+        finished  = decoder_finished_vector_[i];
+        last_ts   = last_frame_time_vector_[i];
+        start_ts  = decoder_start_time_vector_[i];
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      const bool started_long_enough =
+          start_ts != std::chrono::steady_clock::time_point::min()
+          && (now - start_ts) > std::chrono::milliseconds(stream_stall_timeout_ms_);
+      const bool never_produced =
+          last_ts == std::chrono::steady_clock::time_point::max();
+      const bool last_is_stale =
+          !never_produced
+          && (now - last_ts) > std::chrono::milliseconds(stream_stall_timeout_ms_);
+
+      const bool stalled =
+          !finished && started_long_enough && (never_produced || last_is_stale);
+
+      if (!stalled) return false;
+
+      // Take decode_stats_mutex_ to flip the offline flag and read the
+      // current value atomically (also reads black_substitute_logged_vector_).
+      bool was_offline = false;
+      {
+        std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
+        was_offline = stream_offline_vector_[i];
+        stream_offline_vector_[i] = true;
+      }
+      if (!was_offline) {
+        stitch_status::set_online(static_cast<int>(i), 0);
+        Logger::GetInstance().LogError(
+            "[decoder " + std::to_string(i) +
+            "] stream STALL: no frame > " +
+            std::to_string(stream_stall_timeout_ms_) +
+            "ms, switching to BLACK frame substitute");
+      }
+
+      if (black_frame_drm_vector_[i].fd >= 0) {
+        if (!black_substitute_logged_vector_[i]) {
+          black_substitute_logged_vector_[i] = true;
+          Logger::GetInstance().Log(
+              "[decoder " + std::to_string(i) +
+              "] substituting BLACK frame (fd=" +
+              std::to_string(black_frame_drm_vector_[i].fd) +
+              " " + std::to_string(black_frame_drm_vector_[i].width) + "x" +
+              std::to_string(black_frame_drm_vector_[i].height) + ")");
+        }
+        QueuedFrame bf;
+        bf.storage         = QueuedFrameStorage::kBlackSubstitute;
+        bf.width           = black_frame_drm_vector_[i].width;
+        bf.height          = black_frame_drm_vector_[i].height;
+        bf.stride_w        = static_cast<int>(black_frame_drm_vector_[i].pitch);
+        bf.stride_h        = black_frame_drm_vector_[i].height;
+        bf.dma_buf_fd      = black_frame_drm_vector_[i].fd;
+        bf.pixel_format    = 23;   // AV_PIX_FMT_NV12 (matches kDrmPrime path)
+        bf.drm_layer_count = 1;
+        frame_vector[i] = std::move(bf);
+        return true;
+      }
+      // alloc failed earlier; do NOT break — fall through to blocking wait
+      // (this branch only triggers if drm_alloc_nv12 failed at startup, which
+      // is logged separately. Don't deadlock the program in that case.)
+      Logger::GetInstance().LogError(
+          "[decoder " + std::to_string(i) +
+          "] stall detected but black frame not allocated; falling back to "
+          "blocking wait (program may hang if cam is truly dead)");
+      return false;
+    };
+
+    if (check_stall_and_substitute()) {
+      continue;  // next channel — do NOT block on the queue
+    }
+
     while (true) {
+      // v3.x.x: re-check stall each iteration. Without this, a cam that's
+      // stalled after we entered the wait loop would block forever, because
+      // the stall timeout is measured from decoder_start_time, not from
+      // get_frame_vector entry — and the bootstrap can call us before
+      // the timeout has elapsed.
+      if (check_stall_and_substitute()) {
+        break;
+      }
+
       bool has_frame = false;
       bool decoder_finished = false;
       QueuedFrame queued_frame;
@@ -703,6 +913,28 @@ bool SensorDataInterface::ConvertQueuedFrameToDmabuf(const QueuedFrame& queued_f
     } else {
       frame.owner = queued_frame.hardware_frame;
     }
+    return true;
+  }
+
+  // v3.x.x (2026-07-10): stall fallback — black NV12 DMA-BUF substitute.
+  // Same shape as kDrmPrime (fd + width/height + stride), but no owner:
+  // the DMA-BUF's lifetime is owned by SensorDataInterface::black_frame_drm_vector_
+  // and outlives this frame, so we leave both owner shared_ptrs null. The
+  // stitcher reads fd + geometry only and never dereferences the owners.
+  if (queued_frame.storage == QueuedFrameStorage::kBlackSubstitute) {
+    if (queued_frame.dma_buf_fd < 0) {
+      Logger::GetInstance().LogError(
+          "[decoder " + std::to_string(channel_index) +
+          "] BLACK substitute frame missing dma_buf_fd.");
+      return false;
+    }
+    frame.fd = queued_frame.dma_buf_fd;
+    frame.width = queued_frame.width;
+    frame.height = queued_frame.height;
+    frame.stride_w = queued_frame.stride_w > 0 ? queued_frame.stride_w : queued_frame.width;
+    frame.stride_h = queued_frame.stride_h > 0 ? queued_frame.stride_h : queued_frame.height;
+    frame.owner_gst_sample = nullptr;
+    frame.owner = nullptr;
     return true;
   }
 

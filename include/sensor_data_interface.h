@@ -21,6 +21,8 @@
 
 #include "gst_mpp_decoder.h"
 
+#include "drm_allocator.h"
+
 extern "C" {
 struct AVFrame;
 struct _GstSample;
@@ -30,6 +32,12 @@ enum class QueuedFrameStorage {
     kEmpty = 0,
     kSoftwareNV12 = 1,
     kDrmPrime = 2,
+    // v3.x.x (2026-07-10): stall fallback — black NV12 DMA-BUF substitute
+    // returned by get_frame_vector when a stream has not produced a frame
+    // for > STREAM_STALL_TIMEOUT_MS. flows through the same code path as
+    // kDrmPrime, but without a GstSample/AVFrame owner (lifetime owned by
+    // SensorDataInterface::black_frame_drm_vector_).
+    kBlackSubstitute = 3,
 };
 
 // v3.0 (2026-07-08) 输入源描述. 加载自 params/camera_sources.yaml.
@@ -143,6 +151,34 @@ class SensorDataInterface {
     std::mutex decode_stats_mutex_;
     std::atomic<bool> stop_requested_;
     std::atomic<bool> decode_threads_started_;
+
+    // v3.x.x (2026-07-10): stall fallback — black-frame substitute for failed
+    // RTSP streams. Without this, a dead RTSP stream causes get_frame_vector
+    // to block forever (WatchdogLoop reconnects in 100ms cycles and never sets
+    // decoder_finished_vector_[i]=true).
+    //
+    // Two stall flavours:
+    //   (a) decoder never produced any frame (totally unreachable camera):
+    //       detected via decoder_start_time_vector_[i] — if (now - start) > timeout
+    //       AND last_frame_time_vector_[i] is still the time_point::max() sentinel,
+    //       the camera is dead.
+    //   (b) decoder produced frames then went silent (mid-stream failure):
+    //       detected via last_frame_time_vector_[i] going stale.
+    //
+    // On recovery (decode thread successfully pushes a frame while offline), the
+    // stall flag is cleared and the timestamp is updated, so recovery is
+    // automatic when the stream comes back.
+    //
+    // stream_offline_vector_ is std::vector<bool> (not std::vector<std::atomic<bool>>)
+    // because all writes/reads are already serialized under decode_stats_mutex_,
+    // and std::atomic<bool> is neither copy- nor move-constructible so it can't
+    // live in a std::vector (which requires reserve() / reallocation support).
+    std::vector<DrmBuffer> black_frame_drm_vector_;
+    std::vector<std::chrono::steady_clock::time_point> last_frame_time_vector_;
+    std::vector<std::chrono::steady_clock::time_point> decoder_start_time_vector_;
+    std::vector<bool> stream_offline_vector_;
+    std::vector<bool> black_substitute_logged_vector_;
+    int stream_stall_timeout_ms_ = 3000;
 };
 
 #endif  // IMAGE_STITCHING_SENSOR_DATA_INTERFACE_H
