@@ -1,103 +1,166 @@
-// camera_intrinsics.cc - 实现 camchain yaml 加载 + 畸变 map 生成 (v3.x.2, 2026-07-09;
-//                                                                 v3.x.4 修复 2026-07-09)
+// camera_intrinsics.cc - 实现 camchain yaml 加载 + 畸变 map 生成 (v3.x.6, 2026-07-09)
 //
 // 路径:
-//   LoadCamchain(path) → 读 OpenCV FileStorage KMat / D / RMat / width / height
+//   LoadCamchain(path) → 纯文本 regex 提取 KMat/D/RMat/width/height (不再用 cv::FileStorage)
 //   BuildUndistortMap(ci, live_w, live_h) → initUndistortRectifyMap 输出 CV_32FC1
 //
-// K 缩放逻辑 (与 gpu-based-image-stitching-dataset/src/stitching_param_generater.cc
-//   ::InitUndistortMap 一致):
-//   live 与 calib 同分辨率 → 直接用
-//   live > calib → 按比例放大 fx/fy/cx/cy
-//   live < calib → 缩小 (本项目不会出现)
+// v3.x.6 (2026-07-09): 板端 OpenCV 4.5.4 binary 上 cv::FileStorage 解析 camchain_*.yaml
+//   抛 'isMap() in operator[]' cv::Exception (v3.x.4/v3.x.5 已经包 try/catch, 但 6 路
+//   camchain 全部 loaded 0/6). Standalone C++ 测试用同一份 yaml + 同一份 OpenCV 链接能读
+//   成功, 怀疑是 binary 启动早期 RTSP/GLES/some lib 干扰 OpenCV 内部 parser state.
 //
-// v3.x.4 (2026-07-09) 修复: 之前 LoadCamchain 用 cv::FileStorage fs; + fs.open(...) 两步
-//   + 对 KMat/D/RMat 做 cv::FileNode::empty() 过激检查 + 内层 try/catch 包裹. 在板端
-//   OpenCV 4.5.4 上, 这个组合在 binary 里 6 路 cam 全部返回 false, 而 standalone C++ 测试
-//   程序读同一个 yaml 文件 OK. 怀疑 empty() 检查在 !!opencv-matrix tag 后对 sequence 类型
-//   的 FileNode 行为不一致 (KMat 后 parser 进入 matrix-tag state, D 是 sequence 落回 map 时
-//   empty() 可能误报). 改成和原版 InitUndistortMap 一致的写法: cv::FileStorage 构造 +
-//   直接 operator[] 读, 不加 empty() check. 只在最后做 K 形状 sanity check.
-
+//   修法: 完全绕开 cv::FileStorage. camchain yaml 格式非常固定 (OpenCV 标准
+//   `!!opencv-matrix` 风格), 用 std::ifstream + std::regex 提取 K.data (9 个 double),
+//   D (任意长度 double seq), RMat.data (9 个 double), width/height (int). 这样:
+//     * 不依赖 OpenCV 的 yaml 解析器, 任何平台/任何 OpenCV 版本一致
+//     * 错误直接走 std::regex_search 失败返回, 无 try/catch 噪音
+//   行格式: KMat 块 = "data: [a, b, c, ...]" 单行, regex 抓数字.
 #include "camera_intrinsics.h"
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
 
+#include <fstream>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace camera_intrinsics {
 
+namespace {
+
+// 找第一个匹配 key "K" / "D" / "R" / "width" / "height" 后面的 [..] 或 : <num>,
+// 把里面的所有浮点数 / 整数返回. 如果 key 后面不是 seq, 返回空.
+// pattern 例子:
+//   "D: [-0.35, 0.22, ...]"     -> [-0.35, 0.22, ...]
+//   "KMat: ... data: [a, b, ...]" -> 在 KMat 块内找 data: [..]
+//   "width: 1920"               -> [1920]
+// 简化: 用 std::regex 在全文搜 "key\\s*:\\s*\\[[^\\]]*\\]" 或 "key\\s*:\\s*-?[0-9.]+",
+// 取出数字 token.
+
+bool ExtractNumberList(const std::string& text, const std::string& key,
+                       std::vector<double>* out) {
+    // 顺序匹配:
+    //   1) "key: [a, b, c, ...]"
+    //   2) "key: <scalar>"        (单值)
+    // 走两种 regex, 第一种命中就用, 否则第二种.
+    static const std::regex seq_re(
+        "(?:" + key + ")\\s*:\\s*\\[([^\\]]*)\\]",
+        std::regex::ECMAScript);
+    static const std::regex scalar_re(
+        "(?:" + key + ")\\s*:\\s*(-?[0-9]+\\.?[0-9]*(?:[eE][-+]?[0-9]+)?)",
+        std::regex::ECMAScript);
+
+    std::smatch m;
+    if (std::regex_search(text, m, seq_re)) {
+        const std::string& body = m[1].str();
+        std::regex num_re("-?[0-9]+\\.?[0-9]*(?:[eE][-+]?[0-9]+)?");
+        for (auto it = std::sregex_iterator(body.begin(), body.end(), num_re);
+             it != std::sregex_iterator(); ++it) {
+            try {
+                out->push_back(std::stod((*it).str()));
+            } catch (...) {
+                return false;
+            }
+        }
+        return !out->empty();
+    }
+    if (std::regex_search(text, m, scalar_re)) {
+        try {
+            out->push_back(std::stod(m[1].str()));
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+// KMat / RMat 是 !!opencv-matrix 块, 格式:
+//   KMat: !!opencv-matrix
+//       rows: 3
+//       cols: 3
+//       dt: d
+//       data: [a, b, c, ...]
+// 找 "key\n... data: [...]" 的 data: [...] 子串.
+bool ExtractMatrixData(const std::string& text, const std::string& key,
+                       std::vector<double>* out) {
+    // 找 "<key>" 后面紧跟 "data: [...]"
+    std::regex re(
+        "(?:" + key + ")[\\s\\S]*?data\\s*:\\s*\\[([^\\]]*)\\]",
+        std::regex::ECMAScript);
+    std::smatch m;
+    if (!std::regex_search(text, m, re)) return false;
+    const std::string& body = m[1].str();
+    std::regex num_re("-?[0-9]+\\.?[0-9]*(?:[eE][-+]?[0-9]+)?");
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), num_re);
+         it != std::sregex_iterator(); ++it) {
+        try {
+            out->push_back(std::stod((*it).str()));
+        } catch (...) {
+            return false;
+        }
+    }
+    return !out->empty();
+}
+
+}  // namespace
+
 bool LoadCamchain(const std::string& yaml_path, CamchainIntrinsics* out) {
     if (out == nullptr) return false;
     out->valid = false;
 
-    cv::FileStorage fs;
-    try {
-        fs.open(yaml_path, cv::FileStorage::READ);
-    } catch (const cv::Exception& e) {
-        // 文件不存在 / 不可读 / 解析失败 — 当缺 yaml 处理, 不让 boot 阶段 terminate.
-        (void)e;
-        return false;
-    } catch (const std::exception& e) {
-        (void)e;
-        return false;
-    }
-    if (!fs.isOpened()) return false;
+    std::ifstream ifs(yaml_path);
+    if (!ifs.is_open()) return false;
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+    const std::string text = ss.str();
+    if (text.empty()) return false;
 
-    // v3.x.5 (2026-07-09): 板端 OpenCV 4.5.4 binary 里 `cv::FileStorage fs(path, READ)` +
-    //   `fs["KMat"] >> K` 在某些 yaml 上会抛 'isMap() in operator[]' (fs 处于非 map state
-    //   时 operator[] 触发 assertion). 单独的小测试程序读同一份 yaml 不报, 但 image-stitching
-    //   binary 一启动就崩. 直接在 operator[] 周围包 try/catch, 跟空文件同等待遇 (当 missing
-    //   处理) — 不再 align 原版 InitUndistortMap 的"裸 open"写法.
-    cv::Mat K, D, R;
-    try {
-        fs["KMat"] >> K;
-        fs["D"] >> D;
-        fs["RMat"] >> R;
-    } catch (const cv::Exception& e) {
-        // 板端常踩: 'isMap() in operator[]' (fs 解析器进入 matrix-tag state 后没回到 map).
-        // 让上层当 missing/invalid 处理, 不掩盖问题 (log 在调用方打).
-        (void)e;
-        return false;
-    } catch (const std::exception& e) {
-        (void)e;
-        return false;
-    }
+    // 1. KMat.data (9 double) → 3x3 CV_64F
+    std::vector<double> kvec;
+    if (!ExtractMatrixData(text, "KMat", &kvec) || kvec.size() != 9) return false;
+    cv::Mat K(3, 3, CV_64F);
+    for (int i = 0; i < 9; ++i) K.at<double>(i / 3, i % 3) = kvec[i];
 
-    // Sanity check: K 必须是 3x3, D 必须非空. R 缺则用单位阵 (cam0 即此情况).
-    if (K.empty() || K.rows != 3 || K.cols != 3) return false;
-    if (D.empty()) return false;
+    // 2. D (任意长度 double seq, 通常 4 或 5) → Nx1 CV_64F
+    std::vector<double> dvec;
+    if (!ExtractNumberList(text, "D", &dvec) || dvec.empty()) return false;
+    cv::Mat D(static_cast<int>(dvec.size()), 1, CV_64F);
+    for (size_t i = 0; i < dvec.size(); ++i) D.at<double>(static_cast<int>(i), 0) = dvec[i];
 
-    out->K = K.clone();
-    out->D = D.clone();
-    if (R.empty()) {
-        out->R = cv::Mat::eye(3, 3, CV_64F);
+    // 3. RMat.data (9 double, dt: f 常见) → 3x3 CV_64F. 缺则单位阵.
+    std::vector<double> rvec;
+    cv::Mat R;
+    if (ExtractMatrixData(text, "RMat", &rvec) && rvec.size() == 9) {
+        R = cv::Mat(3, 3, CV_64F);
+        for (int i = 0; i < 9; ++i) R.at<double>(i / 3, i % 3) = rvec[i];
     } else {
-        out->R = R.clone();
+        R = cv::Mat::eye(3, 3, CV_64F);
     }
 
-    // 标定分辨率 (calib): 优先 width/height 单独字段, 缺则从 resolution 数组取.
+    // 4. width / height (int). 缺则从 resolution: [w, h] 兜底.
+    std::vector<double> wvec, hvec, resvec;
     int w = 0, h = 0;
-    try {
-        fs["width"]  >> w;
-        fs["height"] >> h;
-    } catch (const cv::Exception&) {
-        return false;
-    } catch (const std::exception&) {
-        return false;
+    if (ExtractNumberList(text, "width", &wvec) && !wvec.empty()) {
+        w = static_cast<int>(wvec[0]);
+    }
+    if (ExtractNumberList(text, "height", &hvec) && !hvec.empty()) {
+        h = static_cast<int>(hvec[0]);
     }
     if (w <= 0 || h <= 0) {
-        cv::FileNode res_node = fs["resolution"];
-        if (!res_node.empty() && res_node.isSeq() && res_node.size() >= 2) {
-            w = static_cast<int>(res_node[0]);
-            h = static_cast<int>(res_node[1]);
+        if (ExtractNumberList(text, "resolution", &resvec) && resvec.size() >= 2) {
+            w = static_cast<int>(resvec[0]);
+            h = static_cast<int>(resvec[1]);
         }
     }
+
+    out->K = K;
+    out->D = D;
+    out->R = R;
     if (w > 0) out->calib_w = w;
     if (h > 0) out->calib_h = h;
-
     out->valid = true;
     return true;
 }
