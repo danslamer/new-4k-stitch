@@ -7,3 +7,4 @@ cmake-build*
 /.ssh/*
 /diag_pngs/*
 camera_sources.yaml.bak.*
+/gpu-based-image-stitching-dataset/*

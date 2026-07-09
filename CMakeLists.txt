@@ -99,6 +99,9 @@ add_executable(${PROJECT_NAME}
     include/gst_mpp_decoder.h
     src/stitching_param_generater.cc
     include/stitching_param_generater.h
+    # v3.x.3 (2026-07-09): OpenCV stitcher pipeline 移植 — SIFT+BA+per-cam R bake
+    src/ba_estimator.cc
+    include/ba_estimator.h
     # v3.2: 帧差掩码 + 2 路 RTSP 输出
     src/frame_diff.cc
     include/frame_diff.h

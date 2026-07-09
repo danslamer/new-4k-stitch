@@ -80,6 +80,28 @@ bool RoiConfig::LoadFromFile(const std::string& path, StitchGlobalConfig& config
                 r.affine[idx] = static_cast<double>(*it);
             }
         }
+
+        // v3.x.3 (2026-07-09): OpenCV BA 输出的 K[9] / R[9] / have_ba_R.
+        //   字段缺失 → 默认值 (placeholder K + 单位阵 R + have_ba_R=false) — 老 yaml 兼容.
+        cv::FileNode K_node = cam_node["K"];
+        if (!K_node.empty() && K_node.size() == 9) {
+            int idx = 0;
+            for (cv::FileNodeIterator it = K_node.begin();
+                 it != K_node.end() && idx < 9; ++it, ++idx) {
+                r.K[idx] = static_cast<double>(*it);
+            }
+        }
+        cv::FileNode R_node = cam_node["R"];
+        if (!R_node.empty() && R_node.size() == 9) {
+            int idx = 0;
+            for (cv::FileNodeIterator it = R_node.begin();
+                 it != R_node.end() && idx < 9; ++it, ++idx) {
+                r.R[idx] = static_cast<double>(*it);
+            }
+        }
+        if (!cam_node["have_ba_R"].empty()) {
+            r.have_ba_R = static_cast<int>(cam_node["have_ba_R"]) != 0;
+        }
     }
 
     fs.release();
@@ -135,6 +157,16 @@ bool RoiConfig::SaveToFile(const std::string& path, const StitchGlobalConfig& co
                           << config.camera_rois[i].affine[3]
                           << config.camera_rois[i].affine[4]
                           << config.camera_rois[i].affine[5] << "]";
+        // v3.x.3 (2026-07-09): OpenCV BA 输出 K/R (3x3 行主序) + have_ba_R 标记.
+        //   总是写, 老 yaml 加载时 K/R 缺失直接用默认值, 不破坏 round-trip.
+        const CameraRoiRect& r = config.camera_rois[i];
+        fs << "K" << "[" << r.K[0] << r.K[1] << r.K[2]
+                       << r.K[3] << r.K[4] << r.K[5]
+                       << r.K[6] << r.K[7] << r.K[8] << "]";
+        fs << "R" << "[" << r.R[0] << r.R[1] << r.R[2]
+                       << r.R[3] << r.R[4] << r.R[5]
+                       << r.R[6] << r.R[7] << r.R[8] << "]";
+        fs << "have_ba_R" << (r.have_ba_R ? 1 : 0);
         fs << "}";
     }
 

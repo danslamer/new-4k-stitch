@@ -64,8 +64,15 @@ void FrameDiff::Reset() {
     has_prev_ = false;
 }
 
-cv::Mat FrameDiff::ComputeMask(const NV12Frame& current) {
+cv::Mat FrameDiff::ComputeMask(const NV12Frame& current,
+                              std::vector<cv::Point2f>* centroids_out) {
     if (current.empty()) return cv::Mat();
+
+    // v3.2.1: 每次调用前清空输出, 保证第一次调用 (没 prev_) 时 centroid 列表也为空,
+    //   调用方拿到的 centroids 严格对应"本帧检测到的运动块".
+    if (centroids_out != nullptr) {
+        centroids_out->clear();
+    }
 
     cv::Mat curr_bgr = Nv12DmaBufToBgr(current);
     if (curr_bgr.empty()) return cv::Mat();
@@ -89,14 +96,30 @@ cv::Mat FrameDiff::ComputeMask(const NV12Frame& current) {
             red_layer.setTo(cv::Scalar(0, 0, 255), bin_mask);
             cv::addWeighted(mask_bgr, 1.0, red_layer, 0.7, 0, mask_bgr);
         }
-        if (cfg_.draw_bboxes) {
+        // v3.2.1 (2026-07-09): 一次 findContours 同时服务 bbox 绘制和 centroid 提取.
+        //   之前 bbox 路径独立 findContours 一次, 现在统一一次, 不增加 CPU 开销.
+        //   没有 draw_bboxes 也没 centroids_out 时, 不调 findContours, 省 1-3ms.
+        const bool need_contours = cfg_.draw_bboxes || (centroids_out != nullptr);
+        if (need_contours) {
             std::vector<std::vector<cv::Point>> contours;
             cv::findContours(bin_mask, contours, cv::RETR_EXTERNAL,
                               cv::CHAIN_APPROX_SIMPLE);
             for (const auto& contour : contours) {
-                cv::Rect bbox = cv::boundingRect(contour);
-                if (bbox.area() >= cfg_.bbox_min_area) {
+                const double area = cv::contourArea(contour);
+                if (area < static_cast<double>(cfg_.bbox_min_area)) {
+                    continue;
+                }
+                if (cfg_.draw_bboxes) {
+                    cv::Rect bbox = cv::boundingRect(contour);
                     cv::rectangle(mask_bgr, bbox, cv::Scalar(0, 0, 255), 3);
+                }
+                if (centroids_out != nullptr) {
+                    cv::Moments m = cv::moments(contour);
+                    if (m.m00 > 0.0) {
+                        centroids_out->emplace_back(
+                            static_cast<float>(m.m10 / m.m00),
+                            static_cast<float>(m.m01 / m.m00));
+                    }
                 }
             }
         }

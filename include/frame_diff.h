@@ -10,6 +10,9 @@
 //   - 应用: 作为独立 RTSP 流 (/stitch_diff) 输出, 让操作员/算法看到动态区域
 //   - 性能: NV12→BGR 转换 ~5-15ms (aarch64, 2K), absdiff+threshold+findContours ~3-8ms,
 //     在 30 FPS 预算 (33ms) 内可行; 用户可在 yaml 调低 fps 节流
+//
+// v3.2.1 (2026-07-09): ComputeMask 增加可选 centroids 输出, 上层可在
+//   stitched 原图上画红色圆点. 复用 findContours 结果, 不增加额外 CPU 开销.
 
 #ifndef FRAME_DIFF_H
 #define FRAME_DIFF_H
@@ -41,7 +44,10 @@ class FrameDiff {
     //   - 第一次调用 (没有 prev): 输出 dimmed 当前帧, 同时缓存 prev.
     //   - 后续调用: 输出带红色变动高亮 + 矩形框的 BGR 图.
     //   - 输入为空 (empty()) 时返回空 cv::Mat.
-    cv::Mat ComputeMask(const NV12Frame& current);
+    //   - centroids_out (可选): 非空时填入每个面积 >= bbox_min_area 的连通块的几何质心,
+    //     用于在原图上画红色圆点 (v3.2.1). 与 bbox 共用同一次 findContours, 不增加 CPU 开销.
+    cv::Mat ComputeMask(const NV12Frame& current,
+                        std::vector<cv::Point2f>* centroids_out = nullptr);
 
     void Reset();
     bool HasPrevious() const { return has_prev_; }

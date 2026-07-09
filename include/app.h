@@ -12,6 +12,7 @@
 #include "output_streams.h"
 #include "gst_rtsp_server.h"
 #include "roi_yaml_watcher.h"
+#include "ba_estimator.h"
 
 #include <memory>
 #include <vector>
@@ -124,6 +125,13 @@ class App {
     //   SetWarpData 会跳过, 走无畸变路径.
     std::vector<cv::Mat> undist_xmap_vector_;
     std::vector<cv::Mat> undist_ymap_vector_;
+
+    // v3.x.3 (2026-07-09): SIFT+BA pipeline 结果.
+    //   ba_succeeded_=true 时用 ba_result_ 喂 BuildStitcherWarpMaps, false 时回退到
+    //   BuildAffineWarpData. 默认 false 保持 v3.x.2 行为, yaml 重启时 InitFromConfig
+    //   会根据 cam[*].have_ba_R 决定是否设 true.
+    bool ba_succeeded_ = false;
+    ba_estimator::BaResult ba_result_;
 };
 
 #endif

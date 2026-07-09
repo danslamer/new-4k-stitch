@@ -1,0 +1,32 @@
+%YAML:1.0
+cam_overlaps: []
+camera_model: "pinhole"
+focal: 1.794124795e+03
+D: [-0.3522925, 0.22636671, 0.00239041, -0.00362517, -0.41366833]
+KMat: !!opencv-matrix
+    rows:3
+    cols:3
+    dt:d
+    data:[1792.83230, 0, 1360.88856, 0, 1795.41729, 669.047743, 0, 0, 1]
+distortion_model: radtan
+RMat: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: f
+   data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+EYEMat: !!opencv-matrix
+    rows:3
+    cols:3
+    dt:u
+    data:[1,0,0,0,1,0,0,0,1]
+# 注: 老 yaml 的 K flat 用的是非标准顺序 [fx, 0, fy, 0, cx, cy, 0, 0, 1], loader 不读, 但
+# 保留以便 yaml 看的语义明确. 新相机标定是单 cam (没有相对 cam0 的外参), 这里给单位阵.
+K: [1792.83230, 0, 1795.41729, 0, 1360.88856, 669.047743, 0, 0, 1]
+R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+# 标定分辨率 (camera_intrinsics.cc 会按此缩放到 live 2560x1440):
+#   用户主点 (1360.89, 669.05) 接近 2560x1440 中心 (1280, 720), 偏离 6% 比例合理;
+#   若用 1920x1080 主点会偏离中心 20%+ 比例异常. 这里用 2560x1440.
+width: 2560
+height: 1440
+resolution: [2560, 1440]
+rostopic: "/cam5/image_raw"

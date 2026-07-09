@@ -20,6 +20,13 @@ struct CameraRoiRect {
     int width = 0;
     int height = 0;
     double affine[6] = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+    // v3.x.3 (2026-07-09): OpenCV stitcher pipeline 移植 — 每路 cam 持久化 SIFT+BA 算出的
+    //   3x3 K (内参, 占位/标定, 行主序) 和 3x3 R (相机旋转, BA 输出). have_ba_R = true 时
+    //   表示该 cam 的 R 是 BA 跑的, 可以走 AffineWarper::buildMaps 路径.
+    //   缺省值占位 = Intrinsics::fill_K (fx=1027 fy=1378 cx=1280 cy=720) + 单位阵 R.
+    double K[9] = {1027.0, 0.0, 1280.0, 0.0, 1378.0, 720.0, 0.0, 0.0, 1.0};
+    double R[9] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+    bool have_ba_R = false;
     bool valid = false;
 
     CameraRoiRect() = default;
