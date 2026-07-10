@@ -58,14 +58,21 @@ const FrameDiffOverlay = (() => {
   }
 
   /**
-   * 二值 mask 上跑 4 连通 flood-fill, 返回几何外接矩形数组 (work 坐标).
+   * 二值 mask 上跑 4 连通 flood-fill, 把所有 ≥ minArea 的连通块合并成唯一一个外接矩形.
    *   - mask[i] 0/255
    *   - 内部栈用 stack-based BFS, 不递归 (避免深度爆炸).
    *   - 单纯扫描 + 标记, 480×408 上耗时 < 5ms (有运动时多一些, 也 < 30ms).
+   *
+   * v3.x (聚合): 跟踪场景默认画面中只有一个主体在动, 多框显得零碎.
+   *   把所有连通块的最小/最大 x/y 取并集, 总面积累加, 算成一个 outer box.
+   *   - 没有候选块 → 返回空数组.
+   *   - 只有 1 个块 → 直接返回它.
+   *   - 多个块 → 把它们"打包"成一个 {x, y, w, h, area} 元素.
+   *   MAX_BOXES 限制语义变成"只画一个外接框", 所以下面省掉 slice.
    */
   function findBoundingBoxes(mask, w, h, minArea) {
     const visited = new Uint8Array(mask.length);
-    const boxes = [];
+    const blobs = [];
     const stack = [];
 
     for (let y = 0; y < h; y++) {
@@ -100,14 +107,42 @@ const FrameDiffOverlay = (() => {
         }
 
         if (area >= minArea) {
-          boxes.push({ x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, area });
+          blobs.push({ minX, maxX, minY, maxY, area });
         }
       }
     }
 
-    // 按面积降序, 限定最大数量, 防止场景扰动刷屏
-    boxes.sort((a, b) => b.area - a.area);
-    return boxes.slice(0, MAX_BOXES);
+    if (blobs.length === 0) return [];
+    if (blobs.length === 1) {
+      const b = blobs[0];
+      return [{
+        x: b.minX,
+        y: b.minY,
+        w: b.maxX - b.minX + 1,
+        h: b.maxY - b.minY + 1,
+        area: b.area
+      }];
+    }
+
+    // 多块聚合: 一个 outer box 覆盖全部运动像素, 总面积 = 各块之和.
+    let outMinX = blobs[0].minX, outMaxX = blobs[0].maxX;
+    let outMinY = blobs[0].minY, outMaxY = blobs[0].maxY;
+    let totalArea = 0;
+    for (const b of blobs) {
+      if (b.minX < outMinX) outMinX = b.minX;
+      if (b.maxX > outMaxX) outMaxX = b.maxX;
+      if (b.minY < outMinY) outMinY = b.minY;
+      if (b.maxY > outMaxY) outMaxY = b.maxY;
+      totalArea += b.area;
+    }
+    return [{
+      x: outMinX,
+      y: outMinY,
+      w: outMaxX - outMinX + 1,
+      h: outMaxY - outMinY + 1,
+      area: totalArea,
+      blobs: blobs.length   // 携带原始块数, 给标签用 "运动 ≈{area}px · {n}块合并"
+    }];
   }
 
   /** 把 work 坐标 boxes 画到 overlay 画布, 按 overlay.display size 缩放. */
@@ -146,8 +181,10 @@ const FrameDiffOverlay = (() => {
       ctx.strokeStyle = COLOR_STROKE;
       ctx.strokeRect(x, y, w, h);
 
-      // 标签: "运动 ≈{area}px"
-      const label = `运动 ${b.area}px`;
+      // 标签: 聚合后仍有 b.blobs (原始连通块数); 单块时省略 "· M 块合并"
+      const label = b.blobs && b.blobs > 1
+        ? `运动 ${b.area}px · ${b.blobs} 块合并`
+        : `运动 ${b.area}px`;
       const padX = 6;
       const padY = 3;
       const tw = ctx.measureText(label).width;
@@ -161,14 +198,19 @@ const FrameDiffOverlay = (() => {
       ctx.fillText(label, lx + padX, ly + padY);
     }
 
-    // 顶部小角标提示有多少个运动块
+    // 顶部小角标: 跟踪开启提示 (boxes 已是聚合后的 0/1, 用 b.blobs 表达原始块数).
+    const tipText = boxes.length === 0
+      ? '跟踪中 · 无运动'
+      : (boxes[0].blobs && boxes[0].blobs > 1
+          ? `跟踪中 · 运动 1 (聚合自 ${boxes[0].blobs} 块)`
+          : '跟踪中 · 运动 1');
     ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-    const tipW = 90;
+    ctx.font = '12px "Microsoft YaHei", sans-serif';
+    const tipW = Math.ceil(ctx.measureText(tipText).width) + 16;
     const tipH = 22;
     ctx.fillRect(dispW - tipW - 12, 12, tipW, tipH);
     ctx.fillStyle = '#fff';
-    ctx.font = '12px "Microsoft YaHei", sans-serif';
-    ctx.fillText(`跟踪中 · 运动 ${boxes.length}`, dispW - tipW - 4, 16);
+    ctx.fillText(tipText, dispW - tipW - 4, 16);
   }
 
   /** 让 overlay canvas 跟着 #video-preview 的实际显示尺寸, 同步 resize. */
