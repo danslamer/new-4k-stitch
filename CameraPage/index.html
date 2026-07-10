@@ -84,6 +84,7 @@
                          alt="实时拼接全景"
                          onload="onStreamLoad(this)"
                          onerror="onStreamError(this)" />
+                    <canvas class="motion-overlay hidden" id="motion-overlay"></canvas>
                     <div class="preview-placeholder">
                       <div class="preview-icon">▶</div>
                       <span>主码流预览 · 1920×1080 @ 25fps</span>
@@ -582,6 +583,30 @@
               </div>
             </div>
 
+            <!-- v3.x: 跟踪页自带视频区, 让 FrameDiffOverlay 在用户当前可见的画面上画框.
+                 home 页和跟踪页各有一个 .video-preview-area, frame-diff-overlay 选最近
+                 的那个 attach; 这样用户在哪个页都能看到实时帧差叠加. -->
+            <div class="card card-elevated">
+              <div class="card-header">
+                <span class="card-title">跟踪实时画面</span>
+                <span class="text-muted" style="font-size:12px;">开启「轨迹跟踪」后在此画面标出运动物体</span>
+              </div>
+              <div class="card-body preview-body">
+                <div class="video-preview-area tracking-preview-area stream-active" id="tracking-video-preview">
+                  <div class="preview-bg"></div>
+                  <img class="preview-stream" id="tracking-mjpeg-stream"
+                       alt="跟踪全景"
+                       onload="onStreamLoad(this)"
+                       onerror="onStreamError(this)" />
+                  <canvas class="motion-overlay hidden" id="tracking-motion-overlay"></canvas>
+                  <div class="preview-placeholder hidden">
+                    <div class="preview-icon">▶</div>
+                    <span>主码流预览 · MJPEG</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <div class="card card-elevated track-result-panel hidden" id="track-result-panel">
               <div class="card-header">
                 <span class="card-title">轨迹结果</span>
@@ -593,6 +618,19 @@
                     <span class="track-result-count">—</span>
                   </div>
                   <div class="track-result-detail" id="track-result-detail"></div>
+                </div>
+                <div class="track-result-section track-clip-section" id="track-clip-section">
+                  <div class="track-result-section-title">
+                    已保存视频片段 <span class="track-clip-count badge-live" id="track-clip-count">0</span>
+                  </div>
+                  <p class="track-clip-section-hint">每 5 秒一段, 文件名即保存时间; 上传到主板 demo/clips/.</p>
+                  <div class="track-clip-list hidden" id="track-clip-list">
+                    <!-- 动态追加: 最新在上 -->
+                  </div>
+                  <div class="track-clip-empty" id="track-clip-empty">
+                    <span class="empty-icon">🎬</span>
+                    <p>尚未保存视频片段, 开启「轨迹跟踪」后每 5 秒保存一段</p>
+                  </div>
                 </div>
                 <div class="track-result-section track-replay-section">
                   <div class="track-result-section-title">轨迹回放</div>
@@ -755,6 +793,7 @@
 
   <script src="js/app.js"></script>
   <script src="js/track-recorder.js"></script>
+  <script src="js/frame-diff-overlay.js"></script>
   <script src="js/tracking-demo.js"></script>
 </body>
 </html>

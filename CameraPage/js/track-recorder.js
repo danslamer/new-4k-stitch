@@ -68,10 +68,20 @@ const TrackRecorder = (() => {
       const res = await fetch('/api/clips/upload', { method: 'POST', body: fd });
       const json = await res.json().catch(() => ({}));
       if (res.ok && json.ok !== false) {
+        const savedName = json.name || filename;
         const kb = (blob.size / 1024).toFixed(1);
-        console.log(`[TrackRecorder] saved ${json.name || filename} (${kb} KB, ${mimeType})`);
+        console.log(`[TrackRecorder] saved ${savedName} (${kb} KB, ${mimeType})`);
         if (typeof showToast === 'function') {
-          showToast(`已保存片段 ${json.name || filename} (${mimeType.split(';')[0]})`);
+          showToast(`已保存片段 ${savedName} (${mimeType.split(';')[0]})`);
+        }
+        // 通知跟踪页 UI 把这个文件名追加到「目标轨迹 - 已保存视频片段」列表.
+        // 失败时回调 undefined, UI 自然兜底空状态, 不影响录音循环.
+        if (typeof window.onTrackClipSaved === 'function') {
+          try {
+            window.onTrackClipSaved(savedName, blob.size, mimeType.split(';')[0], new Date());
+          } catch (e) {
+            console.warn('[TrackRecorder] onTrackClipSaved callback threw', e);
+          }
         }
       } else {
         const msg = (json && json.error) || `HTTP ${res.status}`;

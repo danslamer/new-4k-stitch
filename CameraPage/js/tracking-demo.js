@@ -207,6 +207,95 @@ const TrackingDemo = (() => {
     if (icon) icon.textContent = trackingEnabled ? '■' : '▶';
   }
 
+  /** 格式化 "HH:MM:SS" (本机时区), 给 UI 显示用. */
+  function formatTime(d) {
+    if (!(d instanceof Date)) d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  /** 把可读的文件大小渲染成 "1.2 MB" / "834.5 KB" / "123 B". */
+  function formatSize(bytes) {
+    if (!bytes || bytes < 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
+  /**
+   * 把刚保存的视频片段追加到「目标轨迹 - 已保存视频片段」列表.
+   * - 新条目置顶, 老的往下推.
+   * - 自动切走空状态, 显示 #track-clip-list.
+   * - 累计数 (badge) 自增, 但不重复追加同名条目.
+   *
+   * v3.x: 这是给 track-recorder.js 通过 window.onTrackClipSaved(name, size, mime, when) 调用的钩子.
+   *   改视频格式 / 改保存间隔不用动这里, 录制器只负责 call, UI 只负责渲染.
+   */
+  function appendClipItem(name, size, when) {
+    const list = $('track-clip-list');
+    const empty = $('track-clip-empty');
+    const counter = $('track-clip-count');
+    if (!list || !empty) return;
+
+    // 防重复: 同一文件名 (同一段重复触发 onstop 时偶发) 只追加一次
+    if (list.querySelector(`[data-clip-name="${CSS.escape(name)}"]`)) {
+      return;
+    }
+
+    const sizeText = formatSize(size);
+    const timeText = when ? formatTime(when) : formatTime(new Date());
+
+    const row = document.createElement('div');
+    row.className = 'track-clip-item';
+    row.dataset.clipName = name;
+    row.innerHTML = `
+      <span class="track-clip-item-icon" aria-hidden="true">🎞️</span>
+      <span class="track-clip-item-name" title="${name}">${name}</span>
+      <span class="track-clip-item-meta">
+        <span>${timeText}</span>
+        <span>·</span>
+        <span>${sizeText}</span>
+      </span>
+    `;
+
+    // 新片段放最前, 保持「最新在上」的视觉习惯.
+    list.insertBefore(row, list.firstChild);
+
+    // 空状态收起来, 列表亮起来.
+    empty.classList.add('hidden');
+    list.classList.remove('hidden');
+
+    // 累计计数 + 滚动到顶部, 让用户立刻看到新条目.
+    if (counter) {
+      const n = list.querySelectorAll('.track-clip-item').length;
+      counter.textContent = String(n);
+    }
+    list.scrollTop = 0;
+  }
+
+  /** 重置已保存视频片段区 (用户停录后, 不清空; 给个开关随时手动 reset). */
+  function clearClipList() {
+    const list = $('track-clip-list');
+    const empty = $('track-clip-empty');
+    const counter = $('track-clip-count');
+    if (list) {
+      list.innerHTML = '';
+      list.classList.add('hidden');
+    }
+    if (empty) empty.classList.remove('hidden');
+    if (counter) counter.textContent = '0';
+  }
+
+  /**
+   * 全局钩子: track-recorder.js 每成功上传一段就调一次.
+   * 暴露到 window 而非 IIFE 内部, 因为 track-recorder.js 不依赖 TrackingDemo,
+   * 反向依赖避免循环 (recorder 不依赖 demo, demo 也不直接引 recorder).
+   */
+  window.onTrackClipSaved = function (name, size, mime, when) {
+    if (!name) return;
+    appendClipItem(name, size, when);
+  };
+
   function setTrackingEnabled(enabled) {
     trackingEnabled = enabled;
     updateTrackingStartUI();
@@ -218,6 +307,12 @@ const TrackingDemo = (() => {
       } else {
         console.warn('[TrackingDemo] TrackRecorder 未加载, 跳过视频保存');
       }
+      // 浏览器端帧差叠加层: 把 absdiff 连通域画到 home 页的 #motion-overlay 上.
+      if (typeof FrameDiffOverlay !== 'undefined') {
+        FrameDiffOverlay.start();
+      } else {
+        console.warn('[TrackingDemo] FrameDiffOverlay 未加载, 跳过运动框');
+      }
       if (!manifestReady) loadManifest();
       else {
         renderTrackResults();
@@ -228,6 +323,10 @@ const TrackingDemo = (() => {
       // 停录: 当前段跑完这一段再退出 (保证最后一段也落到 clips/).
       if (typeof TrackRecorder !== 'undefined') {
         TrackRecorder.stop();
+      }
+      // 帧差 overlay 关闭, 清空画布并隐藏 canvas.
+      if (typeof FrameDiffOverlay !== 'undefined') {
+        FrameDiffOverlay.stop();
       }
       stopReplay();
       showToast('轨迹跟踪已停止');

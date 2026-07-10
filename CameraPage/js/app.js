@@ -273,20 +273,29 @@ function onStreamError(img) {
 
 /** 显式重新拉取 /api/stream (避免浏览器缓存旧 MPJEG 帧) */
 function reloadMjpegStream() {
-  const img = document.getElementById('mjpeg-stream');
-  if (!img) return;
-  const current = img.getAttribute('src') || '';
-  img.removeAttribute('src');
-  // 给浏览器一拍重置时间, 防止 img 同时处于 error 状态时不重新请求
-  setTimeout(() => { img.src = (current || '/api/stream') + '?t=' + Date.now(); }, 80);
+  const targets = ['mjpeg-stream', 'tracking-mjpeg-stream'];
+  for (const id of targets) {
+    const img = document.getElementById(id);
+    if (!img) continue;
+    const current = img.getAttribute('src') || '';
+    img.removeAttribute('src');
+    // 给浏览器一拍重置时间, 防止 img 同时处于 error 状态时不重新请求
+    setTimeout(() => { img.src = (current || '/api/stream') + '?t=' + Date.now(); }, 80);
+  }
 }
 
-/** DOMContentLoaded 后启动一次 stream, 部分浏览器要等 layout 完成才请求 img src. */
+/**
+ * DOMContentLoaded 后启动一次 stream, 部分浏览器要等 layout 完成才请求 img src.
+ * v3.x: 同时拉起 home 页 + tracking 页的预览 img (跟踪页的 motion overlay 也靠这个流).
+ */
 function startMjpegStream() {
-  const img = document.getElementById('mjpeg-stream');
-  if (!img) return;
-  if (!img.getAttribute('src')) {
-    img.src = '/api/stream?t=' + Date.now();
+  const targets = ['mjpeg-stream', 'tracking-mjpeg-stream'];
+  for (const id of targets) {
+    const img = document.getElementById(id);
+    if (!img) continue;
+    if (!img.getAttribute('src')) {
+      img.src = '/api/stream?t=' + Date.now();
+    }
   }
 }
 
