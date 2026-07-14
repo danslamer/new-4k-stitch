@@ -1,4 +1,4 @@
-﻿# HISTORY
+# HISTORY
 
 设计演进时间线（精简）+ **完整操作手册** + **踩过的坑**。当前活跃计划见 `NETWORK_CAMERA_PLAN.md`（v3.0 IP camera 改造）。
 
@@ -6,19 +6,19 @@
 
 ## 0. 设计演进（一句话过完）
 
-| 时点 | 关键事件 |
-|---|---|
-| 初始 | OpenCV UMat, 4K×4-cam > 200fps（1080Ti）|
-| 2026-03 | 切 4K 输入；运行时调参 env vars；KMat/RMat 改动 |
-| 2026-03-26 | **性能回归**: warp 并行改串行，FPS 50→个位；修复 |
-| 2026-04-01 | 集成 RK 硬件解码 (rkmpp + RGA)；目标转向 DMA-BUF 零拷贝 |
-| 2026-04-03 | bootstrap 用 OpenCV 特征检测 ROI → 裁剪坐标复用（无 remap, RGA 不支持）|
-| 2026-04-17 起 | SDL2 可视化调参；ROI YAML 持久化；多帧 ROI bootstrap (`NUM_BOOTSTRAP_FRAMES=3`, 阈值 0.25/0.7) |
-| 2026-06-29 | **板子选型**: rocktech RK3588 (6 路物理 MIPI 直连) 中选 |
-| 2026-06-30 | DTS 6 路 sensor 节点验证（详 §1 DTS） |
-| 2026-07-06 | **架构硬约束锁定**: 弃 FFmpeg rkmpp（vendor 不维护 + ABI 不兼容, 0 帧），改 gstreamer1.0-rockchip1 mppvideodec `dma-feature=true` |
-| 2026-07-07 | **绿条纹修复**: `mppvideodec` stride 上报偏小 → RGA + cvtColor 错位；POSIX `realpath()` 解决 yaml 路径; batch_transcode (mp4v→h264)。**6 路 100+ fps @ 100% DMA-BUF, 2×3 端到端跑通** |
-| 2026-07-08 | **v3.0**: 6 路 IP camera RTSP 改造（PoE 8+2 交换机, 镜头 2.8mm 102.5°），取代 v2.x 的本地 mp4 / MIPI 计划 |
+| 时点          | 关键事件                                                                                                                                                                                                 |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 初始          | OpenCV UMat, 4K×4-cam > 200fps（1080Ti）                                                                                                                                                                |
+| 2026-03       | 切 4K 输入；运行时调参 env vars；KMat/RMat 改动                                                                                                                                                          |
+| 2026-03-26    | **性能回归**: warp 并行改串行，FPS 50→个位；修复                                                                                                                                                  |
+| 2026-04-01    | 集成 RK 硬件解码 (rkmpp + RGA)；目标转向 DMA-BUF 零拷贝                                                                                                                                                  |
+| 2026-04-03    | bootstrap 用 OpenCV 特征检测 ROI → 裁剪坐标复用（无 remap, RGA 不支持）                                                                                                                                 |
+| 2026-04-17 起 | SDL2 可视化调参；ROI YAML 持久化；多帧 ROI bootstrap (`NUM_BOOTSTRAP_FRAMES=3`, 阈值 0.25/0.7)                                                                                                         |
+| 2026-06-29    | **板子选型**: rocktech RK3588 (6 路物理 MIPI 直连) 中选                                                                                                                                            |
+| 2026-06-30    | DTS 6 路 sensor 节点验证（详 §1 DTS）                                                                                                                                                                   |
+| 2026-07-06    | **架构硬约束锁定**: 弃 FFmpeg rkmpp（vendor 不维护 + ABI 不兼容, 0 帧），改 gstreamer1.0-rockchip1 mppvideodec `dma-feature=true`                                                                |
+| 2026-07-07    | **绿条纹修复**: `mppvideodec` stride 上报偏小 → RGA + cvtColor 错位；POSIX `realpath()` 解决 yaml 路径; batch_transcode (mp4v→h264)。**6 路 100+ fps @ 100% DMA-BUF, 2×3 端到端跑通** |
+| 2026-07-08    | **v3.0**: 6 路 IP camera RTSP 改造（PoE 8+2 交换机, 镜头 2.8mm 102.5°），取代 v2.x 的本地 mp4 / MIPI 计划                                                                                         |
 
 ---
 
@@ -26,16 +26,17 @@
 
 **6 路物理 MIPI 直连硬件 OK**, DTS 6 个 sensor 节点分布在 6 个 i2c 控制器下：
 
-| Cam | sensor 节点 | i2c 控制器 | mipi-csi2 | dphy | xvclk |
-|---|---|---|---|---|---|
-| cam1 | gc4683@31 | i2c@feaa0000 | mipi0-csi2 | csi2-dcphy0 | 0x176 |
-| cam2 | gc4683_1@31 | i2c@feab0000 | mipi1-csi2 | csi2-dcphy1 | 0x17a |
-| cam3 | gc4683_2@31 | i2c@fead0000 | mipi5-csi2 | dphy0/3（厂商不用）| 0x183 |
-| cam4 | gc4683_3@31 | i2c@fec80000 | mipi2-csi2 | csi2-dphy2 | 0x1b0 |
-| cam5 | gc4683_4@31 | i2c@feac0000 | mipi3-csi2 | csi2-dphy4 | 0x17f |
-| cam6 | gc4683_5@31 | i2c@fec90000 | mipi4-csi2 | csi2-dphy5 | 0x1b3 |
+| Cam  | sensor 节点 | i2c 控制器   | mipi-csi2  | dphy                | xvclk |
+| ---- | ----------- | ------------ | ---------- | ------------------- | ----- |
+| cam1 | gc4683@31   | i2c@feaa0000 | mipi0-csi2 | csi2-dcphy0         | 0x176 |
+| cam2 | gc4683_1@31 | i2c@feab0000 | mipi1-csi2 | csi2-dcphy1         | 0x17a |
+| cam3 | gc4683_2@31 | i2c@fead0000 | mipi5-csi2 | dphy0/3（厂商不用） | 0x183 |
+| cam4 | gc4683_3@31 | i2c@fec80000 | mipi2-csi2 | csi2-dphy2          | 0x1b0 |
+| cam5 | gc4683_4@31 | i2c@feac0000 | mipi3-csi2 | csi2-dphy4          | 0x17f |
+| cam6 | gc4683_5@31 | i2c@fec90000 | mipi4-csi2 | csi2-dphy5          | 0x1b3 |
 
 **厂商确认 intentional 缺口（不需修）**：
+
 - `csi2-dphy0` / `csi2-dphy3` `status=disabled` → 该板这 2 个 dphy 不用
 - `dovdd/dvdd/avdd-supply "supply not found"` warnings → GC4683 不用 DTS 的 supply 节点控制电压
 
@@ -63,7 +64,7 @@ make -j$(nproc)
 
 ### 2.2 FFmpeg (rkmpp) 多架构编译 — 教程坑
 
-来源：<https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation>
+来源：[https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation](https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation)
 
 **⚠️ 不要照搬教程默认 configure**：`--prefix=/usr --enable-rkmpp ...` 在多架构 Debian/Ubuntu 上会装错路径（`.so` 到 `/usr/lib/`, ld 找 `/usr/lib/aarch64-linux-gnu/`），"装上了但项目链不到，继续 fallback 系统 ffmpeg 4.4（无 rkmpp）"。
 
@@ -91,10 +92,25 @@ sudo ldconfig
 ### 2.3 SSH 连接 — 网络配置
 
 **rocktech 镜像网络模型（2026-07-06 实测）**：
+
 - **没有 `networking.service`**，ifupdown 未装
 - **NetworkManager 是唯一网络管家**
 - `/etc/network/interfaces` 不被读（触发 NM ifupdown plugin 把接口标 `unmanaged` → `nmcli con up` 报 "No suitable device found"）
 - **结论**：**任何网络配置走 `nmcli`**，**不要**动 `/etc/network/interfaces` 和 `systemctl restart networking`
+
+#### 临时连接配置（重启失效）
+
+1. 手动启用网卡并设置 IP（假设您想用 192.168.137.100）
+
+sudo ifconfig eth0 192.168.137.100 netmask 255.255.255.0 up
+
+2. 添加默认网关（根据您的网络环境调整）
+
+sudo route add default gw 192.168.137.1
+
+3. 测试能否 ping 通 PC
+
+ping 192.168.137.1   # 请替换为您的 PC 以太网实际 IP
 
 #### 以太网 + Windows ICS（推荐现场）
 
@@ -146,13 +162,13 @@ sudo nmcli connection down "MyWiFi" && sudo nmcli connection up "MyWiFi"
 
 #### 通用排错
 
-| 症状 | 处理 |
-|---|---|
-| `No route to host` | 不在同一子网；ICS 确认 PC 端 `192.168.137.1`，WiFi 确认同一 SSID |
-| `Permission denied (publickey)` | 清旧 host key: `ssh-keygen -R 192.168.137.100` |
-| `nmcli: command not found` | 镜像不带 NetworkManager，改走 wpa_supplicant |
-| `IP configuration could not be reserved` | WiFi 关联成功但 DHCP 拿不到 IP，绑静态 IP 跳过 DHCP |
-| IP 变了后 VSCode Remote 拒连 | `ssh-keygen -R <new_ip>` |
+| 症状                                       | 处理                                                              |
+| ------------------------------------------ | ----------------------------------------------------------------- |
+| `No route to host`                       | 不在同一子网；ICS 确认 PC 端`192.168.137.1`，WiFi 确认同一 SSID |
+| `Permission denied (publickey)`          | 清旧 host key:`ssh-keygen -R 192.168.137.100`                   |
+| `nmcli: command not found`               | 镜像不带 NetworkManager，改走 wpa_supplicant                      |
+| `IP configuration could not be reserved` | WiFi 关联成功但 DHCP 拿不到 IP，绑静态 IP 跳过 DHCP               |
+| IP 变了后 VSCode Remote 拒连               | `ssh-keygen -R <new_ip>`                                        |
 
 ### 2.4 账户与项目目录
 
@@ -198,11 +214,11 @@ ROI bootstrap（`BootStrapOptimalLayout`）是为**相机位置不确定**的 PC
 
 **`SKIP_BOOTSTRAP` 语义矩阵**（与用户 2026-06-30 确认）：
 
-| `USE_ROI_CONFIG` | `SKIP_BOOTSTRAP` | YAML 存在 | YAML 缺失 | 行为 |
-|---|---|---|---|---|
-| 0 | 任意 | 忽略 | 忽略 | 强制跑 bootstrap，不读 yaml（旧调试用）|
-| 1（默认）| 0（默认）| 用 yaml | 跑 bootstrap 兜底 | 旧行为，PC 调试友好 |
-| 1 | **1** | 用 yaml | **跑 bootstrap 兜底 + 警告日志** | **固定支架标准姿势** |
+| `USE_ROI_CONFIG` | `SKIP_BOOTSTRAP` | YAML 存在 | YAML 缺失                              | 行为                                    |
+| ------------------ | ------------------ | --------- | -------------------------------------- | --------------------------------------- |
+| 0                  | 任意               | 忽略      | 忽略                                   | 强制跑 bootstrap，不读 yaml（旧调试用） |
+| 1（默认）          | 0（默认）          | 用 yaml   | 跑 bootstrap 兜底                      | 旧行为，PC 调试友好                     |
+| 1                  | **1**        | 用 yaml   | **跑 bootstrap 兜底 + 警告日志** | **固定支架标准姿势**              |
 
 车载标准：`USE_ROI_CONFIG=1 SKIP_BOOTSTRAP=1 ./image-stitching`，缺文件不崩。
 
@@ -239,13 +255,13 @@ tail -f logs/image-stitching.log | grep DIAG    # 看 layout=1（单 fd）还是
 
 **诊断 `[DIAG]` 段** (`src/gst_mpp_decoder.cc:DIAG`, v2.5 新增)：
 
-| `[DIAG]` 输出 | 含义 |
-|---|---|
-| `caps: video/x-raw(memory:DMABuf),format=NV12,w=2560,h=1440` | mppvideodec 正确输出 DMA-BUF + NV12 |
-| `mem_count=1 ... dmabuf=yes fd=N` | **单 fd, Y+UV 连续, OK** |
-| `mem_count=2 fds=[Y_fd,UV_fd]` | **POTENTIAL ROOT CAUSE**：两块 DMA-BUF, 当前只取首个 fd → UV 平面丢失 → 绿条纹。修复路径：扩展 `struct GstMppFrame` 加 `int dma_buf_fd_uv; gsize offset_uv;`, 把两个 fd 都喂给 RGA / OpenCL |
-| `stride[0,1,2]=2560,2560,0` | NV12 平面 stride 正常（UV stride = Y stride, 最后一平面 padding 0）|
-| `offset[0,1,2]=0,Y*H,0` | UV offset = Y plane size, NV12 标准布局 |
+| `[DIAG]` 输出                                                | 含义                                                                                                                                                                                                    |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `caps: video/x-raw(memory:DMABuf),format=NV12,w=2560,h=1440` | mppvideodec 正确输出 DMA-BUF + NV12                                                                                                                                                                     |
+| `mem_count=1 ... dmabuf=yes fd=N`                            | **单 fd, Y+UV 连续, OK**                                                                                                                                                                          |
+| `mem_count=2 fds=[Y_fd,UV_fd]`                               | **POTENTIAL ROOT CAUSE**：两块 DMA-BUF, 当前只取首个 fd → UV 平面丢失 → 绿条纹。修复路径：扩展 `struct GstMppFrame` 加 `int dma_buf_fd_uv; gsize offset_uv;`, 把两个 fd 都喂给 RGA / OpenCL |
+| `stride[0,1,2]=2560,2560,0`                                  | NV12 平面 stride 正常（UV stride = Y stride, 最后一平面 padding 0）                                                                                                                                     |
+| `offset[0,1,2]=0,Y*H,0`                                      | UV offset = Y plane size, NV12 标准布局                                                                                                                                                                 |
 
 **手动诊断**：`bash tools/diagnose_pipeline.sh [--all]`（yaml + ffprobe + gst-inspect + gst-launch 烟测，一眼定 codec）
 
@@ -274,6 +290,7 @@ tail -f logs/image-stitching.log | grep DIAG    # 看 layout=1（单 fd）还是
 ### ⚫ vendor SDK ffmpeg 不一定带 libx264
 
 板上 RK 自定义 ffmpeg 只 `--enable-rkmpp` 不带 sw encoder, 无法转码 dataset。**data 转码方案**：
+
 - sudo `apt install x264` 装 CLI，写 `.264` → mp4 muxer
 - 或 `tools/batch_transcode_to_h264.sh`（项目已用 ffmpeg + libx264 sw encoder）
 
@@ -341,14 +358,14 @@ Y 平面 + 交织 UV。`stride_w`/`stride_h` 可能 ≠ `width`/`height`（查 `
 
 ## 4. 调试开关速查
 
-| 变量 | 默认 | 含义 |
-|---|---|---|
-| `SAVE_STITCH_FRAMES` | 1 | 落盘拼接结果图；**性能测时置 0** |
-| `SAVE_DIAGNOSTIC_FRAMES` | 1 | 落盘诊断图（ROI 置信度等）|
-| `SAVE_FRAME_INTERVAL` | 30 | 保存间隔（帧）|
-| `DIAGNOSTIC_FRAME_LIMIT` | 3 | 诊断图上限 |
-| `STITCH_DEBUG_LEVEL` | 0 | 拼接调试 verbosity |
-| `RK_GLES_WARPER_DEBUG_LEVEL` | 0 | GLES warp 调试 verbosity |
+| 变量                           | 默认 | 含义                                   |
+| ------------------------------ | ---- | -------------------------------------- |
+| `SAVE_STITCH_FRAMES`         | 1    | 落盘拼接结果图；**性能测时置 0** |
+| `SAVE_DIAGNOSTIC_FRAMES`     | 1    | 落盘诊断图（ROI 置信度等）             |
+| `SAVE_FRAME_INTERVAL`        | 30   | 保存间隔（帧）                         |
+| `DIAGNOSTIC_FRAME_LIMIT`     | 3    | 诊断图上限                             |
+| `STITCH_DEBUG_LEVEL`         | 0    | 拼接调试 verbosity                     |
+| `RK_GLES_WARPER_DEBUG_LEVEL` | 0    | GLES warp 调试 verbosity               |
 
 **性能测标准姿势**：`SAVE_STITCH_FRAMES=0 SAVE_DIAGNOSTIC_FRAMES=0 ./image-stitching`
 
@@ -358,7 +375,7 @@ Y 平面 + 交织 UV。`stride_w`/`stride_h` 可能 ≠ `width`/`height`（查 `
 
 - DMA-BUF 是内核内存管理机制, 设备可直接访问物理内存而无需复制
 - 数据始终在同一块物理内存, 各设备操作完后通过同步机制（fence 等）互相告知"我读/写完了", 避免数据竞争
-- 参考：<https://zhuanlan.zhihu.com/p/1942149087869800464>
+- 参考：[https://zhuanlan.zhihu.com/p/1942149087869800464](https://zhuanlan.zhihu.com/p/1942149087869800464)
 - 池化分配两个特征：(1) **集合有界** V4L2/RKMPP 一次性划拨固定数量（4-16）物理内存块；(2) **时间局部性** 帧连续处理时用 Ring Buffer 轮转
 - 二者结合使 Hash Map Cache 缓存冷启动后达到 100% 命中, 把昂贵的系统调用 + IOMMU 建表开销降为 O(1)
 
@@ -369,8 +386,98 @@ Y 平面 + 交织 UV。`stride_w`/`stride_h` 可能 ≠ `width`/`height`（查 `
 - `AGENTS.md` — Agent 入口 / 编码规范 / 6 路硬编码位置速查 / 环境变量 / 可视化键盘映射
 - `docs/NETWORK_CAMERA_PLAN.md` — v3.0 当前活跃计划（6 路 IP camera, Sprint 0/1/2）
 - `docs/CAMERA_PAGE_INTEGRATION.md` — 浏览器管理平台（C++ http server, 端口 8080）方案 + 阶段 1 部署
+- docs/RTSP_OUTPUT_PLAN.md — v3.1 输出侧计划（拼接全景 RTSP 服务化, 端口 8554, `rtsp://<board>:8554/stitch`）
 - `src/gst_mpp_decoder.cc:DIAG 段` — 现场一拉 log 就看到 caps + stride 真相
 - `tools/post_flash_test.sh` — 烧录新镜像后一键 DTS 验证
 - `tools/sprint0_smoke.sh` — v3.0 Sprint 0 骨架贯通验收（PASS 才进 Sprint 1）
 
 > 参考论文：Du, Chengyao, et al. (2020). *GPU based parallel optimization for real time panoramic video stitching.* Pattern Recognition Letters, 133, 62-69.
+
+## 7. v3.2 (2026-07-09): 帧差掩码 + 2 路 RTSP 推流
+
+**目标**: 拼接完 1 帧后, 计算前后两帧差值生成掩码, 推两路 RTSP (`/stitch` 全景 + `/stitch_diff` 帧差掩码).
+
+**新增模块**:
+
+- `include/frame_diff.h/cc` (`FrameDiff`): NV12→BGR→absdiff→threshold→findContours. 输出 BGR mask (背景 = current × 0.4, 前景 = 红色高亮 + bbox). 持 prev frame 缓存, 线程不安全 (假定 stitch 线程单线程).
+- `include/output_streams.h/cc`: yaml 顶层 `output:` 块解析. 加载 `ServerConfig` (port, auth, on_demand, diff_threshold...) 和 `StreamConfig[]` (path, width, height, fps, bitrate, encoder).
+- `include/gst_rtsp_server.h/cc` (`GstRtspServer`): 单例, gst-rtsp-server 包装. 每路输出 = 1 个 GstRTSPMediaFactory (shared media) + 1 个 per-stream `StreamPipeline` (生产者 → mutex+cv 队列 → pump 线程 → appsrc → `mpph264enc` → `rtph264pay`).
+
+**Pipeline 模板** (per stream):
+
+```
+appsrc name=appsrc_<path> format=time is-live=true do-timestamp=true block=false max-bytes=0 \
+    caps="video/x-raw,format=BGR,width=W,height=H,framerate=F/1" \
+  ! videoconvert ! video/x-raw,format=NV12 \
+  ! mpph264enc bps=BITRATE*1000 rc-mode=cbr gop=FPS*2 \
+  ! h264parse ! rtph264pay name=pay0 pt=96 config-interval=1
+```
+
+**集成点**:
+
+- `App::InitRtspOutput()` (run_stitching 开头调一次): 读 yaml `output:` 块 → 构造 FrameDiff → GstRtspServer::Start(port=8554, streams=[/stitch, /stitch_diff])
+- stitch loop 内 (BlendSeams 之后): 转 BGR → push `/stitch`; FrameDiff::ComputeMask → push `/stitch_diff`. 每帧都跑, appsrc 端 `max-buffers=1` 丢旧帧.
+- `App::~App()`: `GstRtspServer::Stop()` (detach glib loop, join pump threads).
+
+**yaml 配置** (params/camera_sources.yaml 顶层 `output:`):
+
+```yaml
+output:
+  enabled: true
+  bind_address: 0.0.0.0
+  port: 8554
+  auth_enabled: false
+  auth_user: admin
+  auth_pass: CHANGE_ME
+  on_demand: false
+  diff_threshold: 30
+  diff_bbox_min_area: 100
+  streams:
+    - path: /stitch
+      width: 0
+      height: 0
+      fps: 30
+      bitrate_kbps: 4000
+      encoder: h264_hw
+    - path: /stitch_diff
+      width: 0
+      height: 0
+      fps: 30
+      bitrate_kbps: 2000
+      encoder: h264_hw
+```
+
+**操作**:
+
+```bash
+ffplay rtsp://board-ip:8554/stitch
+ffplay rtsp://board-ip:8554/stitch_diff
+ffplay -fflags nobuffer -rtsp_transport tcp rtsp://board-ip:8554/stitch
+```
+
+**新增编译依赖**:
+
+- 板端: `apt install gstreamer1.0-rtsp-server-1.0`
+- CMake: `pkg_check_modules(GSTRTSPSERVER REQUIRED IMPORTED_TARGET gstreamer-rtsp-server-1.0)` + 链 `PkgConfig::GSTRTSPSERVER`
+
+**性能影响 (估)**:
+
+- `FrameDiff` 1 帧: NV12→BGR (5-15ms) + absdiff+threshold+findContours (3-8ms) = ~10-23ms@2K
+- 2 路 mpph264enc 1080p30 HW: ~5ms×2 = 10ms
+- 总: stitch (~13ms) + diff (~15ms) + 2x encode (~10ms) = ~38ms, 略超 33ms 预算. 实际可能在 RGA NV12→BGR 复用上抢回来. 不行就把 diff fps 限到 15.
+
+**踩坑提示**:
+
+- 不要把 `stitch_status::shutdown` 之类的清理写在 `}` 外面 (file scope). 手动加 cleanup 时容易踩 — 已修.
+- OpenCV FileStorage 在 GBK locale 的 PC 上读 UTF-8 yaml 会报 `Input file is invalid` — PC 问题不是 board 问题, 板端 UTF-8 locale 正常.
+
+**踩坑提示 (2026-07-09 实测补充)**:
+
+- 板端 apt 找不到 `gstreamer1.0-rtsp-server-1.0` 时 (rocktech 部分镜像裁过 universe):
+  - 试 `sudo apt install libgstrtspserver-1.0-dev` (有的镜像只用这个名, pkg-config 能识别 `libgstrtspserver-1.0`)
+  - 还不行: 编译会 WARN, 链不会失败 (CMake 自动把 `HAVE_GST_RTSP_SERVER` 设 0)
+  - 运行时: RTSP 相关函数变成 no-op, 拼接功能不受影响
+  - yaml 端: 此时即使设 `output.enabled: true` 也不会启 server, 但也不会崩
+  - 想强制关掉 RTSP: yaml 顶层 `output.enabled: false`
+- 写 `cmake_config.h.in` 让 CMake 把 pkg 检测结果传成宏 (`HAVE_GST_RTSP_SERVER`), 源码 #if 跳过.
+- `appsrc_/stitch` 这种带 / 的 element name 在 gstreamer 0.x 是非法的, 现版本基本宽容但最好 sanitize. v3.2 已经做 `c == '\\\'' ? '\\\''_\\\'' : c` 把 / 换成 _.
