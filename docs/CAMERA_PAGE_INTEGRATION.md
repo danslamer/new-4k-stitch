@@ -1,6 +1,6 @@
 ﻿# CameraPage × image-stitching 接入方案 (v2.4 → v3.0, 2026-07-08)
 
-> **状态**: 阶段 1 完成（HTTP + 模拟 status）, 阶段 2（视频流）等 vpu 固件
+> **状态 (2026-07-14)**: 阶段 1 (HTTP + 5 个 API 端点) 已落地运行 (端口 8080); 阶段 2 (MJPEG 推流) 已实装 (`/api/stream` + `/api/snapshot` + `src/mjpeg_streamer.cc`), vpu 限制已被 gstreamer-mpp path 绕过; 阶段 3 (CameraPage 前端真数据接入) 等 Sprint 5/6 (`docs/USER_GOAL_ROADMAP.md`)。本文是 v2.4 时点 (2026-07-08) 的 CameraPage 接入方案, "等 vpu 修好后" 的旧表述以代码为真已经过时 — 见 `docs/HISTORY.md` § v3.2 节
 > **板端运行**: PID 监控中, 端口 8080
 > **架构**: C++ image-stitching 内嵌 cpp-httplib HTTP server + 独立 status writer 线程
 

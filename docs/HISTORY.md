@@ -1,7 +1,171 @@
-# HISTORY
+﻿# HISTORY
 
-设计演进时间线（精简）+ **完整操作手册** + **踩过的坑**。当前活跃计划见 `NETWORK_CAMERA_PLAN.md`（v3.0 IP camera 改造）。
+设计演进时间线（精简）+ **完整操作手册** + **踩过的坑** + **周期性回顾节**。
 
+## v3.2 实测代码能力回顾（2026-07-14）
+
+> **本节周期性整理**：用"代码即真"原则列出当前仓库实测的能力/差距。每个 Sprint 末尾做一次增量。
+
+### 当前实测能力（OK）
+
+- **6 路 2x3 layout dataset 端到端跑通**：`datasets/2k-test-h264/t{50..53,40,41}.mp4` 经 gstreamer `mppvideodec dma-feature=true` 输出 NV12 DMA-BUF fd → RGA crop/rotate → OpenCL 羽化 → DRM。`v2.5` 后 100+ fps @ 100% DMA-BUF（2026-07-07 绿条纹修复后）。
+- **6 路 RTSP pipeline 已编码**（`src/gst_mpp_decoder.cc::BuildRtspPipeline`）：`rtspsrc → rtph264depay → h264parse → mppvideodec → appsink`，yaml 驱动。**但 `params/camera_sources.yaml` 默认 IP `192.168.10.21..26` 未上电 + Sprint 0 验收脚本已被删除，未端到端跑通**。
+- **`stitching_param_generater.cc` 已编译**：内置 OpenCV `stitching_detailed` 全套（SIFT + AffineBestOf2NearestMatcher + 1-径 Bundle Adjustment + Wave Correct + Spherical Warper + MultiBand Blend）；**App 主循环未调用**。
+- **多帧 ROI bootstrap**：`App::BootStrapOptimalLayout` 用 ORB + BFMatcher (KNN + Lowe ratio) + RANSAC + `estimateAffinePartial2D`，跑多帧取最优 confidence。
+- **参数持久化**：`RoiConfig::SaveToFile/LoadFromFile` + cv::FileStorage 读写 `params/roi_tuning.yaml`；`/api/roi` POST offset 改 yaml（原子 tmp+rename）。
+- **CameraPage 管理面**：cpp-httplib 端口 8080 + `/api/stream` MJPEG 推流 + `/api/snapshot` 单帧 + 5+ API 端点。
+
+### 仍是 MISS / 警告的工作（对齐用户最新目标 GC4683 MIPI / FOV 101x68° / ~180°）
+
+| 目标点 | 当前状态 | 应在 Sprint |
+|---|---|---|
+| `camera_intrinsics.h` 重算 fx/fy 对应 FOV 101x68° | 警告：用的是 102.5°/55.2° 占位；且 `App::InitFromConfig` 未读此 header | Sprint 4-A |
+| 2x3 layout 横向/纵向 overlap 按 FOV+姿态计算，而非硬编码 `W/8` `H/12` | MISS：`BuildStitchLayout2x3` 写死比例 | Sprint 4-B |
+| `stitching_param_generater.cc` 主 pipeline 接入：`SetWarpData(StitchingWarpData)` 实装 | MISS：`ImageStitcher::SetWarpData` 已存在但 App 不传任何 warp_data | Sprint 5-A |
+| bootstrap 估出的 Affine/Homography 持久化到 yaml | MISS：仅 `cached_overlaps_` 内存对象；yaml 仅持 offset | Sprint 5-B/C |
+| 启动期优先读 `warp_data.yaml` 跳过 bootstrap | MISS：`App::InitFromConfig` 不读 warp_data | Sprint 5-C 收尾 |
+| `roi_visualizer.cc` 4 → 6 路循环；支持 width/height | MISS：`DrawROIMarkers` 硬编码 4，`HandleDebugAction` 仅 offset | Sprint 6-A |
+| `/api/roi` POST 接 `x/y/w/h` | MISS：仅接 `offset_x/offset_y` | Sprint 6-B |
+| 180° 俯视 FOV 覆盖 (≥ 96% ~ 180°) | MISS：当前 layout 横向 ≈ 25° / 纵向 ≈ 13.8°（远小于目标） | Sprint 4-B/C |
+
+详细 Sprint 计划：见 [`USER_GOAL_ROADMAP.md`](USER_GOAL_ROADMAP.md)。
+
+### 已删除的旧文档（不要复活）
+
+- `docs/NETWORK_CAMERA_PLAN.md` (v3.0 IP camera 改造, 2026-07-08)
+- `docs/RTSP_OUTPUT_PLAN.md` (v3.1 RTSP 输出)
+- `docs/QUICK_START_IP_ONLY.md` (改 IP 就能用)
+- `tools/sprint0_smoke.sh` 等 Sprint 0 验收脚本
+
+---
+## v3.3 SIFT → ORB 改造（2026-07-14）
+
+> 衔接 v3.2：本节记录把 `src/stitching_param_generater.cc` 内置特征描述子从 SIFT 切到 ORB 的过程。RGA+OpenCL 加速栈零变化，约束见 `docs/USER_GOAL_ROADMAP.md` § 5-PRE。
+
+### 变更内容
+
+- **新增** `src/stitching_param_generater.cc` 内部类：
+  - `OrbFeaturesFinder` (继承 `cv::detail::FeaturesFinder`) — `cv::ORB::create(4000)` 检测+计算 binary 32 字节描述子；BGR→gray→CV_8U 预处理。
+  - `OrbPairwiseMatcher` (继承 `cv::detail::FeaturesMatcher`) — `BFMatcher(NORM_HAMMING) + knnMatch(2) + Lowe ratio 0.65`；不依赖 ORB 之外的描述子类型。
+- **修改** `InitCameraParam()`:
+  - `SIFT::create()` → `makePtr<OrbFeaturesFinder>(4000)`
+  - `AffineBestOf2NearestMatcher` / `BestOf2NearestMatcher` / `BestOf2NearestRangeMatcher` → `makePtr<OrbPairwiseMatcher>(match_conf)`
+  - `AffineBasedEstimator` / `HomographyBasedEstimator` / `BundleAdjuster*` 不动（描述子类型对它们透明）。
+- **修改** `include/stitching_param_generater.h` 默认值:
+  - `matcher_type = "affine"` (was "homography")
+  - `estimator_type = "affine"` (was "homography")
+  - `ba_cost_func = "no"` (was "reproj"，6 路 Affine 场景下 BA 收益有限)
+  - `warp_type = "plane"` (was "spherical"，GC4683 顶视平面场景)
+
+### 不动的部分
+
+- RGA crop/rotate 0/90/180/270 路径 (`src/image_stitcher.cc::WarpImages` 中的 `BlitByRect`)
+- OpenCL 接缝羽化 (`src/image_stitcher.cc::BlendSeams` 中的 `clImportMemoryARM` + `cl_kern_blend_v_` / `cl_kern_blend_h_`)
+- DMA-BUF fd 池化 (`dma_buf_cache_` unordered_map)
+- 主路径 bootstrap (`src/app.cc::EstimatePairOverlap`，本来就走 ORB)
+- 解码 (`src/gst_mpp_decoder.cc`)
+- 持久化 / UI (`src/roi_*.cc`, `src/http_server.cc`)
+
+### 风险 / 兜底
+
+- **ORB 在低纹理场景失配**：本场景 GC4683 顶视拍摄地面/桌面纹理足够。
+- **描述子字节布局兼容性**：`cv::detail::AffineBasedEstimator` / `BundleAdjusterReproj` 等只看 `ImageFeatures.keypoints` 与 `MatchesInfo.matches`，不看描述子字节。如果 OpenCV 升级后这些类内部逻辑变了需要重新评估。
+- **兜底**：如果 Sprint 5-A 接入主 pipeline 后 ORB 估 Affine 失败，临时把 `matcher_type` / `estimator_type` 改回去"homography" + BundleAdjusterReproj 即可，不需要改代码（但默认已经"affine" / "no"）。
+
+### 验收 (板上 e2e)
+
+1. `cmake --build build && ./build/image-stitching` 不报 `cv::detail::FeaturesFinder` / `FeaturesMatcher` 链接错误。
+2. dataset 路径启动日志 `Features in image #N: ~4000` (代替 SIFT 的 ~1500)。
+3. 端到端 FPS 维持 100+ (与 v2.5 一致)。
+4. Sprint 5-C 落盘 `params/warp_data.yaml` 后，`xmap/ymap` 维度与 SIFT 时代一致 (PlaneWarper 输出仅依赖 K + R，与特征点类型无关)。
+
+
+
+
+## v3.4 架构重新规划: 前景/后景分离 + IPM + Seam-based 合成（2026-07-14, 计划, 未实施）
+
+> 本节是文档化阶段, 无代码改动。 落地按 `docs/USER_GOAL_ROADMAP.md` § 0.5 核心原则 + § 2 Sprint 5-IPM/SEAM/FG/SAL 子段逐项推进。
+
+### 决策依据
+
+- **症状**: 6 路顶视 (室内) 拼接, 移动人跨重叠区出现"半透明 + 重影"。
+- **根因 (数学)**: 立体 3D 点 P=(X,Y,Z) 在两台相机像素 (u0,v0) 和 (u1,v1) 不重合, **没有任何 2D warp 能让两路像素投到同一全景像素还保持人形状不变**。 除非 Z=0 (地面, IPM 才能两路对齐) 或 Z=∞ (无穷远, 单 H 才能对齐)。 人既不在地面也不在无穷远, 2D warp 必坏。
+- **结论**: 试图用 2D warp (DH / APAP / AANAP / 全幅 α 混合) 把两路"对齐" = 物理上不可能, 只会做出更怪的"半透明"。 真解是**同一个人只由一台相机画, 重叠区硬切 + 缝局部形变**。
+
+### 核心架构
+
+| 类别 | 几何性质 | 实时策略 | 算力 (RK3588) |
+|---|---|---|---|
+| **后景 (静态地面 + 静态家具)** | 离线标定后两路天然对齐 | 离线算 IPM LUT + 默认 seam + 背景模型, 实时只查表 | ~3ms / 6 路 |
+| **前景 (走动的人)** | 立体物, 2D warp 必坏 | 不试图对齐, 重叠区硬切 (single-side), 检出人跨 seam 把 seam 局部推开 | ~7ms / 7 pair |
+| **混合带 (seam ± 3 px)** | 缝隐藏 | α smoothstep 0→3 px 渐变, 之外硬切 | (计入上面) |
+| **总 wall clock** | | | **~10ms / 帧** (30 fps 预算 33ms 余 23ms) |
+
+### 新增文件 / 改动
+
+- 新增: `src/calibration.cc/.h` (6 路 K/D/R/t 加载 + IPM LUT 计算 + seam mask 加载), `src/bg_subtractor.cc/.h` (滑动平均背景模型), `src/seam_tracker.cc/.h` (Kalman `[seam_x, velocity_x]`), `tools/calibrate_6cam.cpp` (棋盘格标定工具)
+- 改: `src/image_stitcher.cc::WarpImages` 加 IPM 路径 (RGA `imremap` 接 CV_32FC2 ipm_lut, RGA 不可用退到 GLES fragment shader); `src/image_stitcher.cc::BlendSeams` 改 OpenCL kernel 加 seam mask 输入 + 硬切+窄带 (替代 α blend); `src/app.cc::BootStrapOptimalLayout` 末尾加 GraphCut 求默认 seam; `src/app.cc::InitFromConfig` 启动读 IPM LUT + seam mask + 标定 yaml
+- 落盘: `params/calibration.yaml` (6 路 K/D/R/t/H/θ/z_planes), `params/ipm_lut_0..5.png` (CV_32FC2, 8MB/路), `params/seam_default_0..6.png` (7 对相邻, 8-bit 单通道, ~20MB/个压缩), `params/saliency_0..5.png` (CV_32FC1, 1 周累积)
+
+### 不接受的方案 (写在前面防回退)
+
+- ❌ **DH 双单应 / APAP / AANAP**: 立体人 2D warp 假设不成立, 工程复杂但视觉收益不抵 seam-based。 Sprint 5-DH 砍掉。
+- ❌ **α 羽化 / 多频段全幅混合**: 重影的物理根源没解决, 只能压低不能消除, 对前景无效。 原 `src/image_stitcher.cc::BlendSeams` 路径将被 seam 硬切+窄带替代。
+- ❌ **CPU 软解 / 软件 fallback**: 架构硬约束禁止 (2026-07-06 锁定)。
+- ❌ **IPM LUT 在 CPU 算**: RGA `imremap` 或 GLES fragment shader 走 GPU 零拷贝; CPU `cv::remap` 仅作最后 fallback。
+- ❌ **多频段 / Voronoi 全 2D 划分**: 留给 4 路汇合区 (2x3 中央), 不作为主路径。
+
+### 算力账 vs 架构硬约束
+
+| 操作 | 路径 | 耗时 | 硬约束状态 |
+|---|---|---|---|
+| 去畸变 LUT 查表 | RGA colorkey/remap | 0.3ms / 路 | ✅ 仍 DMA-BUF 零拷贝 |
+| IPM remap (CV_32FC2) | RGA `imremap` 或 GLES | 0.5ms / 路 | ✅ 仍 DMA-BUF 零拷贝 |
+| 背景减除 | CPU OpenCV | 0.3ms / 路 | ✅ 数据已在系统内存 (解码后) |
+| 局部 seam 形变 | CPU 距离变换 + 形态学 | 0.2ms / pair | ✅ 小数据量 |
+| Kalman 平滑 | CPU 标量 | <0.1ms | ✅ |
+| OpenCL 硬切+窄带 | Mali GPU, `clImportMemoryARM` | 1ms / pair | ✅ 替代 α blend, 仍零拷贝 |
+| 背景模型慢更新 | CPU | 0.05ms | ✅ |
+| **总 wall clock** | (6 路并行) | **~10ms / 帧** | **30 fps 预算 33ms, 余 23ms** |
+
+### 与 v2.5 (现 100+ fps) 的性能对比
+
+- v2.5: 6×2K dataset, RGA crop + α blend, ~10ms / 帧 = 100 fps
+- v3.4: 6×2K IP camera, RGA IPM + 硬切+窄带 + 背景减除 + 形变, ~10-15ms / 帧 = 65-100 fps
+- 仍**远超 30 fps 目标**, 8 倍余量。
+
+### 落地 Sprint 总工时
+
+| 子段 | 周 | 性质 |
+|---|---|---|
+| 5-PRE (SIFT→ORB) | 0.5 | 必做 (已开工) |
+| 5-IPM-A (标定+IPM LUT) | 1.5 | 离线 |
+| 5-IPM-B (实时 IPM remap) | 1.0 | 在线 |
+| 5-IPM-C (多平面 IPM) | 1.0 | 离线 + 在线混合 (可选) |
+| 5-SEAM-A (GraphCut 默认 seam) | 1.0 | 离线 + 在线混合 |
+| 5-SEAM-B (硬切+窄带) | 1.0 | 在线 |
+| 5-FG-A (背景减除+局部形变) | 1.0 | 在线 |
+| 5-FG-B (Kalman 平滑) | 0.5 | 在线 |
+| 5-SAL (saliency heatmap) | 0.5 | 离线累积 |
+| **总** | **~8.0** | |
+
+### 验证标准 (板上 e2e, 每个子段完成时)
+
+1. **5-IPM-A**: `tools/calibrate_6cam` 跑通, 6 路 K/D/R/t 非零; 棋盘格角点两路 IPM 投到同一 (Xpan,Ypan) 误差 < 2 px
+2. **5-IPM-B**: 启动后日志 `IPM remap enabled, 1 cm/pixel, panorama 4800x4080`; 1m 棋盘格测得 100±2 px (物理尺度验证)
+3. **5-SEAM-B**: 室内有 1 个静止的人跨在 seam 上, 全景图里完整, 没有"半透明 + 重影"
+4. **5-FG-A**: 室内有人走动跨 seam, 全景图里这个人**不重影** (单边完整呈现)
+5. **5-FG-B**: 录像 30 秒对比, 不开 Kalman 缝抖 5-10 px/frame, 开了 < 2 px/frame
+
+### 关联文档
+
+- `docs/USER_GOAL_ROADMAP.md` § 0.5 核心原则 (新增): 详细论证 + 拒绝方案 + 整条 pipeline
+- `docs/USER_GOAL_ROADMAP.md` § 2 Sprint 5: 9 个子段 (5-PRE / 5-IPM-A/B/C / 5-SEAM-A/B / 5-FG-A/B / 5-SAL) 详细计划
+- `docs/USER_GOAL_ROADMAP.md` § 3 风险: 9 个子段对应风险 + 兜底
+- `docs/USER_GOAL_ROADMAP.md` § 4 PR 边界: 9 个子段对应 PR 边界
+- `docs/USER_GOAL_ROADMAP.md` § 6 参考实现点: 17 个文件/函数指针
+- `docs/USER_GOAL_ROADMAP.md` § 7 硬约束关系: 9 个子段对应硬约束影响
+- `AGENTS.md` 当前状态: v3.4 forward-looking note + 核心模块表 (新增 4 个文件) + 6路硬编码表 (新增 6 行)
 ---
 
 ## 0. 设计演进（一句话过完）
@@ -19,6 +183,8 @@
 | 2026-07-06    | **架构硬约束锁定**: 弃 FFmpeg rkmpp（vendor 不维护 + ABI 不兼容, 0 帧），改 gstreamer1.0-rockchip1 mppvideodec `dma-feature=true`                                                                |
 | 2026-07-07    | **绿条纹修复**: `mppvideodec` stride 上报偏小 → RGA + cvtColor 错位；POSIX `realpath()` 解决 yaml 路径; batch_transcode (mp4v→h264)。**6 路 100+ fps @ 100% DMA-BUF, 2×3 端到端跑通** |
 | 2026-07-08    | **v3.0**: 6 路 IP camera RTSP 改造（PoE 8+2 交换机, 镜头 2.8mm 102.5°），取代 v2.x 的本地 mp4 / MIPI 计划                                                                                         |
+| 2026-07-14    | **v3.3 SIFT → ORB 改造**：`stitching_param_generater.cc` 内部描述子由 SIFT 切到 ORB (BFMatcher NORM_HAMMING + KNN + Lowe 0.65)；默认 `affine/no-BA/PlaneWarper`；RGA+OpenCL 加速栈零变化。详见本文件 v3.3 节 + `docs/USER_GOAL_ROADMAP.md` § 5-PRE |
+| 2026-07-14    | **v3.4 架构重新规划**: 前景/后景分离 (后景 IPM LUT + 静态 seam 离线算; 前景硬切+局部形变+背景减除实时), 拒绝 DH/APAP/AANAP/全幅 α blend; 详见本文件 v3.4 节 + `docs/USER_GOAL_ROADMAP.md` § 0.5 + § 2 Sprint 5 (5-IPM-A/B/C + 5-SEAM-A/B + 5-FG-A/B + 5-SAL) |
 
 ---
 
@@ -160,6 +326,108 @@ sudo nmcli connection down "MyWiFi" && sudo nmcli connection up "MyWiFi"
 
 （Windows 移动热点自带网段 `192.168.137.0/24`，PC 端 IP 通常是 `192.168.137.1`，用 `ipconfig` 确认）
 
+#### 持久化静态 IP（实测有效 2026-07-14, 目标 192.168.137.100）
+
+如果 `ifconfig` 临时设 IP 后 `sudo reboot`，会发现 IP 丢了 — 因为临时 ifconfig 不落盘。本节给出**断电重启后 IP/路由/DNS 仍然保留**的标准做法。**所有命令以 `rocktech` 用户跑（`sudo -i` 进 root）**，符合 §2.4 账户约定。
+
+**实测发现：本板 image 默认状态有 4 个坑需要先填，再做 nmcli 静态配置**：
+
+| # | 坑 | 现象 | 修复 |
+|---|---|---|---|
+| 1 | `NetworkManager.service` `disabled` | 开机 NM 不起，依赖 NM 的连接也不起 | `sudo systemctl enable --now NetworkManager` |
+| 2 | `netplan-eth0` 是 DHCP（`ipv4.method=auto`，`autoconnect=yes`） | 重启后 DHCP 抢占 eth0，把我们的静态 IP 抢走 | `sudo nmcli connection delete netplan-eth0` |
+| 3 | `netplan-eth1` 是 192.168.1.10/24 静态 + `/etc/network/interfaces` 里也有 `auto eth1` 块 | eth1 被 NM 标 `unmanaged`，扰乱 device 状态 | 删 `netplan-eth1` 并把 `/etc/network/interfaces` 里 eth1 块清空（备份后覆盖） |
+| 4 | NM 自动给 eth0 创的内存 `eth0` device profile（`autoconnect=no`，**未落盘到 `/etc/NetworkManager/system-connections/`**） | `nmcli con show` 看着像有静态 IP，重启后消失 | 用 `nmcli connection add` 显式创建并 `autoconnect-priority=100` 让它真的落盘 |
+
+**完整命令（一次执行，重启后 IP 锁死 192.168.137.100）**：
+
+```bash
+# 0. 备份现有 /etc/network/interfaces（带时间戳）
+sudo cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%Y%m%d_%H%M%S)
+
+# 1. 清空 /etc/network/interfaces (避免 NM ifupdown plugin 标 unmanaged)
+sudo tee /etc/network/interfaces > /dev/null <<'EOF'
+# Managed by NetworkManager. /etc/network/interfaces is NOT used on this image.
+# (no networking.service; NM is the sole network daemon).
+# Kept as fallback if ifupdown is later installed.
+EOF
+
+# 2. 启 + 开机自启 NetworkManager
+sudo systemctl enable --now NetworkManager
+
+# 3. 删干扰连接（DHCP 抢占 + eth1 残留）
+sudo nmcli connection delete netplan-eth0   # DHCP 抢占
+sudo nmcli connection delete netplan-eth1   # eth1 干扰
+
+# 4. 删 NM 自动建的内存 eth0 device profile（autoconnect=no, 未落盘）
+sudo nmcli connection delete eth0           # 若提示 "not found" 可忽略
+
+# 5. 创建持久化静态连接（关键：autoconnect-priority=100 才会落盘生效）
+sudo nmcli -w 15 connection add \
+    type ethernet \
+    con-name eth0-static \
+    ifname eth0 \
+    ip4 192.168.137.100/24 \
+    gw4 192.168.137.1 \
+    ipv4.dns "223.5.5.5 8.8.8.8" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100
+
+# 6. 立即激活（这一步会替换临时 ifconfig 的 IP，SSH 闪断一次重连即可）
+sudo nmcli connection up eth0-static
+```
+
+**落盘文件位置**：`/etc/NetworkManager/system-connections/eth0-static.nmconnection`（NM 启动时读取，断电后保留）：
+
+```ini
+[connection]
+id=eth0-static
+type=ethernet
+autoconnect-priority=100
+interface-name=eth0
+
+[ipv4]
+address1=192.168.137.100/24,192.168.137.1
+dns=223.5.5.5;8.8.8.8;
+method=manual
+```
+
+**验证**：
+
+```bash
+# 落盘检查
+sudo cat /etc/NetworkManager/system-connections/eth0-static.nmconnection
+nmcli -t -f NAME,DEVICE,STATE,AUTOCONNECT,AUTOCONNECT-PRIORITY connection show eth0-static
+# 期望: eth0-static  eth0  activated  yes  100
+
+# 当前状态
+nmcli -t -f DEVICE,STATE,CONNECTION device status | grep eth0
+ip -4 addr show eth0 | grep inet
+ip route | grep default
+
+# === 关键：断电重启验证 ===
+sudo reboot
+# 等板子起来后 SSH 进去
+ssh rocktech@192.168.137.100
+uptime                                            # 应显示 "up 0/1/2 min"
+nmcli -t -f DEVICE,STATE,CONNECTION device status | grep eth0   # connected:eth0-static
+ip -4 addr show eth0 | grep inet                  # 192.168.137.100/24
+ip route | grep default                           # default via 192.168.137.1 dev eth0
+systemctl is-active NetworkManager                # active
+systemctl is-enabled NetworkManager               # enabled
+ping -c2 192.168.137.1                            # 通
+```
+
+**回滚**（如果想恢复 DHCP）：
+
+```bash
+sudo nmcli connection delete eth0-static
+sudo nmcli connection up eth0   # NM 重建 device profile, 走 DHCP
+# 或者重建 netplan-eth0 (DHCP)：
+sudo nmcli -w 10 connection add type ethernet con-name netplan-eth0 ifname eth0 \
+    ipv4.method auto autoconnect yes autoconnect-priority 0
+```
+
 #### 通用排错
 
 | 症状                                       | 处理                                                              |
@@ -169,6 +437,9 @@ sudo nmcli connection down "MyWiFi" && sudo nmcli connection up "MyWiFi"
 | `nmcli: command not found`               | 镜像不带 NetworkManager，改走 wpa_supplicant                      |
 | `IP configuration could not be reserved` | WiFi 关联成功但 DHCP 拿不到 IP，绑静态 IP 跳过 DHCP               |
 | IP 变了后 VSCode Remote 拒连               | `ssh-keygen -R <new_ip>`                                        |
+| `nmcli: NetworkManager is not running`   | 开机 NM 没自启：`sudo systemctl enable --now NetworkManager`  |
+| 设了静态 IP 重启后还是 DHCP                | image 自带 `netplan-eth0` DHCP `autoconnect=yes` 抢占；先 `nmcli connection delete netplan-eth0` 再新建静态 |
+| `eth1: unmanaged` (预期外)                | `/etc/network/interfaces` 里残留 `auto eth1` 块；清空该文件后 `sudo systemctl restart NetworkManager` |
 
 ### 2.4 账户与项目目录
 

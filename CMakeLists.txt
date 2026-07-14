@@ -83,7 +83,8 @@ add_executable(${PROJECT_NAME}
     include/logger.h
     src/roi_config.cc
     include/roi_config.h
-    include/camera_intrinsics.h  # v3.0: K 矩阵占位 (fx=1027 fy=1378 cx=1280 cy=720)
+    include/camera_intrinsics.h  # Sprint 4-A (2026-07-14): mutable Intrinsics + yaml (fx=1052.55 fy=1068.89 for FOV 101x68 deg)
+    src/camera_intrinsics.cc
     src/roi_visualizer.cc
     include/roi_visualizer.h
     src/status_writer.cc

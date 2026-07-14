@@ -1,0 +1,97 @@
+# ============================================================
+# Sprint 4-A (2026-07-14): GC4683 @ RK3576 MIPI 直连 / FOV 101x68 deg
+#
+# 各字段:
+#   image_w / image_h : 图像分辨率 (像素), 默认 2560 x 1440
+#   h_fov_deg / v_fov_deg : 每路相机水平 / 垂直 FOV (degree)
+#   yaw_h_deg / yaw_v_deg : 每路相机相对支架中心的水平 / 垂直偏角 (degree)
+#   fx / fy / cx / cy    : 直接覆写 K 矩阵 (可选); 缺省则用 fov+image 自动反推
+#   k1 / k2 / p1 / p2    : 畸变系数 (Sprint 4-A 默认 0; Sprint 5-D 自标定覆盖)
+#
+# 默认 6 路排布 (2x3 grid; col 主光轴在 +/-45 deg, row 在 -33/0/+33 deg):
+#   col 0 主光轴 yaw_h = -45 deg  (cam0 / cam2 / cam4)
+#   col 1 主光轴 yaw_h = +45 deg  (cam1 / cam3 / cam5)
+#   row 0 主光轴 yaw_v = -33 deg  (cam0 / cam1)
+#   row 1 主光轴 yaw_v =   0 deg  (cam2 / cam3)
+#   row 2 主光轴 yaw_v = +33 deg  (cam4 / cam5)
+#
+# 由上面算全景覆盖 (App 启动期 log 会打印; 计算公式见 src/app.cc 新版
+#   BuildStitchLayout2x3):
+#   横向 = 2 * 50.5 (FOV/2) + 90 (col 间主光轴夹角) = 191 deg
+#   纵向 = 2 * 34   (FOV/2) + 66 (row 间主光轴夹角) = 134 deg
+#   若要纵向接近 180 deg, 把 yaw_v 改成 -56 / 0 / +56 -> 纵向覆盖 = 192 deg.
+#
+# 修改本文件后重启 image-stitching 即可生效 (App::App() 启动期 reload).
+# ============================================================
+
+cam0:
+   image_w: 2560
+   image_h: 1440
+   h_fov_deg: 101
+   v_fov_deg: 68
+   yaw_h_deg: -45
+   yaw_v_deg: -33
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+
+cam1:
+   image_w: 2560
+   image_h: 1440
+   h_fov_deg: 101
+   v_fov_deg: 68
+   yaw_h_deg:  45
+   yaw_v_deg: -33
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+
+cam2:
+   image_w: 2560
+   image_h: 1440
+   h_fov_deg: 101
+   v_fov_deg: 68
+   yaw_h_deg: -45
+   yaw_v_deg:   0
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+
+cam3:
+   image_w: 2560
+   image_h: 1440
+   h_fov_deg: 101
+   v_fov_deg: 68
+   yaw_h_deg:  45
+   yaw_v_deg:   0
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+
+cam4:
+   image_w: 2560
+   image_h: 1440
+   h_fov_deg: 101
+   v_fov_deg: 68
+   yaw_h_deg: -45
+   yaw_v_deg:  33
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0
+
+cam5:
+   image_w: 2560
+   image_h: 1440
+   h_fov_deg: 101
+   v_fov_deg: 68
+   yaw_h_deg:  45
+   yaw_v_deg:  33
+   k1: 0.0
+   k2: 0.0
+   p1: 0.0
+   p2: 0.0

@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <cmath>
 #include <sys/mman.h>
 
 #include <opencv2/opencv.hpp>
@@ -43,6 +44,9 @@ static constexpr double CONFIDENCE_THRESHOLD = 0.25;
 
 namespace {
 
+// Sprint 4-B (2026-07-14): 加 yaw_h_deg / yaw_v_deg 字段, 由 BuildDefaultTuning
+//   从 camera_intrinsics::ForCam(i) 读 yaml 配置. BuildStitchLayout2x3 据此算
+//   横向/纵向 overlap 与列/行像素位置 (替换原本 W/8, H/12 硬编码).
 struct CameraTuning {
   int rotation_deg = 0;
   int crop_left = 0;
@@ -51,6 +55,8 @@ struct CameraTuning {
   int crop_bottom = 0;
   int offset_x = 0;
   int offset_y = 0;
+  double yaw_h_deg = 0.0;   // Sprint 4-B: 水平姿态偏角 (degree)
+  double yaw_v_deg = 0.0;   // Sprint 4-B: 垂直姿态偏角 (degree)
   bool enabled = true;
 };
 
@@ -213,12 +219,19 @@ cv::UMat ExportNv12DrmBufferToBgr(const DrmBuffer& buffer) {
   return bgr_host.getUMat(cv::ACCESS_READ);
 }
 
+// Sprint 4-B (2026-07-14): 同步 camera_intrinsics::ForCam(i) 的 yaw_h/v_deg,
+//   让 BuildStitchLayout2x3 算 layout 时有真实相机姿态可用 (替换原本 W/8, H/12
+//   硬编码).
 std::vector<CameraTuning> BuildDefaultTuning(size_t num_cameras) {
   std::vector<CameraTuning> tuning(num_cameras);
 
-  for (size_t i = 0; i < num_cameras && i < 6; ++i) {
-    tuning[i].offset_x = g_config.roi_offsets[i].offset_x;
-    tuning[i].offset_y = g_config.roi_offsets[i].offset_y;
+  for (size_t i = 0; i < num_cameras && i < camera_intrinsics::kNumCams; ++i) {
+    tuning[i].offset_x   = g_config.roi_offsets[i].offset_x;
+    tuning[i].offset_y   = g_config.roi_offsets[i].offset_y;
+    // Sprint 4-B: 从 params/calibration.yaml 拿到的每路姿态 (启动期由
+    //   App::App() 调 camera_intrinsics::CalibrationConfig::LoadOrDefault 覆盖过).
+    tuning[i].yaw_h_deg  = camera_intrinsics::ForCam(static_cast<int>(i)).yaw_h_deg;
+    tuning[i].yaw_v_deg  = camera_intrinsics::ForCam(static_cast<int>(i)).yaw_v_deg;
   }
   return tuning;
 }
@@ -718,6 +731,27 @@ std::vector<CameraRoi> BuildCameraRois2x3(const std::vector<NV12Frame>& frames,
     }
   }
 
+  // Sprint 4-C (2026-07-14) 边界安全性 log:
+  //   检查 cam 0 (左上, col 0 / row 0), cam 1 (右上, col 1 / row 0),
+  //   cam 4 (左下, col 0 / row 2) 在其源图像的 4 边是否落在边缘 (无黑边):
+  //     * x=0 / y=0 / x+W<=W / y+H<=H 时说明 ROI 紧贴源图像边沿, 没有让
+  //       "cam i 主光轴位移 - W/2" 在 src 内部产生空洞区 (=黑边).
+  //   完整验收靠 BootStrapOptimalLayout 末尾 SaveDetectedRoiDebug() 落盘的
+  //   diag_pngs/roi_debug_camN.png, 这里仅给文本快速视图.
+  for (int i = 0; i < n; ++i) {
+    std::ostringstream os;
+    const bool x_at_left   = (rois[i].x == 0);
+    const bool y_at_top    = (rois[i].y == 0);
+    const bool x_at_right  = (rois[i].x + rois[i].width  >= W[i]);
+    const bool y_at_bottom = (rois[i].y + rois[i].height >= H[i]);
+    os << "[App] [Sprint4-C] cam" << i
+       << " src=(" << rois[i].x << "," << rois[i].y
+       << "," << rois[i].width << "x" << rois[i].height << ")"
+       << " edges=[L=" << (x_at_left ? "Y" : "n") << " R=" << (x_at_right ? "Y" : "n")
+       << " T=" << (y_at_top ? "Y" : "n") << " B=" << (y_at_bottom ? "Y" : "n") << "]";
+    Logger::GetInstance().Log(os.str());
+  }
+
   return rois;
 }
 
@@ -745,12 +779,29 @@ std::vector<StitchTask> BuildStitchLayout2x3(const std::vector<CameraRoi>& rois,
     tasks[i].src_h = rois[i].height;
   }
 
-  // 简化的 overlap 值 (跟 ROI 简化策略一致, 不依赖 EstimatePairOverlap 结果)
-  // 默认水平 overlap = W/8, 垂直 overlap = H/12 (粗略估计)
+  // Sprint 4-B (2026-07-14): 横向/纵向 overlap 改按 FOV + yaw 计算,
+  //   替换原本硬编码 W/8 / H/12. 参数来自 tuning[].yaw_h_deg / yaw_v_deg
+  //   (BuildDefaultTuning 已从 camera_intrinsics::ForCam(i) 注入).
+  //
+  // 推导 (俯视, panorama 在地面平面上):
+  //   * cam i 主光轴在 panorama 上的水平位置 (像素, 相对 cam0 主光轴) =
+  //     fx * ( tan(yaw_h[i]) - tan(yaw_h[0]) ).
+  //   * cam i 主光轴在 panorama 上的垂直位置 (像素, 相对 cam0 主光轴) =
+  //     fy * ( tan(yaw_v[i]) - tan(yaw_v[0]) ).
+  //   * cam i 图像 (宽 W) 的 dst_x = 主光轴位置 - W/2 (让 cam i 主光轴
+  //     落在 panorama x = 主光轴位置, 即 cam i 图像 x = W/2 处).
+  //   * 同样地 row_y[i] = fy * (tan(yaw_v[i]) - tan(yaw_v[0])) - H/2.
+  // 注: tuning[i].yaw_*_deg 单位是 degree, 转弧度后用 tan().
+
   const int W = rois[0].width;
   const int H = rois[0].height;
-  const int overlap_h = W / 8;
-  const int overlap_v = H / 12;
+  const double fx = camera_intrinsics::ForCam(0).fx;
+  const double fy = camera_intrinsics::ForCam(0).fy;
+  const double yaw_h0_deg = tuning[0].yaw_h_deg;  // cam0 yaw = 列 0 基准
+  const double yaw_v0_deg = tuning[0].yaw_v_deg;
+
+  const double yaw_h0_rad = yaw_h0_deg * 3.14159265358979323846 / 180.0;
+  const double yaw_v0_rad = yaw_v0_deg * 3.14159265358979323846 / 180.0;
 
   // 2x3 grid 布局 (cam0/2/4 在左列, cam1/3/5 在右列)
   // row 0: cam0 (左上), cam1 (右上)
@@ -758,15 +809,31 @@ std::vector<StitchTask> BuildStitchLayout2x3(const std::vector<CameraRoi>& rois,
   // row 2: cam4 (左下), cam5 (右下)
   const int blend_w = NormalizeEvenFloor(std::max(20, g_config.feather_width));
 
-  // 左列 (cam0/2/4) x = 0
-  // 右列 (cam1/3/5) x = W - overlap_h
-  // 行 0: y = 0
-  // 行 1: y = H - overlap_v
-  // 行 2: y = 2*(H - overlap_v)
+  // 每 cam 主光轴相对 cam0 主光轴在 panorama 上的像素位移.
+  // tau_xx[i] = fx * (tan(yaw[i]) - tan(yaw[0]))   (水平)
+  // tau_yy[i] = fy * (tan(yaw[i]) - tan(yaw[0]))   (垂直)
+  double tau_h[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+  double tau_v[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+  for (int i = 0; i < n; ++i) {
+    const double yh_rad = tuning[i].yaw_h_deg * 3.14159265358979323846 / 180.0;
+    const double yv_rad = tuning[i].yaw_v_deg * 3.14159265358979323846 / 180.0;
+    tau_h[i] = fx * (std::tan(yh_rad) - std::tan(yaw_h0_rad));
+    tau_v[i] = fy * (std::tan(yv_rad) - std::tan(yaw_v0_rad));
+  }
 
-  // 应用 tuning 微调
-  int col_x[2] = { 0, NormalizeEvenFloor(W - overlap_h) };
-  int row_y[3] = { 0, NormalizeEvenFloor(H - overlap_v), NormalizeEvenFloor(2 * (H - overlap_v)) };
+  // col_x[col]: col 主光轴相对 cam0 主光轴的像素位移 - W/2 (cam 主光轴在 W/2 处).
+  //   col 0 = cam0/2/4:  cam 0 主光轴位移 = 0  -> col_x[0] = -W/2; 但我们在 dst_x
+  //   加上 +W/2 让 col 0 起点为 0. (见下方 dst_x 计算).
+  //   col 1 = cam1/3/5:  cam 1 主光轴位移 = tau_h[1] -> col_x[1] = tau_h[1].
+  //   实际 col 0 起点 = 0, col 1 起点 = tau_h[1].
+  // 注意: 我们直接以 cam0 图像占 panorama [0, W] 为基准, 所以 col 0 起点 = 0 不
+  //   用 tau_h. col 1 起点 = cam1 主光轴位移 - W/2 + W/2 = cam1 主光轴位移.
+  const int col_x[2] = { 0, NormalizeEvenFloor(static_cast<int>(std::lround(tau_h[1]))) };
+  const int row_y[3] = {
+      0,
+      NormalizeEvenFloor(static_cast<int>(std::lround(tau_v[2]))),  // cam2 = row 1
+      NormalizeEvenFloor(static_cast<int>(std::lround(tau_v[4])))   // cam4 = row 2
+  };
 
   for (int i = 0; i < n; ++i) {
     int col = i % 2;   // 0 or 1
@@ -775,11 +842,32 @@ std::vector<StitchTask> BuildStitchLayout2x3(const std::vector<CameraRoi>& rois,
     tasks[i].dst_y = row_y[row] + tuning[i].offset_y;
   }
 
-  // panorama 尺寸
-  *panorama_width = NormalizeEvenCeil(col_x[1] + W);   // 右列起点 + cam 宽度
-  *panorama_height = NormalizeEvenCeil(row_y[2] + H);  // 下行起点 + cam 高度
+  // panorama 尺寸 = 右列起点 + cam 宽; 下行起点 + cam 高.
+  //   注意: 用户调校时 (尤其 yaw 偏角很大或 ext grid) 可能让 col/row 起点是
+  //   负数 (主光轴落在 cam0 左侧), 此时应扩到 0 起点. 这里我们保守地以
+  //   col_x[1] >= 0 / row_y[2] >= 0 为前提 (yaml 默认排布满足).
+  //   若 col_x[1] < 0 则 col 0 也会有部分溢出, 应在 BuildStitchLayout 之前
+  //   调整 col_x (留给后续 Sprint 6 UI). 当前断言 log 提醒.
+  if (col_x[1] < 0 || row_y[2] < 0) {
+    Logger::GetInstance().Log(
+        "[App] [2x3][warn] negative col/row pivot detected; panorama may crop. "
+        "col_x[1]=" + std::to_string(col_x[1]) +
+        " row_y[2]=" + std::to_string(row_y[2]));
+  }
 
-  Logger::GetInstance().Log("[App] [2x3] overlap_h=" + std::to_string(overlap_h)
+  *panorama_width = NormalizeEvenCeil(col_x[1] + W);
+  *panorama_height = NormalizeEvenCeil(row_y[2] + H);
+
+  // 落盘前计算 overlap 像素 (相对 W/H) 仅用于日志, 不再影响 layout.
+  const int overlap_h = std::max(0, W - col_x[1]);
+  const int overlap_v = std::max(0, H - row_y[2]);
+  Logger::GetInstance().Log("[App] [2x3][sprint4-B] fx=" + std::to_string(fx)
+                           + " fy=" + std::to_string(fy)
+                           + " yaw_h0=" + std::to_string(yaw_h0_deg)
+                           + " yaw_v0=" + std::to_string(yaw_v0_deg)
+                           + " col_x[1]=" + std::to_string(col_x[1])
+                           + " row_y[2]=" + std::to_string(row_y[2])
+                           + " overlap_h=" + std::to_string(overlap_h)
                            + " overlap_v=" + std::to_string(overlap_v)
                            + " blend_w=" + std::to_string(blend_w));
   return tasks;
@@ -1150,6 +1238,33 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
              frames_locked_(false), locked_frame_idx_(0) {
   Logger::GetInstance().Initialize();
   Logger::GetInstance().Log("[App] Application starting...");
+
+  // Sprint 4-A (2026-07-14): 启动期调 camera_intrinsics::CalibrationConfig::
+  //   LoadOrDefault 把 params/calibration.yaml 覆盖到全局 Intrinsics 存储.
+  //   失败/缺文件时保留默认 (FOV 101/68 deg 反推的 fx/fy, yaw 全 0).
+  //   这里打印每 cam 关键字段, 启动期可见 (也方便诊断 4-B 算 layout 是否正常).
+  if (camera_intrinsics::CalibrationConfig::LoadOrDefault(
+          "../params/calibration.yaml")) {
+    Logger::GetInstance().Log(
+        "[App] [Sprint4-A] calibration loaded from ../params/calibration.yaml");
+  } else {
+    Logger::GetInstance().Log(
+        "[App] [Sprint4-A] calibration yaml missing/invalid, using defaults "
+        "(fx=1052.55 fy=1068.89 from FOV 101x68 deg, all yaw=0)");
+  }
+  for (int i = 0; i < camera_intrinsics::kNumCams; ++i) {
+    const auto& cam = camera_intrinsics::ForCam(i);
+    std::ostringstream os;
+    os << "[App] [Sprint4-A] cam" << i
+       << " image=" << cam.image_w << "x" << cam.image_h
+       << " fx=" << cam.fx << " fy=" << cam.fy
+       << " cx=" << cam.cx << " cy=" << cam.cy
+       << " yaw_h=" << cam.yaw_h_deg << "deg yaw_v=" << cam.yaw_v_deg << "deg"
+       << " dist=[k1=" << cam.k1 << " k2=" << cam.k2
+       << " p1=" << cam.p1 << " p2=" << cam.p2 << "]";
+    Logger::GetInstance().Log(os.str());
+  }
+
   Logger::GetInstance().Log(string("[App] Visual tuning: ") + (visual_mode_ ? "ENABLED" : "DISABLED (set ENABLE_VISUAL_TUNING=1 to enable)"));
 
   // 阶段 2: MJPEG 推流参数 (CameraPage "实时预览" 用). MJPEG_INTERVAL=1 全速 30 FPS,

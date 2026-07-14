@@ -61,14 +61,14 @@ class StitchingParamGenerator {
     bool try_cuda = false;
     float conf_thresh = 1.f;
     float match_conf = 0.6f;
-    string matcher_type = "homography";
-    string estimator_type = "homography";
-    string ba_cost_func = "reproj";
+    string matcher_type = "affine";  // v3.3: ORB 路径下默认走 Affine 估计 (SIFT 时代默认 homography)
+    string estimator_type = "affine";  // v3.3: 6 路固定支架 + 顶视用 Affine 估计更稳
+    string ba_cost_func = "no";  // v3.3: 6 路 Affine 场景下 BA 收益有限, 默认 no; 想精修可改 "affine" (BundleAdjusterAffinePartial)
     string ba_refine_mask = "xxxxx";
     cv::detail::WaveCorrectKind wave_correct = cv::detail::WAVE_CORRECT_HORIZ;
     bool save_graph = false;
     string save_graph_to;
-    string warp_type = "spherical";
+    string warp_type = "plane";  // v3.3: GC4683 顶视平面场景, 改默认 plane (原 spherical 适合手持全景)
     int expos_comp_type = cv::detail::ExposureCompensator::GAIN_BLOCKS;
     int expos_comp_nr_feeds = 1;
     int expos_comp_nr_filtering = 2;

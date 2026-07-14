@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 Codex / Claude Code / 其他 AI agent 入口。详细设计、踩坑记录、操作手册见 `docs/`：
 
@@ -48,6 +48,15 @@ rtspsrc → rtph264depay → mppvideodec (DMA-BUF) → RGA crop/rotate → OpenC
 
 6 路 2×3 layout 已端到端跑通（v2.5 2026-07-07, 绿条纹修复后 100+ fps）→ v3.0（2026-07-08）切换为 6 路 IP camera RTSP，Sprint 0 骨架贯通（yaml + TCP/554 + gst-launch 烟测 + 编译 + 30s 端到端验证脚本就绪）。下一步：Sprint 1（同步 + 稳定 + watchdog）。
 
+**v3.3 (2026-07-14) SIFT -> ORB 改造完成**（前置 5-PRE, 见 `docs/USER_GOAL_ROADMAP.md` § 5-PRE）：`src/stitching_param_generater.cc` 内置特征描述子由 SIFT (float L2) 切到 ORB (binary 32 字节, `BFMatcher(NORM_HAMMING) + KNN(2) + Lowe ratio 0.65`); 内部新增 `OrbFeaturesFinder`（继承 `cv::detail::FeaturesFinder`）+ `OrbPairwiseMatcher`（继承 `cv::detail::FeaturesMatcher`）; `include/stitching_param_generater.h` 默认改 `matcher_type=affine / estimator_type=affine / ba_cost_func=no / warp_type=plane`。**RGA crop/rotate + OpenCL 接缝羽化 加速栈零变化**（不动主路径）。
+**v3.4 (2026-07-14) 架构重新规划: 前景/后景分离 + IPM + Seam-based 合成 (计划, 未实施)**（见 `docs/USER_GOAL_ROADMAP.md` § 0.5 核心原则 + § 2 Sprint 5）：
+
+- **后景 (静态地面 + 静态家具)**: 离线标定 6 路 K/D/R/t + 离地高 H + 俯角 θ → `params/calibration.yaml`; 离线算 IPM LUT (`params/ipm_lut_0..5.png`, CV_32FC2, 8MB/路) + 默认 seam (`params/seam_default_0..6.png`) + saliency heatmap (1 周累积)。 实时只做查表和合成, 算力几乎为 0。
+- **前景 (走动的人)**: **不试图把两路对齐** (几何不可能 — 立体人两台相机视线夹角不同, 任何 2D 变换都对不齐)。 重叠区不做 α/多频段混合, 用 seam 切开, 检出人跨 seam 时把 seam 局部推开 (`src/image_stitcher.cc::PushSeam` 5-FG-A 新建)。
+- **架构硬约束零突破**: RGA `imremap` 接 CV_32FC2 IPM LUT (替代现 0/90 旋转路径) 仍走 DMA-BUF 零拷贝; OpenCL 硬切+3px 窄带替代现 α blend, 仍 `clImportMemoryARM` 零拷贝; 算力 ~10ms / 帧 远超 30 fps 预算。
+- **不接受的方案**: DH 双单应 / APAP / AANAP (立体人 2D warp 假设不成立, 工程复杂但收益不抵); 全幅 α 羽化 / 多频段 (重影物理根源没解决, 只能压低不能消除); IPM CPU 软算 (架构硬约束禁止)。
+- **新增文件**: `src/calibration.cc/.h`, `src/bg_subtractor.cc/.h`, `src/seam_tracker.cc/.h`, `tools/calibrate_6cam.cpp`。
+- **Sprint 5 子段**: 5-PRE (ORB 必做) → 5-IPM-A (标定+IPM LUT, 1.5 周离线) → 5-IPM-B (实时 IPM remap, 1 周) → 5-IPM-C (多平面 IPM 可选, 1 周) → 5-SEAM-A (GraphCut 默认 seam, 1 周) → 5-SEAM-B (硬切+窄带, 1 周) → 5-FG-A (背景减除+局部形变, 1 周) → 5-FG-B (Kalman, 0.5 周) → 5-SAL (saliency 累积, 0.5 周离线)。 总工时 ~7.5 周。
 详细状态 & 测试命令：见 `docs/NETWORK_CAMERA_PLAN.md` §9 实施分期 & `tools/sprint0_smoke.sh`。
 
 ## 常用命令
@@ -86,15 +95,18 @@ sudo cat /sys/class/devfreq/27800000.gpu/load                    # GPU 负载
 
 | 文件 | 职责 |
 |---|---|
-| `src/app.cc` | 主循环、ROI bootstrap、布局 |
+| `src/app.cc` | 主循环、ROI bootstrap、布局、启动期读 IPM LUT / seam mask / 标定 yaml (v3.4) |
 | `src/sensor_data_interface.cc` | 每路相机一个解码/采集线程（v3.0：rtspsrc + watchdog） |
 | `src/gst_mpp_decoder.cc` | gstreamer pipeline（v2.4 起接管 mppvideodec，输出 NV12 DMA-BUF fd + DIAG 诊断段） |
-| `src/image_stitcher.cc` | RGA/GLES warp, OpenCL 接缝, `dma_buf_cache_` |
-| `src/rk_gles_warper.cc` | EGL+GLES warp via DMA-BUF import（可选，初始化失败静默回退） |
+| `src/image_stitcher.cc` | RGA `imremap` IPM (v3.4) + 硬切+窄带 OpenCL seam 合成 (v3.4) + 背景减除 hook + PushSeam 局部形变, `dma_buf_cache_` |
+| `src/calibration.cc` (v3.4 新) | 6 路 K/D/R/t 加载; IPM LUT 计算 (CV_32FC2); seam mask 加载; saliency heatmap 加载 |
+| `src/bg_subtractor.cc` (v3.4 新) | 滑动平均背景模型 + 0/255 fg_mask 输出 (per-camera, 线程安全) |
+| `src/seam_tracker.cc` (v3.4 新) | Kalman 滤波 `[seam_x, velocity_x]` (按 y 索引的 1D seam) + max_displacement clamp |
+| `src/rk_gles_warper.cc` | EGL+GLES warp via DMA-BUF import（v3.4 起作为 IPM remap 的 GLES 备份路径, RGA 不可用时降级） |
 | `src/drm_allocator.cc` | DRM dumb buffer 分配 |
 | `src/roi_config.cc` + `src/roi_visualizer.cc` | ROI YAML 读写 + SDL2 可视化调参 |
 | `src/http_server.cc` + `src/status_writer.cc` | CameraPage HTTP server (cpp-httplib, 端口 8080) + 状态 JSON 写入 |
-
+| `tools/calibrate_6cam.cpp` (v3.4 新) | 棋盘格标定工具: 6 路 K/D/R/t 求解 → `params/calibration.yaml` |
 ## 6 路硬编码位置速查（2×3 迁移时改动）
 
 | 位置 | 当前 | 目标 |
@@ -105,7 +117,13 @@ sudo cat /sys/class/devfreq/27800000.gpu/load                    # GPU 负载
 | `src/image_stitcher.cc:BlendSeams` | 6 路 + 6 dispatch_seam | — |
 | `src/roi_visualizer.cc` Tab | 4→6 cam 循环已完成 | — |
 | `params/camera_sources.yaml` | 6 路 cam 块（v3.0: `type: rtsp`） | — |
-
+| `src/stitching_param_generater.cc` (v3.3) | 内部新增 `OrbFeaturesFinder` + `OrbPairwiseMatcher`; 默认 `matcher_type=affine / estimator_type=affine / ba_cost_func=no / warp_type=plane`. 描述子对 `AffineBasedEstimator` / `BundleAdjuster*` 透明, **RGA+OpenCL 加速栈零变化** | — |
+| `src/calibration.cc` (v3.4 计划) | 6 路 K/D/R/t 加载 + IPM LUT 计算 (CV_32FC2, 8MB/路) + seam mask 加载; **离线标定, 启动读不重算** | `params/calibration.yaml` + `params/ipm_lut_0..5.png` + `params/seam_default_0..6.png` |
+| `src/bg_subtractor.cc` (v3.4 计划) | 6 路滑动平均背景模型 + 0/255 fg_mask; 实时, 每路独立 bg, 线程安全 | — |
+| `src/seam_tracker.cc` (v3.4 计划) | Kalman 滤波 `[seam_x, velocity_x]` (按 y 索引) + max_displacement clamp 20 px | — |
+| `src/image_stitcher.cc::WarpImages` (v3.4 计划) | RGA `imremap` 接 CV_32FC2 IPM LUT (替代现 0/90 旋转路径); 仍走 DMA-BUF 零拷贝 | — |
+| `src/image_stitcher.cc::BlendSeams` (v3.4 计划) | 硬切 + seam ± 3 px 窄带混合 (替代现 α blend); 仍走 `clImportMemoryARM` 零拷贝 | — |
+| `tools/calibrate_6cam.cpp` (v3.4 计划) | 棋盘格 6 路标定 → `params/calibration.yaml` | — |
 **yaml 框架已支持任意路数**：`params/camera_sources.yaml` 加新 cam 块即可，不动 C++ 代码。
 
 ## 命名规范

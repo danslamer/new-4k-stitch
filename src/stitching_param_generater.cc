@@ -5,11 +5,11 @@
 
 /**
  * @file stitching_param_generater.cc
- * @brief 拼接参数生成器实现
+ * @brief 闁瑰嘲鍚嬬敮鎾矗閸屾稒娈堕柣銏㈠枑閸ㄦ岸宕抽妸銉ф澖闁?
  * 
- * 基于OpenCV的stitching_detailed示例修改，用于生成相机内外参数、
- * 图像特征、单应性矩阵和变形映射，为全景拼接提供基础参数。
- * 注意：该模块在当前工程中未被使用，保留以备技术演进。
+ * 闁糕晞妗ㄧ花鐞宲enCV闁汇劌澧晅itching_detailed缂佲偓鏉炴壆浼愬ǎ鍥跺枟閺佸ジ鏁嶅畝鈧弫銈嗙鎼达絾鏅搁柟瀛樺姉濞村寮甸崫鍕暥濠㈣埖鐗曞顒勫极閼割兘鍋?
+ * 闁搞儲鍎抽崕姘舵偋閻熸壆绐欓柕鍡曠瀹曠喐鎯旈弮鈧埀顑懐鍙愰梻鍐涧閹蜂即宕ｅΟ楦垮煂闁哄嫮濮撮惃鐘绘晬鐏炶壈绀嬮柛蹇嬪妽濞呮瑩骞忛崗鐓庡闁圭粯鍔掔欢鐢稿春閾忚鏀ㄩ柛娆忓€归弳鐔煎Υ?
+ * 婵炲鍔嶉崜浼存晬濮樻剚鍤夋俊顖椻偓铏仴闁革负鍔岀紞瀣礈瀹ュ懍绱ｇ紒瀣儎閼垫垿寮甸鍥舵蕉濞达綀娉曢弫銈夋晬鐏炶偐绠介柣锝嗙懁娴滄帗寰勯崶銊ノ楅柡鍫灡缁便劍娼诲☉鏍ゅ亾?
  */
 
 #include "stitching_param_generater.h"
@@ -30,15 +30,108 @@ using namespace cv::detail;
 #define ENABLE_LOG 0
 #define LOG(msg) do { std::ostringstream log_stream; log_stream << msg; Logger::GetInstance().Log(log_stream.str()); } while (false)
 #define LOGLN(msg) LOG(msg)
+// ============================================================================
+// v3.3 (2026-07-14) SIFT -> ORB 鏀归€?- 鑷疄鐜?cv::detail::FeaturesFinder /
+// FeaturesMatcher (NORM_HAMMING binary descriptor 璺緞).
+//   - 纭害鏉? 鎻忚堪瀛愮被鍨?ORB binary (32 瀛楄妭 / kp), 涓嶈鍥為€€鍒?SIFT/SURF.
+//   - 纭害鏉? 鍖归厤璺濈 NORM_HAMMING, 涓嶈鍥為€€鍒?L2.
+//   - 杩欎袱涓被瀵?AffineBasedEstimator / HomographyBasedEstimator / BundleAdjuster
+//     閮芥槸閫忔槑鐨?(瀹冧滑鍙湅 keypoints + matches, 涓嶇湅 descriptor 瀛楄妭甯冨眬).
+// ============================================================================
+namespace {
+
+class OrbFeaturesFinder : public cv::detail::FeaturesFinder {
+ public:
+  explicit OrbFeaturesFinder(int n_features = 4000,
+                             float scale_factor = 1.2f,
+                             int n_levels = 8,
+                             int edge_threshold = 31,
+                             int first_level = 0,
+                             int wta_k = 2,
+                             int score_type = cv::ORB::HARRIS_SCORE,
+                             int patch_size = 31)
+      : orb_(cv::ORB::create(n_features, scale_factor, n_levels,
+                              edge_threshold, first_level, wta_k,
+                              score_type, patch_size)) {}
+
+ protected:
+  void find(const cv::Mat& image,
+            cv::detail::ImageFeatures& features) override {
+    features.img_idx = -1;
+    features.img_size = image.size();
+    features.keypoints.clear();
+    features.descriptors.release();
+    if (image.empty()) {
+      return;
+    }
+    cv::Mat gray = image;
+    if (gray.channels() != 1) {
+      cv::cvtColor(gray, gray, cv::COLOR_BGR2GRAY);
+    }
+    if (gray.type() != CV_8U) {
+      gray.convertTo(gray, CV_8U);
+    }
+    orb_->detectAndCompute(gray, cv::noArray(),
+                           features.keypoints, features.descriptors);
+  }
+
+ private:
+  cv::Ptr<cv::ORB> orb_;
+};
+
+class OrbPairwiseMatcher : public cv::detail::FeaturesMatcher {
+ public:
+  explicit OrbPairwiseMatcher(float match_conf = 0.65f, int knn = 2)
+      : cv::detail::FeaturesMatcher(false),
+        match_conf_(match_conf),
+        knn_(knn) {}
+
+  void match(const cv::detail::ImageFeatures& features1,
+             const cv::detail::ImageFeatures& features2,
+             cv::detail::MatchesInfo& matches_info) override {
+    matches_info = cv::detail::MatchesInfo{};
+    matches_info.src_img_idx = features1.img_idx;
+    matches_info.dst_img_idx = features2.img_idx;
+
+    if (features1.descriptors.empty() ||
+        features1.descriptors.type() != CV_8U ||
+        features2.descriptors.empty() ||
+        features2.descriptors.type() != CV_8U) {
+      return;
+    }
+
+    cv::BFMatcher matcher(cv::NORM_HAMMING);
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    matcher.knnMatch(features1.descriptors, features2.descriptors,
+                     knn_matches, knn_);
+
+    std::vector<cv::DMatch> good;
+    good.reserve(knn_matches.size());
+    for (const auto& m : knn_matches) {
+      if (m.size() < 2) continue;
+      // Lowe ratio test - binary descriptor 甯哥敤 0.65, 姣?SIFT (0.7) 涓ユ牸.
+      if (m[0].distance >= m[1].distance * match_conf_) continue;
+      good.push_back(m[0]);
+    }
+    matches_info.matches = std::move(good);
+    // Affine/Homography estimator 鍐呴儴浼氳窇 RANSAC 閲嶇畻 inliers_mask / H / confidence.
+  }
+
+ private:
+  float match_conf_;
+  int knn_;
+};
+
+}  // namespace
 
 /**
- * @brief StitchingParamGenerator构造函数
- * 初始化拼接参数生成器，执行完整的参数生成流程：
- * 1. 初始化内存空间
- * 2. 畸变校正
- * 3. 相机参数估计
- * 4. 变形器初始化
- * @param image_vector 输入的多帧图像向量，应包含待拼接的所有图像
+ * @brief StitchingParamGenerator闁哄瀚伴埀顒傚Т閸ら亶寮?
+ * 闁告帗绻傞～鎰板礌閺嶃劌顏婚柟鎭掑劚瀵剟寮幍顔芥櫢闁瑰瓨鍔曞▍鎺楁晬鐏炴儳鈷旈悶娑樿嫰閻ｎ剟寮€靛憡鐣遍柛娆忓€归弳鐔兼偨閻旂鐏囨繛缈犺兌閳诲ジ鏁?
+ * 1. 闁告帗绻傞～鎰板礌閺嵮冩暥閻庢稒顭囬埞鏍⒒?
+ * 2. 闁伙絿顭堣ぐ澶愬冀閳╁喚鍔€
+ * 3. 闁烩晛鎲″┃鈧柛娆忓€归弳鐔稿閹峰矈鍚€
+ * 4. 闁告瑦锚閼镐即宕抽妸銉ョ仴濠殿喖顑呯€?
+ * @param image_vector 閺夊牊鎸搁崣鍡涙儍閸曨偒妯嬮悽顖嗗啯绂堥柛宥呯箰閹粓鏌岃箛銉х閹煎瓨鏌ㄧ€垫﹢宕ラ銏㈢闁瑰嘲鍚嬬敮鎾儍閸曨剙顣查柡鍫濐槸濞存﹢宕?
  */
 StitchingParamGenerator::StitchingParamGenerator(
     const vector<cv::Mat>& image_vector) {
@@ -81,18 +174,23 @@ StitchingParamGenerator::StitchingParamGenerator(
 }
 
 /**
- * @brief 初始化相机参数
+ * @brief 闁告帗绻傞～鎰板礌閺嶎偅绁查柡鍫濇惈瀵剟寮?
  * 
- * 执行以下步骤：
- * 1. 使用SIFT特征提取多张图像的特征点
- * 2. 进行特征点匹配（根据matcher_type选择匹配策略）
- * 3. 基于匹配的特征点估计相机间的单应性矩阵
- * 4. 光束平差（Bundle Adjustment）优化相机参数
- * 5. 波形校正以消除倾斜
+ * 闁圭瑳鍡╂斀濞寸姰鍎扮粭鍛潰閵夆晩鈧啴鏁?
+ * 1. 濞达綀娉曢弫顥笽FT闁绘鎳撶欢娑㈠箵閹邦剙绲垮鑸佃壘缁卞爼宕堕幆褍鍓奸柣銊ュ婢规帒顕ユ担鍝勪化
+ * 2. 閺夆晜绋栭、鎴︽偋閻熸壆绐欓柣鎰嚀鐏忣噣鏌婂蹇曠闁哄秷顫夊畵涔礱tcher_type闂侇偄顦扮€氥劑宕犺ぐ鎺戝赋缂佹稒鐗滈弳鎰版晬?
+ * 3. 闁糕晞妗ㄧ花顒勫礌瑜版帒甯抽柣銊ュ婢规帒顕ユ担鍝勪化濞村吋濯介鎼佹儎閸涘﹥绨氶梻鍌氼嚟濞堟垿宕￠弴鐐靛畨闁诡儸鍛彁闂?
+ * 4. 闁稿繐顦板顐︾嵁閸愬弶鈻曢柨娑樻箰undle Adjustment闁挎稑顦槐顓㈠礌閺嶎偅绁查柡鍫濇惈瀵剟寮?
+ * 5. 婵炲鍨归懜浼村冀閳╁喚鍔€濞寸姰鍎茬粔鐑芥⒔閵堝應鍋撻悙顒佺仒
  */
 void StitchingParamGenerator::InitCameraParam() {
-  Ptr<Feature2D> finder;
-  finder = SIFT::create();
+  // v3.3 (2026-07-14): SIFT -> ORB.
+  //   原实现: SIFT::create() + AffineBestOf2NearestMatcher (L2 float desc).
+  //   新实现: OrbFeaturesFinder (binary 32 字节) + OrbPairwiseMatcher
+  //           (BFMatcher NORM_HAMMING + KNN(2) + Lowe ratio).
+  //   AffineBasedEstimator / HomographyBasedEstimator / BundleAdjuster 对
+  //   描述子字节布局透明, 不需要改.
+  Ptr<FeaturesFinder> finder = makePtr<OrbFeaturesFinder>(4000);
   vector<ImageFeatures> features(num_img_);
   vector<Size> full_img_sizes(num_img_);
   for (int i = 0; i < num_img_; ++i) {
@@ -103,14 +201,9 @@ void StitchingParamGenerator::InitCameraParam() {
   }
   LOG("Pairwise matching");
   vector<MatchesInfo> pairwise_matches;
-  Ptr<FeaturesMatcher> matcher;
-  if (matcher_type == "affine")
-    matcher = makePtr<AffineBestOf2NearestMatcher>(false, try_cuda, match_conf);
-  else if (range_width == -1)
-    matcher = makePtr<BestOf2NearestMatcher>(try_cuda, match_conf);
-  else
-    matcher = makePtr<BestOf2NearestRangeMatcher>(range_width, try_cuda,
-                                                  match_conf);
+  // matcher_type / range_width 在新 ORB 路径下都走 OrbPairwiseMatcher.
+  // 保留字段名以保持 yaml / 代码可读, 后续若需要不同匹配策略可在此分发.
+  Ptr<FeaturesMatcher> matcher = makePtr<OrbPairwiseMatcher>(match_conf);
   (*matcher)(features, pairwise_matches);
   matcher->collectGarbage();
   // Check if we should save matches graph
@@ -175,15 +268,15 @@ void StitchingParamGenerator::InitCameraParam() {
 
 
 /**
- * @brief 初始化变形器
+ * @brief 闁告帗绻傞～鎰板礌閺嵮冪秮鐟滆埇鍨瑰▍?
  * 
- * 执行以下步骤：
- * 1. 计算中位焦距用于变形
- * 2. 创建变形器（支持平面、圆柱、球面等多种变形方式）
- * 3. 为每幅图像构建变形映射
- * 4. 生成图像掩码并进行变形
- * 5. 计算拼接后的全景图ROI（感兴趣区域）
- * 6. 对相邻图像进行边界调整以消除重叠
+ * 闁圭瑳鍡╂斀濞寸姰鍎扮粭鍛潰閵夆晩鈧啴鏁?
+ * 1. 閻犱緤绱曢悾缁樼▔椤撴繄绉撮柣鎺炵畳缁愭盯鎮介妸銈囪壘闁告瑦锚閼?
+ * 2. 闁告帗绋戠紓鎾诲矗濡缚鍩岄柛锝庣厜缁辨瑩寮ㄩ娑樼槷妤犵偞濞婂浼村Υ娴ｅ憡濡囬柡灞肩┒閳ь兛鑳堕幃鍡涙閵忋垻鎼煎鑸垫皑椤帡宕ｅΟ楦垮煂闁哄倻鎳撶槐锟犳晬?
+ * 3. 濞戞挾鍎ら惁锟犵嵁閸涱厽绂堥柛宥呯箲閻庮垰顕欓崫鍕秮鐟滆埇鍨哄Σ褏浜?
+ * 4. 闁汇垻鍠愰崹姘跺炊閹冨壖闁硅　鏅濋悥婊堢嵁閹壆绠婚悶娑樿嫰瑜板銇?
+ * 5. 閻犱緤绱曢悾濠氬箯閸忕厧澶嶉柛姘捣濞堟垿宕楅妸锔界彲闁搞儳鍐琌I闁挎稑鐗婇崝鍛村礂绾惧褰柛鏍ф惈閻撴瑩鏁?
+ * 6. 閻庨潧婀卞ù澶愭焽鐠囧弶绂堥柛宥呯箺缁绘鎮板畝鍐彾闁伙絽鐭侀惃鐔煎极缂堢姳绨版繛鎴濈墦濞呭酣鏌屽鍛秾
  */
 void StitchingParamGenerator::InitWarper() {
 
@@ -383,20 +476,20 @@ void StitchingParamGenerator::InitWarper() {
 
 
 /**
- * @brief 初始化畸变校正映射
+ * @brief 闁告帗绻傞～鎰板礌閺嶎偅姣勯柛娆惿戦悧搴☆潰閿濆棙衼閻?
  * 
- * 执行以下步骤：
- * 1. 从params文件夹加载YAML标定文件（camchain_*.yaml）
- * 2. 读取相机内参矩阵（KMat）、畸变系数（D）、外参（RMat）
- * 3. 处理分辨率缩放（如果输入分辨率与标定分辨率不同）
- * 4. 生成畸变校正的坐标映射（用于cv::remap）
+ * 闁圭瑳鍡╂斀濞寸姰鍎扮粭鍛潰閵夆晩鈧啴鏁?
+ * 1. 濞寸姴绐媋rams闁哄倸娲ｅ▎銏″緞閻熸澘顫ｉ弶鐐电ゼAML闁哄秴娲ら悾楣冨棘閸ワ附顐介柨娑樻綇amchain_*.yaml闁?
+ * 2. 閻犲洩顕цぐ鍥儎閸涘﹥绨氶柛鎰噹瀵剟鎯岄埡鍛枅闁挎稑婀燤at闁挎稑顦埀顑胯兌閺嗏晠宕ｅΟ濂稿厙闁轰礁搴滅槐姗犻柨娑橆槶閳ь兛绀侀ˇ濠氬矗閸岋妇绀凴Mat闁?
+ * 3. 濠㈣泛瀚幃濠囧礆閸℃岸鍝洪柣婊冩川缂傚寮ㄩ幘鍛濠碘€冲€归悘澶嬫綇閹惧啿寮抽柛鎺戞妞存悂鎮抽崶锔剧憿闁哄秴娲ら悾楣冨礆閸℃岸鍝洪柣婊冩矗缁楀宕ュ畝瀣
+ * 4. 闁汇垻鍠愰崹姘舵偩缁嬪灝缍侀柡宥佸墲椤掓粓鎯冮崟顐ｇ稄闁哄秴娲﹀Σ褏浜搁崟鍓佺闁活潿鍔嬬花鐞::remap闁?
  * 
- * 标定文件格式（params/camchain_i.yaml）：
- * - KMat: 3x3相机内参矩阵
- * - D: 畸变系数向量
- * - RMat: 3x3旋转矩阵（相对于第一个相机）
- * - focal: 焦距
- * - width/height: 标定时的图像分辨率
+ * 闁哄秴娲ら悾楣冨棘閸ワ附顐介柡宥囧帶缁憋繝鏁嶉崸顪ams/camchain_i.yaml闁挎稑顧€缁?
+ * - KMat: 3x3闁烩晛鎲″┃鈧柛鎰噹瀵剟鎯岄埡鍛枅
+ * - D: 闁伙絿顭堣ぐ澶屽寲缂佹ɑ娈堕柛姘灴閸?
+ * - RMat: 3x3闁哄啫顑堝ù鍡涙儗閳哄懏鈻堥柨娑樼墢濞村鈧敻鈧稓鑹剧紒妤婂厸缁斿瓨绋夐鍡樼ゲ闁哄牏灏ㄧ槐?
+ * - focal: 闁绘帪绠掔粣?
+ * - width/height: 闁哄秴娲ら悾楣冨籍閸撲焦鐣遍柛銉﹀劤閸庢岸宕氶崱姘跺摵闁?
  */
 void StitchingParamGenerator::InitUndistortMap() {
   std::vector<double> cam_focal_vector(num_img_);
@@ -480,18 +573,18 @@ void StitchingParamGenerator::InitUndistortMap() {
 }
 
 /**
- * @brief 获取所有重投影参数
+ * @brief 闁兼儳鍢茶ぐ鍥箥閳ь剟寮垫径鎰闁硅埖娲栨總鏍矗閸屾稒娈?
  * 
- * 返回通过初始化过程计算得到的所有参数，供外部使用：
- * - 畸变校正映射：用于cv::remap进行图像校正
- * - 重投影映射：用于cv::remap进行观点变换（透视投影）
- * - 精化后的ROI：每个图像在拼接画布中的位置和大小
+ * 閺夆晜鏌ㄥú鏍焻濮樺磭绠栭柛鎺撶箓椤劙宕犻弽顒傜畺缂佸顑堥鍝ョ不濡も偓缁堕亶宕氶幍顔界暠闁圭鍋撻柡鍫濐槸瀵剟寮敮顔剧濞撴碍绋戦ˇ濠氭焾閵娿倕鈻忛柣銏╃厜缁?
+ * - 闁伙絿顭堣ぐ澶愬冀閳╁喚鍔€闁哄嫮濮撮惃鐘绘晬濮樿鲸鏆忓ù婊冪┋v::remap閺夆晜绋栭、鎴﹀炊閹冨壖闁哄秮鍓濋?
+ * - 闂佹彃绉垫慨鍥亹鏉堛劍衼閻忓繐瀚哥槐浼存偨閵娿倗鑹綾v::remap閺夆晜绋栭、鎴犳喆閸屾粌浠柛娆惿戝畷鏌ユ晬閸儮鍋撹箛姘兼綊闁硅埖娲栨總鏍晬?
+ * - 缂侇喗鍎崇€垫煡宕ユ惔锝嗙暠ROI闁挎稒纰嶉惁鈩冪▔椤忓嫭绂堥柛宥呯箰濠€顏堝箯閸忕厧澶嶉柣銏ｎ嚙缁旈攱绋夐鐘崇暠濞达絽绉堕悿鍡涘椽鐏炲浜ｉ悘?
  * 
- * @param undist_xmap_vector 输出：畸变校正的X坐标映射
- * @param undist_ymap_vector 输出：畸变校正的Y坐标映射
- * @param reproj_xmap_vector 输出：重投影的X坐标映射
- * @param reproj_ymap_vector 输出：重投影的Y坐标映射
- * @param projected_image_roi_vect_refined 输出：精化后的图像ROI（每个图像在全景图中的位置）
+ * @param undist_xmap_vector 閺夊牊鎸搁崵顓㈡晬濮樿鲸姣勯柛娆惿戦悧搴☆潰閿濆洦鐣盭闁秆勫姈閻栵綁寮伴悩鑼
+ * @param undist_ymap_vector 閺夊牊鎸搁崵顓㈡晬濮樿鲸姣勯柛娆惿戦悧搴☆潰閿濆洦鐣盰闁秆勫姈閻栵綁寮伴悩鑼
+ * @param reproj_xmap_vector 閺夊牊鎸搁崵顓㈡晬濮樿泛娅㈤柟鑸垫礀婵傛牠鎯冮崚瀣锤閹邦厾鍨奸柡鍕Т閻?
+ * @param reproj_ymap_vector 閺夊牊鎸搁崵顓㈡晬濮樿泛娅㈤柟鑸垫礀婵傛牠鎯冮崚宀勫锤閹邦厾鍨奸柡鍕Т閻?
+ * @param projected_image_roi_vect_refined 閺夊牊鎸搁崵顓㈡晬濮樿京缈遍柛鏍ㄧ墪閹鎯冮崟顐ｇ闁稿秴绮篛I闁挎稑鐗婇惁鈩冪▔椤忓嫭绂堥柛宥呯箰濠€顏堝礂閵婏附鐝柛銉ュ綖閼垫垿鎯冮崟顏嗙Т缂傚喚鍣槐?
  */
 void StitchingParamGenerator::GetReprojParams(
     vector<cv::UMat>& undist_xmap_vector,
