@@ -93,7 +93,7 @@ cameras:
     use_tcp: true
   # cam4 → (row 2, col 0) 左下 = 192.168.1.15
   - type: rtsp
-    uri: "rtsp://admin:123456@192.168.1.23:554/video1"
+    uri: "rtsp://admin:123456@192.168.1.24:554/video1"
     width: 2560
     height: 1440
     fps: 30
@@ -104,7 +104,7 @@ cameras:
     use_tcp: true
   # cam5 → (row 2, col 1) 右下 = 192.168.1.14
   - type: rtsp
-    uri: "rtsp://admin:123456@192.168.1.24:554/video1"
+    uri: "rtsp://admin:123456@192.168.1.23:554/video1"
     width: 2560
     height: 1440
     fps: 30
