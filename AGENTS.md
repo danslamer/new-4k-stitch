@@ -99,7 +99,8 @@ sudo cat /sys/class/devfreq/27800000.gpu/load                    # GPU 负载
 | `src/sensor_data_interface.cc` | 每路相机一个解码/采集线程（v3.0：rtspsrc + watchdog） |
 | `src/gst_mpp_decoder.cc` | gstreamer pipeline（v2.4 起接管 mppvideodec，输出 NV12 DMA-BUF fd + DIAG 诊断段） |
 | `src/image_stitcher.cc` | RGA `imremap` IPM (v3.4) + 硬切+窄带 OpenCL seam 合成 (v3.4) + 背景减除 hook + PushSeam 局部形变, `dma_buf_cache_` |
-| `src/calibration.cc` (v3.4 新) | 6 路 K/D/R/t 加载; IPM LUT 计算 (CV_32FC2); seam mask 加载; saliency heatmap 加载 |
+| `src/calibration.cc` (v3.4 新) | 6 路 K/D/R/t 加载; seam mask 加载; saliency heatmap 加载 (与 v3.4 AANAP 共用) |
+| `src/aanap_warp.cc` (v3.4 新, 2026-07-15 修正) | AANAP 全局 H (ORB+RANSAC) + per-image 相似变换 T_sim 估计; 输出 CV_32FC2 xmap/ymap 落盘 `params/aanap_warp_0..5.png`; 静态多平面主路径 (替代 v3.4 初版的 IPM-only) |
 | `src/bg_subtractor.cc` (v3.4 新) | 滑动平均背景模型 + 0/255 fg_mask 输出 (per-camera, 线程安全) |
 | `src/seam_tracker.cc` (v3.4 新) | Kalman 滤波 `[seam_x, velocity_x]` (按 y 索引的 1D seam) + max_displacement clamp |
 | `src/rk_gles_warper.cc` | EGL+GLES warp via DMA-BUF import（v3.4 起作为 IPM remap 的 GLES 备份路径, RGA 不可用时降级） |

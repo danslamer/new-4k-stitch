@@ -25,6 +25,10 @@ extern "C" {
 // v3.0: pthread mutex / cond. gstreamer 回调里有可能用到.
 #include <chrono>
 #include <mutex>
+#include <cerrno>      // errno
+#include <sys/stat.h>  // stat
+#include <unistd.h>    // (used by gstreamer; future hooks)
+#include <fcntl.h>     // (used by gstreamer; future hooks)
 #include <sstream>
 #include <thread>
 
@@ -415,6 +419,36 @@ bool GstMppDecoder::StartRtsp(const std::string& url, const std::string& user_id
   // 启动 watchdog (rtsp 专属). file 路径不启.
   StartReconnectWatchdog();
   return true;
+}
+
+// ============================================================================
+// ★ Sprint 4-MIPI (2026-07-15): StartMipi()
+//   启动 v4l2src 路径 (走 ISP 输出 NV12 DMA-BUF).
+//   失败时返回 false, 调用方应回退到 BlackFrameProvider
+//   (SensorDataInterface::StartDecodeThreads 已经做了这一步).
+//
+// io_mode 复用 uri_ 字段存 (dmabuf / mmap); mipi_device_path_ 是 /dev/videoN.
+//   is_eos_ 由 IsEos() 暴露, watchdog 不启 (mipi 缺流时 v4l2src 会负数帧计数).
+// ============================================================================
+bool GstMppDecoder::StartMipi(const std::string& device_path,
+                              const std::string& io_mode,
+                              int num_buffers,
+                              int expected_w, int expected_h) {
+  Stop();  // 清干净再开
+  is_rtsp_ = false;
+  is_mipi_ = true;
+  expected_w_ = expected_w;
+  expected_h_ = expected_h;
+  mipi_device_path_ = device_path;
+  uri_ = io_mode;  // reuse: "dmabuf" / "mmap"
+  is_eos_.store(false);
+  first_frame_dumped_ = false;
+
+  // num_buffers (v4l2src num-buffers) 当前 BuildMipiPipeline 里写死 4.
+  // 后续如需用户可配, 加 private int mipi_num_buffers_{4};.
+  (void)num_buffers;
+
+  return BuildMipiPipeline();
 }
 
 bool GstMppDecoder::PullFrame(GstMppFrame& out_frame) {

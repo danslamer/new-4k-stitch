@@ -30,6 +30,22 @@ enum class QueuedFrameStorage {
     kEmpty = 0,
     kSoftwareNV12 = 1,
     kDrmPrime = 2,
+    kBlackFrame = 3,   // Sprint 4-MIPI: 缺设备/打开失败时占位, NV12 全 0, RGA 零拷贝用.
+};
+
+// Sprint 4-MIPI (2026-07-15): 黑图占位帧的 holder. 持有一个一次性分配的
+//   DMA-BUF NV12 buffer (DrmBuffer), lifetime 贯穿队列. 比 gst_sample 简单:
+//   不走 gstreamer, 直接 drm_alloc_nv12 + memset 0 + 后台线程 30 fps 推同
+//   一块; 多个 consumer (stitcher) 各持 shared_ptr<BlackFrameHolder>,
+//   全部释放后才 drm_free.
+#include "drm_allocator.h"
+struct BlackFrameHolder {
+    DrmBuffer drm;
+    int width  = 0;
+    int height = 0;
+    int dma_buf_fd()  const { return drm.fd; }
+    int pitch_px()    const { return drm.pitch; }
+    ~BlackFrameHolder();  // drm_free 析构 (defined in sensor_data_interface.cc)
 };
 
 // v3.0 (2026-07-08) 输入源描述. 加载自 params/camera_sources.yaml.
@@ -39,7 +55,7 @@ enum class QueuedFrameStorage {
 struct CameraSource {
     enum class Type {
         kFile,    // 本地视频文件 (走 gstreamer filesrc → qtdemux → h264parse → mppvideodec)
-        kMipi,    // V4L2 节点 (deprecated, 占位)
+        kMipi,    // MIPI camera V4L2 节点 (走 gstreamer v4l2src + ISP → NV12 DMA-BUF → appsink)
         kRtsp,    // ★ 网络摄像头 RTSP 拉流 (走 rtspsrc → rtph264depay → h264parse → mppvideodec)
     };
 
@@ -48,7 +64,17 @@ struct CameraSource {
     int width = 0;
     int height = 0;
     int fps = 30;
-    std::string pixel_format;     // "NV12" (期望, 仅日志用)
+    std::string pixel_format;     // "NV12" (期望, 仅日志用). MIPI 通常已经是 NV12 (ISP 输出).
+
+    // Sprint 4-MIPI (2026-07-15) MIPI 字段. 仅 is_mipi() 时生效.
+    //   device_path: V4L2 节点绝对路径, e.g. "/dev/video11".
+    //   driver 输出格式默认 NV12 (rockchip vendor SDK ISP pipeline 通常已经 NV12).
+    //   io_mode: dmabuf (零拷贝, 仅要求 sensor driver 支持) 或 mmap (兜底).
+    std::string device_path;       // mipi: /dev/videoN  (仅 is_mipi() 生效)
+    std::string io_mode = "dmabuf"; // mipi: "dmabuf" / "mmap"
+    int v4l2_buffer_count = 4;     // mipi: v4l2src num-buffers (1..8)
+    bool use_isp_pipeline = false; // mipi: true 时把 camera 输出先经 rockchip ISP (rkvideoconvert)
+                                   //      false (默认) 则假定 device 节点已经是 NV12 零拷贝直通.
 
     // ★ v3.0 RTSP 字段. 仅 is_rtsp() 时生效.
     std::string user_id;          // 空 = 无认证
@@ -86,6 +112,9 @@ struct QueuedFrame {
     // 由 gst_mpp_decoder 持有, sample 析构时 gstreamer 自动还 buffer. dma_buf_fd
     // 是 sample 中 GstBuffer 第一个 DMA-BUF 内存的 fd, 给 stitcher 直接 RGA 用.
     std::shared_ptr<_GstSample> gst_sample;
+    // Sprint 4-MIPI: 占位黑帧 holder. storage == kBlackFrame 时由 black_holder
+    //   持有一块一次性分配的 NV12 DMA-BUF (全 0), 析构时自动 drm_free.
+    std::shared_ptr<BlackFrameHolder> black_holder;
     int width = 0;
     int height = 0;
     int stride_w = 0;
@@ -119,6 +148,14 @@ class SensorDataInterface {
     void RecordVideos();
     std::vector<double> GetDecodeFpsSnapshot();
 
+    // Sprint 4-MIPI (2026-07-15): 启动期探测的结果.
+    //   camera_actually_started_[i] == true  -> v4l2src 正常解码
+    //   camera_actually_started_[i] == false -> 该路是黑图占位 (缺设备 / 打开失败)
+    const std::vector<bool>& camera_actually_started() const {
+        return camera_actually_started_;
+    }
+    size_t num_started_real() const;
+
  private:
     void StartDecodeThreads();
     void StopDecodeThreads();
@@ -143,6 +180,16 @@ class SensorDataInterface {
     std::mutex decode_stats_mutex_;
     std::atomic<bool> stop_requested_;
     std::atomic<bool> decode_threads_started_;
+
+    // Sprint 4-MIPI (2026-07-15): 启动结果表 + 失败原因, 给 App::App() 启动期 log / status_writer 用.
+    std::vector<bool> camera_actually_started_;
+    std::vector<std::string> camera_startup_reason_;  // "v4l2src-ok" / "no-device" / "open-fail:..." / "v4l2-timeout"
+
+    // 静态黑帧占位线程. 进入点是 StartDecodeThreads per-thread lambda 在
+    //   mipi 路径 StartMipi 失败时调用. Mark finished on exit.
+    static void BlackFramePushLoop(size_t i,
+                                    std::shared_ptr<BlackFrameHolder> holder,
+                                    SensorDataInterface* self);
 };
 
 #endif  // IMAGE_STITCHING_SENSOR_DATA_INTERFACE_H

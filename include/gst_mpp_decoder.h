@@ -82,6 +82,17 @@ class GstMppDecoder {
                  const std::string& user_pw, const RtspOptions& opts,
                  int expected_w = 0, int expected_h = 0);
 
+  // ★ Sprint 4-MIPI (2026-07-15) MIPI 路径: 启动 v4l2src + (optional ISP) +
+  //   appsink pipeline. device_path 是 /dev/videoN 节点绝对路径.
+  //   io_mode = "dmabuf" 走零拷贝 (要求 sensor driver 支持), "mmap" 是 CPU-side fallback.
+  //   num_buffers 控制 v4l2src 内部 buffer count (1..8).
+  //   期望失败返回 false (errno 或 v4l2src 报错); 调用方在 SensorDataInterface
+  //   内会自动降级到 BlackFrameProvider.
+  bool StartMipi(const std::string& device_path,
+                 const std::string& io_mode,
+                 int num_buffers,
+                 int expected_w = 0, int expected_h = 0);
+
   // 拉一帧, 阻塞. 出错或 EOS 时 is_eos=true.
   // 调用方拿到 GstMppFrame 后, sample 持有 GstBuffer, 直接用 dma_buf_fd 即可
   // (gstreamer 已 DMA-BUF feature on, buffer 是 DMA-BUF 内存).
@@ -101,6 +112,7 @@ class GstMppDecoder {
   // 拆 file / rtsp 两个构造路径, 共享 appsink/DMABuf 提取与 DIAG 日志.
   bool BuildFilePipeline();
   bool BuildRtspPipeline();
+  bool BuildMipiPipeline();  // Sprint 4-MIPI
 
   // rtspsrc 是 sometimes-pads, pad-added 回调动态连 depay.
   // 通过 g_signal_connect (rtspsrc, "pad-added", OnRtspsrcPadAdded, depay) 注册.
@@ -123,7 +135,9 @@ class GstMppDecoder {
 
   // ★ v3.0: rtsp 专属状态.
   bool is_rtsp_ = false;
+  bool is_mipi_ = false;     // Sprint 4-MIPI
   std::string rtsp_url_;
+  std::string mipi_device_path_;  // Sprint 4-MIPI: /dev/videoN
   std::string rtsp_user_id_;
   std::string rtsp_user_pw_;
   RtspOptions rtsp_opts_{};

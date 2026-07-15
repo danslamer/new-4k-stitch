@@ -1265,6 +1265,26 @@ App::App() : num_img_(0), total_cols_(0), height_(0),
     Logger::GetInstance().Log(os.str());
   }
 
+  // Sprint 4-MIPI (2026-07-15): 启动期打印每路 (real / placeholder) 状态.
+  // 注: 这里的 started[] 在每个 decode thread 第一次成功 StartMipi 之前都是 false
+  //   (默认初始化); 真正"过几秒还没起来"才算 placeholder, 是 polling 后续 log.
+  if (num_img_ > 0) {
+    const auto& started = sensorDataInterface_.camera_actually_started();
+    std::ostringstream mipi_ss;
+    mipi_ss << "[App] [Sprint4-MIPI] startup(" << num_img_ << "):";
+    size_t real_count = 0;
+    size_t placeholder_count = 0;
+    for (size_t i = 0; i < num_img_; ++i) {
+      bool ok = (i < started.size()) ? started[i] : false;
+      mipi_ss << " cam" << i << "=" << (ok ? "v4l2src-ok" : "pending");
+      if (ok) ++real_count; else ++placeholder_count;
+    }
+    mipi_ss << " | real=" << real_count
+            << " pending=" << placeholder_count
+            << " | see [decoder N] / [BlackFrame N] lines below for resolve";
+    Logger::GetInstance().Log(mipi_ss.str());
+  }
+
   Logger::GetInstance().Log(string("[App] Visual tuning: ") + (visual_mode_ ? "ENABLED" : "DISABLED (set ENABLE_VISUAL_TUNING=1 to enable)"));
 
   // 阶段 2: MJPEG 推流参数 (CameraPage "实时预览" 用). MJPEG_INTERVAL=1 全速 30 FPS,

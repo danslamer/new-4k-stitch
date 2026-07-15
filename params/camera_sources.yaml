@@ -1,131 +1,91 @@
----
 # ============================================================
-# v3.0 (2026-07-08): 6 路网络摄像头 (PoE 交换机接入开发板)
+# Sprint 4-MIPI (2026-07-15): 6 路 GC4683 MIPI 直连 (RK3576 已验证).
+#   历史信息见 docs/HISTORY.md § 2.9 (v4l2-ctl ISP 取流实测, 2026-07-15).
+#   **ISP 在 SoC 端 rkisp, GC4683 sensor 本身无 ISP 能力 (厂商口径错误, 见 HISTORY.md § 3
+#   "GC4683 没有 built-in ISP" 段). 必须走 rkisp_mainpath 节点, 不是 raw.**
 #
-# 用法:
-#   1. 把下面 6 路的 `uri` / `user_id` / `user_pw` 填实
-#      (摄像机 web 后台确认 RTSP URL, 海康/大华/雄迈格式不同)
-#   2. 板端: export INPUT_SOURCE_MODE=camera
-#   3. 跑: bash tools/sprint0_smoke.sh
+# 6 路 /dev/videoN 节点对应 (HISTORY.md § 2.9 表):
+#   cam0  <-> /dev/video66    (rkisp_mainpath, gc4683@10)
+#   cam1  <-> /dev/video75    (rkisp_mainpath, gc4683_2@31)
+#   cam2  <-> /dev/video84    (rkisp_mainpath, gc4683_3@10)
+#   cam3  <-> /dev/video93    (rkisp_mainpath, gc4683_4@31; 当前板端 sensor 已拔)
+#   cam4  <-> /dev/video102   (rkisp_mainpath, gc4683_5@31)
+#   cam5  <-> /dev/video111   (rkisp_mainpath, gc4683_1@31; 当前板端 sensor 已拔)
 #
-# 字段说明:
-#   type             : file | rtsp (file 仅 dev/test 用)
-#   uri              : file → ../datasets/2k-test-h264/tXX.mp4
-#                      rtsp → rtsp://user:pass@host:port/path
-#   width / height   : 2560 × 1440 (2K)
-#   fps              : 30
-#   pixel_format     : NV12 (mppvideodec 唯一支持格式)
-#   user_id / user_pw: rtsp 专用, 空字符串 = 无认证
-#   latency_ms       : rtspsrc jitter buffer (80-200)
-#   use_tcp          : true (TCP 抗丢) / false (UDP 低延迟)
-#   connect_timeout_s: rtspsrc 信令 + TCP connect 超时
-#   retry_attempts   : 单路 RTC 失败重试 (默认 5)
-#   reconnect_backoff_ms: 断线重连退避
-#   frame_drop_threshold: fps / 期望fps 低于此值告警
+# 注: cam1/cam5 物理 sensor 暂未接 (拔下待换), BlackFrameProvider 自动接 2 路占位.
+#     历史探测输出保存在 HISTORY.md § 2.9, 有变更时再跑 probe_v4l2.sh.
 #
-# 顶层:
-#   sync_window_ms   : 6 路 PTS 拉齐窗, 默认 16ms (1 帧 @60fps)
-#   auto_calibrate   : Sprint 2 启动期自标定, 默认 false
+# 运行 (PC 端先 scp 到板端):
+#   bash tools/sprint4_mipi_bootstrap.sh             # 全自动: probe + cmake + make + 启 5s
+#   bash tools/sprint4_mipi_bootstrap.sh --probe-only # 仅 probe
 #
-# 占位 IP: 192.168.10.21 ~ 26, 板子: 192.168.10.100
+# 字段 (mipi 专用):
+#   device_path:    /dev/videoN rkisp_mainpath 节点 (已经 SoC 端 ISP, NV12 输出)
+#   io_mode:        "dmabuf" (零拷贝默认)
+#   v4l2_buffer_count: v4l2src 内部 buffer 数 (1..8, 默认 4)
 # ============================================================
 
 sync_window_ms: 16
 auto_calibrate: 0
 
 cameras:
-  # ----- cam0: 2×3 网格左上 -----
-  - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.21:554/Streaming/Channels/101
+  # ----- cam0: /dev/video66 (rkisp_mainpath, gc4683@10) -----
+  - type: mipi
+    device_path: /dev/video66
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
-    user_id: admin
-    user_pw: CHANGE_ME
-    latency_ms: 120
-    use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
+    io_mode: dmabuf
+    v4l2_buffer_count: 4
 
-  # ----- cam1: 2×3 网格右上 -----
-  - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.22:554/Streaming/Channels/101
+  # ----- cam1: /dev/video75 (rkisp_mainpath, gc4683_2@31) -----
+  - type: mipi
+    device_path: /dev/video75
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
-    user_id: admin
-    user_pw: CHANGE_ME
-    latency_ms: 120
-    use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
+    io_mode: dmabuf
+    v4l2_buffer_count: 4
 
-  # ----- cam2: 2×3 网格左中 -----
-  - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.23:554/Streaming/Channels/101
+  # ----- cam2: /dev/video84 (rkisp_mainpath, gc4683_3@10) -----
+  - type: mipi
+    device_path: /dev/video84
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
-    user_id: admin
-    user_pw: CHANGE_ME
-    latency_ms: 120
-    use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
+    io_mode: dmabuf
+    v4l2_buffer_count: 4
 
-  # ----- cam3: 2×3 网格右中 -----
-  - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.24:554/Streaming/Channels/101
+  # ----- cam3: /dev/video93 (rkisp_mainpath, gc4683_4@31; ⚠ 当前 sensor 已拔) -----
+  # 这路 sensor 物理上是断的, 启动时 v4l2src 会失败, BlackFrameProvider 自动接管 (全黑占位).
+  - type: mipi
+    device_path: /dev/video93
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
-    user_id: admin
-    user_pw: CHANGE_ME
-    latency_ms: 120
-    use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
+    io_mode: dmabuf
+    v4l2_buffer_count: 4
 
-  # ----- cam4: 2×3 网格左下 -----
-  - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.25:554/Streaming/Channels/101
+  # ----- cam4: /dev/video102 (rkisp_mainpath, gc4683_5@31) -----
+  - type: mipi
+    device_path: /dev/video102
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
-    user_id: admin
-    user_pw: CHANGE_ME
-    latency_ms: 120
-    use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
+    io_mode: dmabuf
+    v4l2_buffer_count: 4
 
-  # ----- cam5: 2×3 网格右下 -----
-  - type: rtsp
-    uri: rtsp://admin:CHANGE_ME@192.168.10.26:554/Streaming/Channels/101
+  # ----- cam5: /dev/video111 (rkisp_mainpath, gc4683_1@31; ⚠ 当前 sensor 已拔) -----
+  - type: mipi
+    device_path: /dev/video111
     width: 2560
     height: 1440
     fps: 30
     pixel_format: NV12
-    user_id: admin
-    user_pw: CHANGE_ME
-    latency_ms: 120
-    use_tcp: true
-    connect_timeout_s: 10
-    retry_attempts: 5
-    reconnect_backoff_ms: 2000
-    frame_drop_threshold: 0.8
+    io_mode: dmabuf
+    v4l2_buffer_count: 4

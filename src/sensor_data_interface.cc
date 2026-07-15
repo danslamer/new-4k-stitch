@@ -37,6 +37,8 @@
 #include "gst_mpp_decoder.h"
 #include "logger.h"
 #include "status_writer.h"
+#include "drm_allocator.h"
+#include <sys/mman.h>
 
 #include <algorithm>
 #include <chrono>
@@ -80,6 +82,111 @@ struct DecoderPerfStats {
  * @brief 传感器数据接口类
  * 负责管理多路视频解码且框管理
  */
+
+// Sprint 4-MIPI (2026-07-15): BlackFrameHolder + 黑帧占位线程
+BlackFrameHolder::~BlackFrameHolder() {
+    if (drm.fd >= 0) {
+        drm_free(drm);  // drm_allocator.cc: 关 drm_fd, reset
+        drm.fd = -1;
+    }
+}
+
+#include <cstring>  // memset
+// 一次性分配一块 NV12 DMA-BUF, mmap 后 memset 全 0. 失败返回 nullptr.
+static std::shared_ptr<BlackFrameHolder> MakeZeroBlackFrame(int w, int h) {
+    auto holder = std::make_shared<BlackFrameHolder>();
+    holder->width  = w;
+    holder->height = h;
+    if (drm_alloc_nv12(w, h, holder->drm) != 0) {
+        Logger::GetInstance().LogError(
+            "[BlackFrame] drm_alloc_nv12 failed for black placeholder " +
+            std::to_string(w) + "x" + std::to_string(h));
+        return nullptr;
+    }
+    void* ptr = drm_map(holder->drm);
+    if (ptr != MAP_FAILED) {
+        const size_t y_size  = static_cast<size_t>(holder->drm.pitch) * static_cast<size_t>(h);
+        const size_t uv_size = static_cast<size_t>(holder->drm.pitch) * static_cast<size_t>(h / 2);
+        std::memset(ptr, 0, y_size + uv_size);
+        drm_unmap(holder->drm, ptr);
+    }
+    return holder;
+}
+}
+
+size_t SensorDataInterface::num_started_real() const {
+    size_t n = 0;
+    for (bool b : camera_actually_started_) if (b) ++n;
+    return n;
+}
+
+// Sprint 4-MIPI (2026-07-15): 30 fps 推一块全 0 NV12 frame. 直到 stop_requested_.
+//   引用 self->image_queue_vector_ / mutex / decoder_ready/fps 向量.
+void SensorDataInterface::BlackFramePushLoop(size_t i,
+                                             std::shared_ptr<BlackFrameHolder> holder,
+                                             SensorDataInterface* self) {
+    Logger::GetInstance().Log(
+        "[BlackFrame] cam" + std::to_string(i) +
+        " placeholder running, w=" + std::to_string(holder->width) +
+        " h=" + std::to_string(holder->height) +
+        " fd=" + std::to_string(holder->dma_buf_fd()));
+    auto frame_period = std::chrono::milliseconds(33);
+    auto next_push    = std::chrono::steady_clock::now() + frame_period;
+    size_t pushed = 0;
+    auto last_log = std::chrono::steady_clock::now();
+    while (!self->stop_requested_.load()) {
+        if (std::chrono::steady_clock::now() >= next_push) {
+            QueuedFrame qf;
+            qf.storage      = QueuedFrameStorage::kBlackFrame;
+            qf.width        = holder->width;
+            qf.height       = holder->height;
+            qf.stride_w     = holder->pitch_px();
+            qf.stride_h     = holder->height;
+            qf.dma_buf_fd   = holder->dma_buf_fd();
+            qf.black_holder = holder;
+
+            {
+                std::lock_guard<std::mutex> queue_lock(
+                    self->image_queue_mutex_vector_[i]);
+                if (self->image_queue_vector_[i].size() >= self->max_queue_length_) {
+                    self->image_queue_vector_[i].pop();
+                }
+                self->image_queue_vector_[i].push(std::move(qf));
+            }
+            ++pushed;
+            next_push += frame_period;
+
+            // 1s log + 30 fps 占位 + ready 标记
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_log >= std::chrono::seconds(1)) {
+                std::lock_guard<std::mutex> stats_lock(self->decode_stats_mutex_);
+                self->decoder_ready_vector_[i] = true;
+                self->decoded_frames_since_report_[i] = pushed;
+                self->decode_report_time_vector_[i] = now;
+                if (i < self->decode_fps_vector_.size())
+                    self->decode_fps_vector_[i] = 30.0;
+                std::ostringstream ss;
+                ss << "[decoder_perf " << i << "]"
+                   << " decoder=blackframe"
+                   << " frame_fmt=NV12/DMABuf"
+                   << " frames=" << pushed
+                   << " fps=" << 30.0
+                   << " uri=black-placeholder fd=" << holder->dma_buf_fd();
+                Logger::GetInstance().Log(ss.str());
+                last_log = now;
+                stitch_status::set_online(static_cast<int>(i), 0);  // 0 = placeholder 走的
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    std::lock_guard<std::mutex> stats_lock(self->decode_stats_mutex_);
+    self->decoder_finished_vector_[i] = true;
+    Logger::GetInstance().Log(
+        "[BlackFrame] cam" + std::to_string(i) +
+        " placeholder stopped, total pushed=" + std::to_string(pushed));
+}
+
 SensorDataInterface::SensorDataInterface()
     : max_queue_length_(2),
       num_img_(0),
@@ -353,14 +460,17 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
     return;
   }
 
+  // Sprint 4-MIPI (2026-07-15): mipi 不再被过滤, 直接进 file_sources
+  //   (decode thread 自己按 is_rtsp() / is_mipi() 分发). 缺设备/打开失败的
+  //   mipi 路径在 StartDecodeThreads 内自动降级到 BlackFrameProvider 线程.
   std::vector<CameraSource> file_sources;
   for (const auto& src : effective_sources) {
-    if (src.is_mipi()) continue;  // phase 3 后才会用
+    if (src.is_rtsp()) continue;  // rtsp 走自己的 StartRtsp 路径
     file_sources.push_back(src);
   }
   if (file_sources.empty()) {
     Logger::GetInstance().LogError(
-        "[sensor_data_interface] no usable file sources, num_img=0");
+        "[sensor_data_interface] no usable file/mipi sources, num_img=0");
     return;
   }
 
@@ -393,12 +503,19 @@ void SensorDataInterface::InitVideoCapture(size_t& num_img) {
   for (size_t i = 0; i < num_img_; ++i) {
     route_ss << " cam" << i << "="
              << (video_sources_[i].is_rtsp() ? "rtsp" :
-                 video_sources_[i].is_mipi() ? "mipi(deprecated)" : "file");
+                 video_sources_[i].is_mipi() ? "mipi" : "file");
   }
   Logger::GetInstance().Log(route_ss.str());
 
+  // Sprint 4-MIPI: 启动结果表 + 失败原因, 由 StartDecodeThreads 写完后再 log.
+  camera_actually_started_.assign(num_img_, false);
+  camera_startup_reason_.assign(num_img_, std::string{});
+
   StartDecodeThreads();
 }
+
+// 见 SensorDataInterface::BlackFramePushLoop (static member; 访问 private fields).
+
 
 /**
  * @brief 启动解码线程
@@ -429,6 +546,7 @@ void SensorDataInterface::StartDecodeThreads() {
       //   - mipi: 已退役, 不应再到这里 (Sanity log + 标 finished)
       image_stitching::GstMppDecoder decoder;
       bool started = false;
+      std::string started_kind;
       if (src.is_rtsp()) {
         image_stitching::RtspOptions opts;
         opts.latency_ms         = src.latency_ms;
@@ -439,21 +557,55 @@ void SensorDataInterface::StartDecodeThreads() {
         started = decoder.StartRtsp(
             src.uri, src.user_id, src.user_pw, opts,
             /*expected_w*/ 2560, /*expected_h*/ 1440);
+        started_kind = "rtsp";
+      } else if (src.is_mipi()) {
+        // Sprint 4-MIPI: v4l2src + capsfilter (NV12 DMA-BUF) + appsink.
+        started = decoder.StartMipi(
+            src.device_path.empty() ? src.uri : src.device_path,
+            src.io_mode.empty() ? "dmabuf" : src.io_mode,
+            src.v4l2_buffer_count,
+            /*expected_w*/ 2560, /*expected_h*/ 1440);
+        started_kind = "mipi";
       } else {
-        // kFile (也兼容 kMipi deprecated)
         started = decoder.Start(file_name, /*expected_w*/ 2560, /*expected_h*/ 1440);
+        started_kind = "file";
       }
 
       if (!started) {
+        // Sprint 4-MIPI: mipi 路径启动失败不退出线程, 改走 BlackFramePushLoop 占位.
+        if (src.is_mipi()) {
+          Logger::GetInstance().LogError(
+              "[decoder " + std::to_string(i) +
+              "] mipi start failed, falling back to BlackFrame placeholder (device=" +
+              (src.device_path.empty() ? src.uri : src.device_path) + ")");
+          int w = (src.width  > 0) ? src.width  : 2560;
+          int h = (src.height > 0) ? src.height : 1440;
+          auto black = MakeZeroBlackFrame(w, h);
+          if (!black) {
+            std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
+            decoder_finished_vector_[i] = true;
+            return;
+          }
+          camera_actually_started_[i] = false;
+          camera_startup_reason_[i] =
+              std::string("mipi-placeholder:") +
+              (src.device_path.empty() ? src.uri : src.device_path);
+          stitch_status::set_online(static_cast<int>(i), 0);
+          SensorDataInterface::BlackFramePushLoop(i, black, this);
+          return;
+        }
         Logger::GetInstance().LogError(
             "[decoder " + std::to_string(i) +
-            "] failed to start gstreamer pipeline: " + file_name);
+            "] failed to start gstreamer pipeline (" + started_kind +
+            "): " + file_name);
         stitch_status::set_online(static_cast<int>(i), 0);
         std::lock_guard<std::mutex> stats_lock(decode_stats_mutex_);
         decoder_finished_vector_[i] = true;
         return;
       }
       // v3.0: pipeline 已起, 标记 online. watchdog 后续异常时会切回 0.
+      camera_actually_started_[i] = true;
+      camera_startup_reason_[i] = started_kind + "-ok";
       stitch_status::set_online(static_cast<int>(i), 1);
 
       // gstreamer pull 循环. file EOS 走 Stop + Start 重启循环;
@@ -656,6 +808,30 @@ bool SensorDataInterface::ConvertQueuedFrameToDmabuf(const QueuedFrame& queued_f
   // v2.4: 优先 gst_sample 路径 (gstreamer-rockchip mppvideodec, vendor 推荐).
   // gst_sample 持有 GstBuffer (DMA-BUF backed), 析构时 gstreamer 自动还 buffer.
   // NV12Frame.fd 直接给 RGA 零拷贝, NV12Frame.owner 防止 sample 提前析构.
+  // Sprint 4-MIPI (2026-07-15): 占位黑帧路径 — 不经 gst_sample,
+  //   直接从 black_holder 拿 dma_buf_fd. BlackFrameProvider 线程持有
+  //   shared_ptr<BlackFrameHolder>, 在所有消费者释放前不释放底层 DMA-BUF.
+  if (queued_frame.storage == QueuedFrameStorage::kBlackFrame) {
+    if (queued_frame.black_holder == nullptr ||
+        queued_frame.black_holder->dma_buf_fd < 0) {
+      Logger::GetInstance().LogError(
+          "[decoder " + std::to_string(channel_index) +
+          "] black frame missing holder/fd.");
+      return false;
+    }
+    frame.fd = queued_frame.black_holder->dma_buf_fd;
+    frame.width  = queued_frame.black_holder->width;
+    frame.height = queued_frame.black_holder->height;
+    frame.stride_w = queued_frame.black_holder->pitch > 0
+                      ? queued_frame.black_holder->pitch
+                      : queued_frame.black_holder->width;
+    frame.stride_h = queued_frame.black_holder->height;
+    // NV12Frame.owner 暂未用; 但保留指针让 BlackFrameHolder 续命到 stitcher
+    //   消费完 (此处 queued_frame 已被 get_image_vector 一次性 move 进 NV12Frame
+    //   之外的局部, 所以生命周期由 caller 保证).
+    return true;
+  }
+
   if (queued_frame.storage == QueuedFrameStorage::kDrmPrime) {
     if (queued_frame.dma_buf_fd < 0) {
       Logger::GetInstance().LogError(

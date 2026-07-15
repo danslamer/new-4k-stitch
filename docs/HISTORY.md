@@ -2,6 +2,8 @@
 
 设计演进时间线（精简）+ **完整操作手册** + **踩过的坑** + **周期性回顾节**。
 
+`AANAP (静态多平面) + Seam (动态) + 背景减除切换`
+
 ## v3.2 实测代码能力回顾（2026-07-14）
 
 > **本节周期性整理**：用"代码即真"原则列出当前仓库实测的能力/差距。每个 Sprint 末尾做一次增量。
@@ -17,16 +19,16 @@
 
 ### 仍是 MISS / 警告的工作（对齐用户最新目标 GC4683 MIPI / FOV 101x68° / ~180°）
 
-| 目标点 | 当前状态 | 应在 Sprint |
-|---|---|---|
-| `camera_intrinsics.h` 重算 fx/fy 对应 FOV 101x68° | 警告：用的是 102.5°/55.2° 占位；且 `App::InitFromConfig` 未读此 header | Sprint 4-A |
-| 2x3 layout 横向/纵向 overlap 按 FOV+姿态计算，而非硬编码 `W/8` `H/12` | MISS：`BuildStitchLayout2x3` 写死比例 | Sprint 4-B |
-| `stitching_param_generater.cc` 主 pipeline 接入：`SetWarpData(StitchingWarpData)` 实装 | MISS：`ImageStitcher::SetWarpData` 已存在但 App 不传任何 warp_data | Sprint 5-A |
-| bootstrap 估出的 Affine/Homography 持久化到 yaml | MISS：仅 `cached_overlaps_` 内存对象；yaml 仅持 offset | Sprint 5-B/C |
-| 启动期优先读 `warp_data.yaml` 跳过 bootstrap | MISS：`App::InitFromConfig` 不读 warp_data | Sprint 5-C 收尾 |
-| `roi_visualizer.cc` 4 → 6 路循环；支持 width/height | MISS：`DrawROIMarkers` 硬编码 4，`HandleDebugAction` 仅 offset | Sprint 6-A |
-| `/api/roi` POST 接 `x/y/w/h` | MISS：仅接 `offset_x/offset_y` | Sprint 6-B |
-| 180° 俯视 FOV 覆盖 (≥ 96% ~ 180°) | MISS：当前 layout 横向 ≈ 25° / 纵向 ≈ 13.8°（远小于目标） | Sprint 4-B/C |
+| 目标点                                                                                     | 当前状态                                                                  | 应在 Sprint     |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- | --------------- |
+| `camera_intrinsics.h` 重算 fx/fy 对应 FOV 101x68°                                       | 警告：用的是 102.5°/55.2° 占位；且`App::InitFromConfig` 未读此 header | Sprint 4-A      |
+| 2x3 layout 横向/纵向 overlap 按 FOV+姿态计算，而非硬编码`W/8` `H/12`                   | MISS：`BuildStitchLayout2x3` 写死比例                                   | Sprint 4-B      |
+| `stitching_param_generater.cc` 主 pipeline 接入：`SetWarpData(StitchingWarpData)` 实装 | MISS：`ImageStitcher::SetWarpData` 已存在但 App 不传任何 warp_data      | Sprint 5-A      |
+| bootstrap 估出的 Affine/Homography 持久化到 yaml                                           | MISS：仅`cached_overlaps_` 内存对象；yaml 仅持 offset                   | Sprint 5-B/C    |
+| 启动期优先读`warp_data.yaml` 跳过 bootstrap                                              | MISS：`App::InitFromConfig` 不读 warp_data                              | Sprint 5-C 收尾 |
+| `roi_visualizer.cc` 4 → 6 路循环；支持 width/height                                     | MISS：`DrawROIMarkers` 硬编码 4，`HandleDebugAction` 仅 offset        | Sprint 6-A      |
+| `/api/roi` POST 接 `x/y/w/h`                                                           | MISS：仅接`offset_x/offset_y`                                           | Sprint 6-B      |
+| 180° 俯视 FOV 覆盖 (≥ 96% ~ 180°)                                                       | MISS：当前 layout 横向 ≈ 25° / 纵向 ≈ 13.8°（远小于目标）             | Sprint 4-B/C    |
 
 详细 Sprint 计划：见 [`USER_GOAL_ROADMAP.md`](USER_GOAL_ROADMAP.md)。
 
@@ -38,6 +40,7 @@
 - `tools/sprint0_smoke.sh` 等 Sprint 0 验收脚本
 
 ---
+
 ## v3.3 SIFT → ORB 改造（2026-07-14）
 
 > 衔接 v3.2：本节记录把 `src/stitching_param_generater.cc` 内置特征描述子从 SIFT 切到 ORB 的过程。RGA+OpenCL 加速栈零变化，约束见 `docs/USER_GOAL_ROADMAP.md` § 5-PRE。
@@ -79,10 +82,7 @@
 3. 端到端 FPS 维持 100+ (与 v2.5 一致)。
 4. Sprint 5-C 落盘 `params/warp_data.yaml` 后，`xmap/ymap` 维度与 SIFT 时代一致 (PlaneWarper 输出仅依赖 K + R，与特征点类型无关)。
 
-
-
-
-## v3.4 架构重新规划: 前景/后景分离 + IPM + Seam-based 合成（2026-07-14, 计划, 未实施）
+## v3.4 架构重新规划: 前景/后景分离 + AANAP (静态) + Seam-based 合成 (2026-07-14 规划, 2026-07-15 AANAP 复活修正, 计划, 未实施)
 
 > 本节是文档化阶段, 无代码改动。 落地按 `docs/USER_GOAL_ROADMAP.md` § 0.5 核心原则 + § 2 Sprint 5-IPM/SEAM/FG/SAL 子段逐项推进。
 
@@ -94,12 +94,12 @@
 
 ### 核心架构
 
-| 类别 | 几何性质 | 实时策略 | 算力 (RK3588) |
-|---|---|---|---|
-| **后景 (静态地面 + 静态家具)** | 离线标定后两路天然对齐 | 离线算 IPM LUT + 默认 seam + 背景模型, 实时只查表 | ~3ms / 6 路 |
-| **前景 (走动的人)** | 立体物, 2D warp 必坏 | 不试图对齐, 重叠区硬切 (single-side), 检出人跨 seam 把 seam 局部推开 | ~7ms / 7 pair |
-| **混合带 (seam ± 3 px)** | 缝隐藏 | α smoothstep 0→3 px 渐变, 之外硬切 | (计入上面) |
-| **总 wall clock** | | | **~10ms / 帧** (30 fps 预算 33ms 余 23ms) |
+| 类别                                 | 几何性质               | 实时策略                                                             | 算力 (RK3588)                                   |
+| ------------------------------------ | ---------------------- | -------------------------------------------------------------------- | ----------------------------------------------- |
+| **后景 (静态地面 + 静态家具)** | 离线标定后两路天然对齐 | 离线算 IPM LUT + 默认 seam + 背景模型, 实时只查表                    | ~3ms / 6 路                                     |
+| **前景 (走动的人)**            | 立体物, 2D warp 必坏   | 不试图对齐, 重叠区硬切 (single-side), 检出人跨 seam 把 seam 局部推开 | ~7ms / 7 pair                                   |
+| **混合带 (seam ± 3 px)**      | 缝隐藏                 | α smoothstep 0→3 px 渐变, 之外硬切                                 | (计入上面)                                      |
+| **总 wall clock**              |                        |                                                                      | **~10ms / 帧** (30 fps 预算 33ms 余 23ms) |
 
 ### 新增文件 / 改动
 
@@ -117,16 +117,16 @@
 
 ### 算力账 vs 架构硬约束
 
-| 操作 | 路径 | 耗时 | 硬约束状态 |
-|---|---|---|---|
-| 去畸变 LUT 查表 | RGA colorkey/remap | 0.3ms / 路 | ✅ 仍 DMA-BUF 零拷贝 |
-| IPM remap (CV_32FC2) | RGA `imremap` 或 GLES | 0.5ms / 路 | ✅ 仍 DMA-BUF 零拷贝 |
-| 背景减除 | CPU OpenCV | 0.3ms / 路 | ✅ 数据已在系统内存 (解码后) |
-| 局部 seam 形变 | CPU 距离变换 + 形态学 | 0.2ms / pair | ✅ 小数据量 |
-| Kalman 平滑 | CPU 标量 | <0.1ms | ✅ |
-| OpenCL 硬切+窄带 | Mali GPU, `clImportMemoryARM` | 1ms / pair | ✅ 替代 α blend, 仍零拷贝 |
-| 背景模型慢更新 | CPU | 0.05ms | ✅ |
-| **总 wall clock** | (6 路并行) | **~10ms / 帧** | **30 fps 预算 33ms, 余 23ms** |
+| 操作                    | 路径                           | 耗时                 | 硬约束状态                          |
+| ----------------------- | ------------------------------ | -------------------- | ----------------------------------- |
+| 去畸变 LUT 查表         | RGA colorkey/remap             | 0.3ms / 路           | ✅ 仍 DMA-BUF 零拷贝                |
+| IPM remap (CV_32FC2)    | RGA`imremap` 或 GLES         | 0.5ms / 路           | ✅ 仍 DMA-BUF 零拷贝                |
+| 背景减除                | CPU OpenCV                     | 0.3ms / 路           | ✅ 数据已在系统内存 (解码后)        |
+| 局部 seam 形变          | CPU 距离变换 + 形态学          | 0.2ms / pair         | ✅ 小数据量                         |
+| Kalman 平滑             | CPU 标量                       | <0.1ms               | ✅                                  |
+| OpenCL 硬切+窄带        | Mali GPU,`clImportMemoryARM` | 1ms / pair           | ✅ 替代 α blend, 仍零拷贝          |
+| 背景模型慢更新          | CPU                            | 0.05ms               | ✅                                  |
+| **总 wall clock** | (6 路并行)                     | **~10ms / 帧** | **30 fps 预算 33ms, 余 23ms** |
 
 ### 与 v2.5 (现 100+ fps) 的性能对比
 
@@ -136,18 +136,18 @@
 
 ### 落地 Sprint 总工时
 
-| 子段 | 周 | 性质 |
-|---|---|---|
-| 5-PRE (SIFT→ORB) | 0.5 | 必做 (已开工) |
-| 5-IPM-A (标定+IPM LUT) | 1.5 | 离线 |
-| 5-IPM-B (实时 IPM remap) | 1.0 | 在线 |
-| 5-IPM-C (多平面 IPM) | 1.0 | 离线 + 在线混合 (可选) |
-| 5-SEAM-A (GraphCut 默认 seam) | 1.0 | 离线 + 在线混合 |
-| 5-SEAM-B (硬切+窄带) | 1.0 | 在线 |
-| 5-FG-A (背景减除+局部形变) | 1.0 | 在线 |
-| 5-FG-B (Kalman 平滑) | 0.5 | 在线 |
-| 5-SAL (saliency heatmap) | 0.5 | 离线累积 |
-| **总** | **~8.0** | |
+| 子段                          | 周             | 性质                   |
+| ----------------------------- | -------------- | ---------------------- |
+| 5-PRE (SIFT→ORB)             | 0.5            | 必做 (已开工)          |
+| 5-IPM-A (标定+IPM LUT)        | 1.5            | 离线                   |
+| 5-IPM-B (实时 IPM remap)      | 1.0            | 在线                   |
+| 5-IPM-C (多平面 IPM)          | 1.0            | 离线 + 在线混合 (可选) |
+| 5-SEAM-A (GraphCut 默认 seam) | 1.0            | 离线 + 在线混合        |
+| 5-SEAM-B (硬切+窄带)          | 1.0            | 在线                   |
+| 5-FG-A (背景减除+局部形变)    | 1.0            | 在线                   |
+| 5-FG-B (Kalman 平滑)          | 0.5            | 在线                   |
+| 5-SAL (saliency heatmap)      | 0.5            | 离线累积               |
+| **总**                  | **~8.0** |                        |
 
 ### 验证标准 (板上 e2e, 每个子段完成时)
 
@@ -165,26 +165,135 @@
 - `docs/USER_GOAL_ROADMAP.md` § 4 PR 边界: 9 个子段对应 PR 边界
 - `docs/USER_GOAL_ROADMAP.md` § 6 参考实现点: 17 个文件/函数指针
 - `docs/USER_GOAL_ROADMAP.md` § 7 硬约束关系: 9 个子段对应硬约束影响
+
+### 2026-07-15 修正: AANAP 复活 (Zhihu 文章 + 用户反馈触发)
+
+> **触发**: 用户引用 Zhihu `question/34535199/answer/135169187` (截图 `docs/PixPin_2026-07-15_13-00-22.png`) 关于多平面拼接算法的讨论, 指出 IPM 是单 H 不能处理室内墙-地转角等 3D 多平面场景, AANAP 的 content-preserving warp (per-image 相似变换 + 全局 H) 能显著改善。
+
+**修正前 vs 修正后**:
+
+- **修正前 (2026-07-14 v3.4 初始)**: 拒绝 AANAP, 主路径 IPM-only + Seam。 假设"Y=0 单平面"已够。
+- **修正后 (2026-07-15)**: AANAP 接受为**静态多平面主路径**, IPM 降为可选物理尺度。 AANAP 解决静态多平面 (墙-地转角), Seam 解决动态立体人, 两者各管一摊, **合成 kernel 按 fg_mask 切换**:
+  - 动区 (fg_mask > 0): seam 单边, 物理隔离
+  - 静区 (fg_mask = 0): AANAP 混合, 墙-地自然过渡 + seam ±3px 窄带
+
+**为什么 IPM 不够 (修正前过度简化)**:
+
+- IPM 是单 H, 假设整个场景在 Y=0 地面。 把 Z>0 的 3D 点 (墙、桌面、人) 强行投到地面, 立体物"拍扁"失真。
+- 室内多平面 (墙-地转角 90°, 墙-天花 90°): cam0 和 cam1 看同一转角, 投到地面的"地面位置"不同, 转角处重影。
+- AANAP 解决: 全局 H 估大平面姿态, per-image T_sim 保持直线 (墙保持直, 转角处自然过渡)。
+
+**为什么 AANAP 也不能解决动态 parallax (但不冲突)**:
+
+- AANAP 是 2D warp, 对立体动态人 (头在 Z=0.4m) 仍然"画错", 跟 IPM 一样。 但 AANAP 不会让 seam 单边的方案失效 — 动态区走 fg_mask 单边, 不依赖 AANAP 估的 warp。
+- **两者互补不互斥**: AANAP 管静区自然过渡, Seam 管动区物理隔离, 合成 kernel 按 fg_mask 切换。
+
+**算法选型矩阵 (修正后)**:
+
+| 场景                | AANAP                    | Seam                   | 谁来做               |
+| ------------------- | ------------------------ | ---------------------- | -------------------- |
+| 静态地面 (Y=0)      | OK                       | OK                     | AANAP 更自然         |
+| 静态墙 (Z 不同)     | OK (T_sim 保持直线)      | bad (硬切会看到两段墙) | AANAP 必上           |
+| 墙-地转角 (3D 折线) | OK (T_sim 沿直线 anchor) | so-so 硬切会切到转角   | AANAP                |
+| 静态高位物 (桌面)   | so-so 透视仍拖           | bad                    | AANAP + 5-IPM-C 多 Z |
+| 立体动态人          | bad 2D warp 搞不定       | OK 单边无重影          | Seam 必上            |
+| 阴影在地面          | OK AANAP 不分            | OK 切到阴影外          | AANAP 自然融合       |
+| 快速走动跨 seam     | bad                      | OK 形变跟上            | Seam + PushSeam      |
+
+**文档同步**:
+
+- `docs/USER_GOAL_ROADMAP.md` § 0.5.5 接受/拒绝清单: AANAP 从拒绝移到接受 (主路径)
+- `docs/USER_GOAL_ROADMAP.md` § 2 Sprint 5: 重新组织为 5-PRE → 5-CAL-A → 5-AANAP-A → 5-AANAP-B → 5-SEAM-A/B → 5-FG-A/B → 5-SAL → 5-IPM (可选)
+- `docs/USER_GOAL_ROADMAP.md` § 3 风险 / § 4 PR / § 6 参考 / § 7 硬约束: 同步 AANAP
+- `AGENTS.md` 核心模块表: 新增 `src/aanap_warp.cc/.h`
+- `HISTORY.md` v3.4 段 (本节): 标题 + 修正小节
+- `HISTORY.md` timeline: v3.4 行更新措辞
+
+**Sprint 总工时调整**:
+
+- 修正前: 5-PRE → 5-IPM-A/B/C → 5-SEAM-A/B → 5-FG-A/B → 5-SAL, ~7.5 周
+- 修正后: 5-PRE → 5-CAL-A → 5-AANAP-A → 5-AANAP-B → 5-SEAM-A/B → 5-FG-A/B → 5-SAL → 5-IPM (可选), ~8.5 周 (MVS 不含 5-IPM, 7 周)
 - `AGENTS.md` 当前状态: v3.4 forward-looking note + 核心模块表 (新增 4 个文件) + 6路硬编码表 (新增 6 行)
+
 ---
 
 ## 0. 设计演进（一句话过完）
 
-| 时点          | 关键事件                                                                                                                                                                                                 |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 初始          | OpenCV UMat, 4K×4-cam > 200fps（1080Ti）                                                                                                                                                                |
-| 2026-03       | 切 4K 输入；运行时调参 env vars；KMat/RMat 改动                                                                                                                                                          |
-| 2026-03-26    | **性能回归**: warp 并行改串行，FPS 50→个位；修复                                                                                                                                                  |
-| 2026-04-01    | 集成 RK 硬件解码 (rkmpp + RGA)；目标转向 DMA-BUF 零拷贝                                                                                                                                                  |
-| 2026-04-03    | bootstrap 用 OpenCV 特征检测 ROI → 裁剪坐标复用（无 remap, RGA 不支持）                                                                                                                                 |
-| 2026-04-17 起 | SDL2 可视化调参；ROI YAML 持久化；多帧 ROI bootstrap (`NUM_BOOTSTRAP_FRAMES=3`, 阈值 0.25/0.7)                                                                                                         |
-| 2026-06-29    | **板子选型**: rocktech RK3588 (6 路物理 MIPI 直连) 中选                                                                                                                                            |
-| 2026-06-30    | DTS 6 路 sensor 节点验证（详 §1 DTS）                                                                                                                                                                   |
-| 2026-07-06    | **架构硬约束锁定**: 弃 FFmpeg rkmpp（vendor 不维护 + ABI 不兼容, 0 帧），改 gstreamer1.0-rockchip1 mppvideodec `dma-feature=true`                                                                |
-| 2026-07-07    | **绿条纹修复**: `mppvideodec` stride 上报偏小 → RGA + cvtColor 错位；POSIX `realpath()` 解决 yaml 路径; batch_transcode (mp4v→h264)。**6 路 100+ fps @ 100% DMA-BUF, 2×3 端到端跑通** |
-| 2026-07-08    | **v3.0**: 6 路 IP camera RTSP 改造（PoE 8+2 交换机, 镜头 2.8mm 102.5°），取代 v2.x 的本地 mp4 / MIPI 计划                                                                                         |
-| 2026-07-14    | **v3.3 SIFT → ORB 改造**：`stitching_param_generater.cc` 内部描述子由 SIFT 切到 ORB (BFMatcher NORM_HAMMING + KNN + Lowe 0.65)；默认 `affine/no-BA/PlaneWarper`；RGA+OpenCL 加速栈零变化。详见本文件 v3.3 节 + `docs/USER_GOAL_ROADMAP.md` § 5-PRE |
-| 2026-07-14    | **v3.4 架构重新规划**: 前景/后景分离 (后景 IPM LUT + 静态 seam 离线算; 前景硬切+局部形变+背景减除实时), 拒绝 DH/APAP/AANAP/全幅 α blend; 详见本文件 v3.4 节 + `docs/USER_GOAL_ROADMAP.md` § 0.5 + § 2 Sprint 5 (5-IPM-A/B/C + 5-SEAM-A/B + 5-FG-A/B + 5-SAL) |
+| 时点          | 关键事件                                                                                                                                                                                                                                                                                                                                                 |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 初始          | OpenCV UMat, 4K×4-cam > 200fps（1080Ti）                                                                                                                                                                                                                                                                                                                |
+| 2026-03       | 切 4K 输入；运行时调参 env vars；KMat/RMat 改动                                                                                                                                                                                                                                                                                                          |
+| 2026-03-26    | **性能回归**: warp 并行改串行，FPS 50→个位；修复                                                                                                                                                                                                                                                                                                  |
+| 2026-04-01    | 集成 RK 硬件解码 (rkmpp + RGA)；目标转向 DMA-BUF 零拷贝                                                                                                                                                                                                                                                                                                  |
+| 2026-04-03    | bootstrap 用 OpenCV 特征检测 ROI → 裁剪坐标复用（无 remap, RGA 不支持）                                                                                                                                                                                                                                                                                 |
+| 2026-04-17 起 | SDL2 可视化调参；ROI YAML 持久化；多帧 ROI bootstrap (`NUM_BOOTSTRAP_FRAMES=3`, 阈值 0.25/0.7)                                                                                                                                                                                                                                                         |
+| 2026-06-29    | **板子选型**: rocktech RK3588 (6 路物理 MIPI 直连) 中选                                                                                                                                                                                                                                                                                            |
+| 2026-06-30    | DTS 6 路 sensor 节点验证（详 §1 DTS）                                                                                                                                                                                                                                                                                                                   |
+| 2026-07-06    | **架构硬约束锁定**: 弃 FFmpeg rkmpp（vendor 不维护 + ABI 不兼容, 0 帧），改 gstreamer1.0-rockchip1 mppvideodec `dma-feature=true`                                                                                                                                                                                                                |
+| 2026-07-07    | **绿条纹修复**: `mppvideodec` stride 上报偏小 → RGA + cvtColor 错位；POSIX `realpath()` 解决 yaml 路径; batch_transcode (mp4v→h264)。**6 路 100+ fps @ 100% DMA-BUF, 2×3 端到端跑通**                                                                                                                                                 |
+| 2026-07-08    | **v3.0**: 6 路 IP camera RTSP 改造（PoE 8+2 交换机, 镜头 2.8mm 102.5°），取代 v2.x 的本地 mp4 / MIPI 计划                                                                                                                                                                                                                                         |
+| 2026-07-15    | **v3.5 (in-progress)**: 6 路 GC4683 MIPI 真接入 (rkisp_mainpath /dev/video66..111, sensor 拔占位走 BlackFrameProvider); 详见 `docs/BOARD_VERIFICATION_STATUS.md`                                                                                                                                                                                 |
+| 2026-07-14    | **v3.4 架构重新规划**: 前景/后景分离 (后景 IPM LUT + 静态 seam 离线算; 前景硬切+局部形变+背景减除实时), 拒绝 DH/APAP/全幅 α blend; 详见本文件 v3.4 节 + `docs/USER_GOAL_ROADMAP.md` § 0.5 + § 2 Sprint 5 (5-IPM-A/B/C + 5-SEAM-A/B + 5-FG-A/B + 5-SAL)                                                                                        |
+| 2026-07-15    | **v3.4 修正: AANAP 复活**: 用户引用 Zhihu 截图 (`docs/PixPin_2026-07-15_13-00-22.png`) 指出 IPM (单 H) 不能处理室内墙-地等多平面, AANAP 的 content-preserving warp (per-image 相似变换 + 全局 H) 显著改善; AANAP 从拒绝清单移到主路径 (静态多平面), IPM 降为可选物理尺度; 详见本节 2026-07-15 修正 小节 + `docs/USER_GOAL_ROADMAP.md` § 0.5.5 |
+| 2026-07-15    | **v4l2-ctl ISP 取流确认**: 厂商命令 `width=1280,height=960,pixelformat='UYVY' --stream-mmap=4` 是 `rkisp_mainpath` 标准取流法 (≥ 2.4MB/帧)。**板上默认格式 2560×1440 NV12 ISP (= 5.5MB/帧, 6 路 33GB/s) 是 2K stitch pipeline 唯一正解**。GC4683 raw sensor 没内置 ISP，是 SoC 端 rkisp 处理。详见本节 §2.9 + §3 两条 🔴             |
+
+---
+
+## v3.5 当前快照 - Sprint 4-MIPI 代码已就绪 (2026-07-15)
+
+> **一句话**: 6 路 GC4683 MIPI 接入代码全部写完, 待用户在板端做 SCP+SSH 实跑验收。
+> 详细 checklist / 后续 Sprint 依赖图见 **[`docs/BOARD_VERIFICATION_STATUS.md`](BOARD_VERIFICATION_STATUS.md)**。
+
+### v3.5 已落地的代码 (HEAD 之后未 commit)
+
+| 文件                                          | 类型      | 行         | 关键点                                                                                                                                                                                      |
+| --------------------------------------------- | --------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `include/gst_mpp_decoder.h` / `.cc`       | modified  | +14 / +34  | `StartMipi(device, io_mode, n_buf, w, h)` + `BuildMipiPipeline()`: v4l2src + capsfilter NV12 + appsink; device 节点 stat 失败立即返 false                                               |
+| `include/sensor_data_interface.h` / `.cc` | modified  | +51 / +186 | `BlackFrameHolder { DrmBuffer drm; w, h; }` + `kBlackFrame` storage + `static SensorDataInterface::BlackFramePushLoop(i, holder, this)` 30 fps 占位; per-thread mipi 失败 -> 占位循环 |
+| `src/app.cc`                                | modified  | +20        | App ctor 加`[App] [Sprint4-MIPI] startup(N)` summary log                                                                                                                                  |
+| `params/camera_sources.yaml`                | rewritten | -          | 6 路`type: mipi`; `device_path` 改 HISTORY.md § 2.9 实测 rkisp_mainpath (`/dev/video66/75/84/93/102/111`); cam1 / cam5 物理 sensor 暂拔, 由 BlackFrameProvider 接住                  |
+| `tools/probe_v4l2.sh`                       | new       | 5.9 KB     | 优先枚举 NV12 + 2560x1440 的 rkisp_mainpath 节点;`--edit-yaml` 自动 patch yaml; 强制 `--stream-count=N` (HISTORY.md § 3 坑)                                                            |
+| `tools/sprint4_mipi_bootstrap.sh`           | new       | 3.2 KB     | 一键 probe -> cmake + make -> 启 image-stitching 5s -> 抓 log                                                                                                                               |
+
+### v3.5 板端实跑路径 (用户 PowerShell 跑)
+
+> ⚠️ **sandbox TCP 出站被拦**: 我在 sandbox 内无法 SSH 到板端 (Permission denied port 22)。
+> 用户需在他自己的 PowerShell 跑:
+>
+> ```powershell
+> scp -r include/src/params/tools git push  # 或 scp 文件清单 (见 BOARD_VERIFICATION_STATUS § 3.1)
+> ssh rocktech@192.168.137.100 "cd ~/Projects/new-4k-stitch && bash tools/sprint4_mipi_bootstrap.sh"
+> ssh rocktech@192.168.137.100 "grep -E 'decoder_perf|BlackFrame|gst_mpp_decoder|Sprint4-MIPI' /tmp/stitch.log"
+> ```
+>
+> 或者直接在板端 ssh 跑 `bash tools/sprint4_mipi_bootstrap.sh`。
+> PC 端一键 SCP+SSH 脚本 **`tools/_push_and_verify.ps1`** - 我中断在 Step 3, **没写到磁盘**; 用户要的话给个 "yes" 我接着干。
+
+### v3.5 已知风险 + 仍待补小坑
+
+| 项                                  | 详情                                                                                                                             |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| raw-Bayer 防呆                      | `BuildMipiPipeline()` 没在开头加 "pixelformat 必须是 NV12" 检查 - 用户中断在 Step 3。建议补 `v4l2-ctl -d $node --get-fmt-video |
+| `tools/_push_and_verify.ps1`      | **不存在** (中断在 Step 3)。                                                                                               |
+| `tools/sprint4_mipi_bootstrap.sh` | 默认行为已 OK, 但`--bg` 模式下还需要 `kill <pid>` 收尾 (脚本会 print PID)。                                                  |
+| Board IP / 板用户名                 | yaml / scripts 都用`rocktech@192.168.137.100`, 不一致请手动 sed。                                                              |
+
+### v3.5 后续 Sprint 5/6 任务依赖 (per USER_GOAL_ROADMAP § 2)
+
+```
+Sprint 4-MIPI -> board verify  ->
+   Sprint 5-IPM-A   1.5 周   离线 6 路 K/R/t 标定 + IPM LUT
+   Sprint 5-IPM-B   1 周     实时 IPM remap (RGA + CV_32FC2)
+   Sprint 5-SEAM-A   1 周     GraphCut 默认 seam 落盘
+   Sprint 5-SEAM-B   1 周     硬切 + 3px 窄带
+   Sprint 5-FG-A     1 周     BgSubtractor + PushSeam
+   Sprint 5-FG-B     0.5 周   Kalman
+   Sprint 5-SAL      0.5 周   saliency
+   Sprint 6-A        1 周     UI 4->6 cam + width/height
+   Sprint 6-B        0.5 周   /api/roi POST x/y/w/h
+   Sprint 7          1 周     end-to-end 180° 覆盖验证
+合计 ~7.5 周 (per 文档)
+```
 
 ---
 
@@ -332,12 +441,12 @@ sudo nmcli connection down "MyWiFi" && sudo nmcli connection up "MyWiFi"
 
 **实测发现：本板 image 默认状态有 4 个坑需要先填，再做 nmcli 静态配置**：
 
-| # | 坑 | 现象 | 修复 |
-|---|---|---|---|
-| 1 | `NetworkManager.service` `disabled` | 开机 NM 不起，依赖 NM 的连接也不起 | `sudo systemctl enable --now NetworkManager` |
-| 2 | `netplan-eth0` 是 DHCP（`ipv4.method=auto`，`autoconnect=yes`） | 重启后 DHCP 抢占 eth0，把我们的静态 IP 抢走 | `sudo nmcli connection delete netplan-eth0` |
-| 3 | `netplan-eth1` 是 192.168.1.10/24 静态 + `/etc/network/interfaces` 里也有 `auto eth1` 块 | eth1 被 NM 标 `unmanaged`，扰乱 device 状态 | 删 `netplan-eth1` 并把 `/etc/network/interfaces` 里 eth1 块清空（备份后覆盖） |
-| 4 | NM 自动给 eth0 创的内存 `eth0` device profile（`autoconnect=no`，**未落盘到 `/etc/NetworkManager/system-connections/`**） | `nmcli con show` 看着像有静态 IP，重启后消失 | 用 `nmcli connection add` 显式创建并 `autoconnect-priority=100` 让它真的落盘 |
+| # | 坑                                                                                                                                   | 现象                                           | 修复                                                                             |
+| - | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| 1 | `NetworkManager.service` `disabled`                                                                                              | 开机 NM 不起，依赖 NM 的连接也不起             | `sudo systemctl enable --now NetworkManager`                                   |
+| 2 | `netplan-eth0` 是 DHCP（`ipv4.method=auto`，`autoconnect=yes`）                                                                | 重启后 DHCP 抢占 eth0，把我们的静态 IP 抢走    | `sudo nmcli connection delete netplan-eth0`                                    |
+| 3 | `netplan-eth1` 是 192.168.1.10/24 静态 + `/etc/network/interfaces` 里也有 `auto eth1` 块                                       | eth1 被 NM 标`unmanaged`，扰乱 device 状态   | 删`netplan-eth1` 并把 `/etc/network/interfaces` 里 eth1 块清空（备份后覆盖） |
+| 4 | NM 自动给 eth0 创的内存`eth0` device profile（`autoconnect=no`，**未落盘到 `/etc/NetworkManager/system-connections/`**） | `nmcli con show` 看着像有静态 IP，重启后消失 | 用`nmcli connection add` 显式创建并 `autoconnect-priority=100` 让它真的落盘  |
 
 **完整命令（一次执行，重启后 IP 锁死 192.168.137.100）**：
 
@@ -430,16 +539,16 @@ sudo nmcli -w 10 connection add type ethernet con-name netplan-eth0 ifname eth0 
 
 #### 通用排错
 
-| 症状                                       | 处理                                                              |
-| ------------------------------------------ | ----------------------------------------------------------------- |
-| `No route to host`                       | 不在同一子网；ICS 确认 PC 端`192.168.137.1`，WiFi 确认同一 SSID |
-| `Permission denied (publickey)`          | 清旧 host key:`ssh-keygen -R 192.168.137.100`                   |
-| `nmcli: command not found`               | 镜像不带 NetworkManager，改走 wpa_supplicant                      |
-| `IP configuration could not be reserved` | WiFi 关联成功但 DHCP 拿不到 IP，绑静态 IP 跳过 DHCP               |
-| IP 变了后 VSCode Remote 拒连               | `ssh-keygen -R <new_ip>`                                        |
-| `nmcli: NetworkManager is not running`   | 开机 NM 没自启：`sudo systemctl enable --now NetworkManager`  |
-| 设了静态 IP 重启后还是 DHCP                | image 自带 `netplan-eth0` DHCP `autoconnect=yes` 抢占；先 `nmcli connection delete netplan-eth0` 再新建静态 |
-| `eth1: unmanaged` (预期外)                | `/etc/network/interfaces` 里残留 `auto eth1` 块；清空该文件后 `sudo systemctl restart NetworkManager` |
+| 症状                                       | 处理                                                                                                             |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `No route to host`                       | 不在同一子网；ICS 确认 PC 端`192.168.137.1`，WiFi 确认同一 SSID                                                |
+| `Permission denied (publickey)`          | 清旧 host key:`ssh-keygen -R 192.168.137.100`                                                                  |
+| `nmcli: command not found`               | 镜像不带 NetworkManager，改走 wpa_supplicant                                                                     |
+| `IP configuration could not be reserved` | WiFi 关联成功但 DHCP 拿不到 IP，绑静态 IP 跳过 DHCP                                                              |
+| IP 变了后 VSCode Remote 拒连               | `ssh-keygen -R <new_ip>`                                                                                       |
+| `nmcli: NetworkManager is not running`   | 开机 NM 没自启：`sudo systemctl enable --now NetworkManager`                                                   |
+| 设了静态 IP 重启后还是 DHCP                | image 自带`netplan-eth0` DHCP `autoconnect=yes` 抢占；先 `nmcli connection delete netplan-eth0` 再新建静态 |
+| `eth1: unmanaged` (预期外)               | `/etc/network/interfaces` 里残留 `auto eth1` 块；清空该文件后 `sudo systemctl restart NetworkManager`      |
 
 ### 2.4 账户与项目目录
 
@@ -498,6 +607,96 @@ ROI bootstrap（`BootStrapOptimalLayout`）是为**相机位置不确定**的 PC
 ### 2.8 性能调参口诀
 
 整体鼓瘪调 `FOCAL_SCALE`；接缝不顺调 `CY_OFFSET`；左右不接调 `CX_OFFSET`。
+
+### 2.9 摄像头 ISP 取流 (v4l2-ctl, 6 路 2K ISP pipeline) — 2026-07-15 实测
+
+**✅ 推荐（板子 2K stitch pipeline 唯一正解）**：抓 ISP 处理后的 2K NV12（5.5MB/帧），不是 raw BA10。
+
+```bash
+# 单路抓 N 帧 ISP NV12 2560×1440 = 5,529,600 B/帧
+v4l2-ctl -d /dev/video<NNN> \
+  --set-fmt-video=width=2560,height=1440,pixelformat=NV12 \
+  --stream-mmap=3 --stream-count=<F> \
+  --stream-to=./cam<N>_2k_nv12.yuv
+```
+
+**⚠ 一定写 `--stream-count=N`**。缺了它 v4l2-ctl 无限抓流，**`kill -9` 会让 ISP queue 卡死**（见 §3 🔴 坑）。
+
+#### 6 路 rkisp_mainpath 节点对应（2026-07-15 实测）
+
+| /dev/video        | 驱动           | cam  | 物理状态                             | `BA10` raw 节点                            |
+| ----------------- | -------------- | ---- | ------------------------------------ | -------------------------------------------- |
+| `/dev/video66`  | rkisp_mainpath | cam1 | ✅ 接 cam1 (gc4683@10)               | `/dev/video0`  (rkcif stream_cif_mipi_id0) |
+| `/dev/video75`  | rkisp_mainpath | cam3 | ✅ 接 cam3 (gc4683_2@31)             | `/dev/video3`  (rkcif-mipi5-csi2)          |
+| `/dev/video84`  | rkisp_mainpath | cam4 | ✅ 接 cam4 (gc4683_3@10)             | `/dev/video5`  (rkcif-mipi2-csi2)          |
+| `/dev/video93`  | rkisp_mainpath | cam5 | ⚠ sensor 已断（cam2/cam5 拔下待换） | —                                           |
+| `/dev/video102` | rkisp_mainpath | cam6 | ✅ 接 cam6 (gc4683_5@31)             | `/dev/video13` (rkcif-mipi4-csi2)          |
+| `/dev/video111` | rkisp_mainpath | cam2 | ⚠ sensor 已断（待换）               | —                                           |
+
+> cam↔video 映射（DT suffix: gc4683_N → camN+1），cam2/cam5 物理断开但 media entity 仍在。
+
+#### 完整 v4l2 输出格式（rkisp_mainpath 支持）
+
+按 `--list-formats` 实测：
+
+```
+'UYVY'  (UYVY 4:2:2, 1280×960 = 2,457,600 B/帧)   # 厂商文档范例
+'NV16'  (Y/UV 4:2:2)
+'NV61'  (Y/VU 4:2:2)
+'NV21'  (Y/VU 4:2:0)
+'NV12'  (Y/UV 4:2:0, 2560×1440 = 5,529,600 B/帧) # 2K pipeline 用
+'NM21'  (Y/VU 4:2:0 N-C, AfbcOutputCompressed)
+'NM12'  (Y/UV 4:2:0 N-C, AfbcOutputCompressed)
+```
+
+#### 解码 UYVY 2K NV12 → PNG 快速验证（板上）
+
+```python
+# /tmp/uyvy_to_png.py — UYVY 4:2:2 packed → PNG
+import numpy as np, cv2
+data = np.fromfile("cam1.yuv", dtype=np.uint8)
+img = cv2.cvtColor(data.reshape(960, 1280, 2), cv2.COLOR_YUV2BGR_UYVY)
+cv2.imwrite("cam1.png", cv2.convertScaleAbs(img, alpha=2.0, beta=20), [cv2.IMWRITE_PNG_COMPRESSION, 3])
+
+# NV12 4:2:0 → PNG (默认 2560×1440)
+data = np.fromfile("cam1.yuv", dtype=np.uint8)
+img = cv2.cvtColor(data.reshape(2160, 2560), cv2.COLOR_YUV2BGR_NV12)
+cv2.imwrite("cam1.png", cv2.convertScaleAbs(img, alpha=2.0, beta=20))
+```
+
+#### IPC pipeline (`media-ctl -p /dev/media6` 实测链路)
+
+```
+gc4683 (SGRBG10_1X10 2560×1440)
+  └─► csi2-dphy → mipi-csi2 → rkcif-mipi-lvds
+                     └─► rkisp-isp-subdev (demosaic + 3A + ISP tuning + CCM + gamma)
+                          ├─► rkisp_mainpath  → /dev/video66 (cam1)
+                          ├─► rkisp_selfpath  → /dev/video67 (缩放下采样)
+                          ├─► rkisp_fbcpath   → /dev/video68 (AFBC)
+                          └─► rkisp_iqtool    → /dev/video69 (调参)
+
+注：`rkisp0-vir0` 包含 cam1/2/3（一个 ISP 硬件服务 3 路由轮流），
+`rkisp1-vir0` 服务 cam4/5/6。vir0 = ISP 输入端主导。
+```
+
+#### GC4683 没有 built-in ISP（厂商说错！）
+
+- 驱动源 `gc4683_主板.c:488` / `gc4683_模组.c:487`：`.bus_fmt = MEDIA_BUS_FMT_SGRBG10_1X10` (仅 raw bayer)
+- media-ctl 拓扑：sensor entity `m00_f_gc4683 N-XXXX` 只有 1 个 Source pad → csi2-dphy
+- `v4l2-ctl ... --get-subdev-fmt` 输出 `MEDIA_BUS_FMT_SGRBG10_1X10`，无 YUV 能力
+- 厂商应是把 GC4683 当 GC4653 谈的（GC4653 出 YUV，GC4683 只出 raw）
+- **真实 ISP：Rockchip SoC 的 rkisp**，需要 `/etc/iqfiles/gc4653_*.json` tuning（当前 vendor 用 GC4653 tuning 顶替，偏绿系）
+
+
+
+按场景分四档，全部在开发板上直接跑：
+
+| 场景                                                       | 命令                                                                                                                                          | 关键参数                                                                            |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| **🟢 1 行单帧快照（最快）**                          | `v4l2-ctl -d /dev/video66 --set-fmt-video=width=2560,height=1440,pixelformat=NV12 --stream-mmap=3 --stream-count=1 --stream-to=/tmp/f.nv12` | 改`videoNN` 选 cam；加 `--stream-count=N` 多帧                                  |
+| **🟢 多路同步 + 自动命名** （最常用）                | `python3 tools/grab_sync.py --mode isp --duration 5`                                                                                        | 自动扫 rkisp_mainpath → cam1..N；可加`--cams 66,75,84,102`                       |
+| **🟢 4 路 H264 mp4** （要喂 OpenCV 直接读）          | `bash tools/capture_mp4_4cam.sh`                                                                                                            | mp4mux + SIGINT 优雅 EOS，否则 moov 丢                                              |
+| **🟢 探 + patch + 构建 + 启** （Sprint 4-MIPI 一键） | `bash tools/sprint4_mipi_bootstrap.sh --probe-only` 或 `--bg`                                                                             | probe 出 cam 节点后自动改`camera_sources.yaml`；不接 `--bg` 直接前台 5 秒后退出 |
 
 ---
 
@@ -605,7 +804,53 @@ RK3576 librga 只支持平移/缩放/正交旋转, 无法柱面/球面/透视等
 - 较差：`t00`, `t30`, `t50`（低重叠或光照漂移, 易触发"画面重复"瑕疵）
 - 2×3 测试也要选匹配对
 
-### ⚫ g_feather_width 必须偶数
+### ⚫ v4l2-ctl 流命令缺 `--stream-count` 会无限抓流 + ISP queue 卡死（2026-07-15）
+
+**症状**：照搬厂商文档的 `v4l2-ctl --stream-mmap=4 --stream-to=./out.yuv`（没 `--stream-count=`）跑测试，`v4l2-ctl` 永远不退出。`kill -9` 后再跑任何 ISP 取流命令都失败：
+
+- `VIDIOC_STREAMON returned -1 (Operation not permitted)` (EPERM)
+- 或 `rkisp0-vir0: check rkisp_mainpath link or isp input` 在 dmesg 里反复
+- `media-ctl --reset` 救不回，反而让所有 link 失能 + STREAMON 变 EPERM
+
+**根因**：`--stream-mmap=N` 配合缺 `--stream-count` 时 v4l2-ctl 默认无限抓流（`-1`），并在按 `| head -30` 截 stdout 时被 SIGPIPE 杀掉。`kill -9` 让 REQBUFS 中已分配的 mmap buffer 留在 ISP 队列里，driver 内部 `rkisp_s_fmt_vid_cap_mplane queue busy` 卡死。
+
+**修法**：
+
+1. **预防**：所有 v4l2-ctl 流命令**必须**加 `--stream-count=N`（要多少帧写多少；`--stream-count=1` 验证路径、`--stream-count=$(($FPS*$DURATION))` 抓视频）。
+2. **复位（如果忘了 count）**：
+
+```bash
+# 先看 dmesg 是否有 "queue busy" 决定是否要重启
+dmesg | grep -E "queue busy|check rkisp_mainpath"
+
+# 试 soft reset
+media-ctl -d /dev/media6 --reset
+media-ctl -d /dev/media6 -l '"rkisp-isp-subdev":2->"rkisp_mainpath":0[1]'
+
+# soft reset 救不回来（出现 EPERM），只能重启
+sudo reboot
+```
+
+重启后 6 个 rkisp_mainpath（v66/75/84/93/102/111）会自动重新分配。
+
+参考：[`docs/HISTORY.md §2.9`](#29-摄像头-isp-取流-v4l2-ctl-6-路-2k-isp-pipeline--2026-07-15-实测)。
+
+---
+
+### ⚫ GC4683 没有 built-in ISP（厂商口径错误，2026-07-15）
+
+**症状**：厂商回复"GC4683 自带 ISP，你抓 raw 就是没走 ISP"。但实测无 YUV 能力。
+
+**根因**：
+
+- 驱动源（[GC4683drivers/主板厂家/gc4683_主板.c:488](../GC4683drivers/主板厂家/gc4683_主板.c) / [模组原厂](../GC4683drivers/模组原厂/gc4683_模组.c)）：`.bus_fmt = MEDIA_BUS_FMT_SGRBG10_1X10` —— **sensor 只声明 10-bit raw bayer，没任何 YUV 出口**
+- `media-ctl -d /dev/media6 -p`：sensor entity `m00_f_gc4683 2-0010` 只有 1 个 Source pad → csi2-dphy，**不是 sensor-ISP 输出**
+- `v4l2-ctl -d /dev/media0 --subdev-get-fmt` 返回 `MEDIA_BUS_FMT_SGRBG10_1X10`，没 YUV 能力
+- 厂商应是把 GC4683 当 **GC4653** 谈：GC4653 内部 ISP 出 YUV，GC4683 是 raw sensor 出 bayer
+
+**真相**：ISP 是在 **Rockchip SoC 端** rkisp 硬件做的（demosaic + 3A + CCM + gamma），需要 `/etc/iqfiles/` 下放 tuning json（当前 vendor 用 GC4653 tuning 顶替 GC4683，全局偏绿）。
+
+**捕捉 ISP 处理结果**：必须走 `/dev/videoN` 的 **rkisp_mainpath 节点**，不是 raw 入口。参考 [`docs/HISTORY.md §2.9`](#29-摄像头-isp-取流-v4l2-ctl-6-路-2k-isp-pipeline--2026-07-15-实测)。
 
 kernel 除以 2。同样的约束对单相机裁剪宽度生效（`NormalizeEvenFloor` / `NormalizeEvenCeil`, `app.cc:63-69`）。
 
